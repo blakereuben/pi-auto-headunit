@@ -4,6 +4,9 @@ A native, open-source Android Auto head-unit project for Raspberry Pi Compute Mo
 
 The aim is an appliance-style system that starts with the car, connects to an Android phone, displays Android Auto on a touchscreen, and uses Raspberry Pi hardware acceleration where available. The primary runtime is a normal Raspberry Pi OS application—not Docker—and the finished installer will be a Debian (`.deb`) package managed by systemd.
 
+> [!NOTE]
+> **AI authorship disclosure:** The current code and documentation in this repository were created by OpenAI Codex. Blake Reuben has acted as the project owner and orchestrator: defining the goals and requirements, supplying the hardware and test environment, approving the work, and carrying out or supervising physical testing. See [AI_DISCLOSURE.md](AI_DISCLOSURE.md) for details.
+
 > [!IMPORTANT]
 > This project is at an early hardware-diagnostics stage. It does **not** yet display Android Auto, play its audio, return touch input, or support wireless Android Auto. It is experimental, uncertified software for bench development and must not control safety-critical vehicle functions.
 
