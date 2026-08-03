@@ -1,0 +1,5 @@
+# Milestone 1 provider policy. The graphical settings UI is a later milestone.
+[wireless]
+wifi_provider = "auto"
+bluetooth_provider = "auto"
+

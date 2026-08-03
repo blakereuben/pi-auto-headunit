@@ -1,0 +1,10 @@
+# Development access for documented AOA tests. The MTP match is intentionally
+# narrower than granting access to every USB device from every phone vendor.
+SUBSYSTEM=="usb", ENV{ID_MTP_DEVICE}=="1", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+
+# Publicly documented Google AOA accessory-mode product IDs.
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d04", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d05", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+

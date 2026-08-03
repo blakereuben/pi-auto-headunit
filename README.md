@@ -1,0 +1,166 @@
+# Pi Auto Head Unit
+
+A native, open-source Android Auto head-unit project for Raspberry Pi Compute Module 4, Compute Module 5, Pi 4, and Pi 5, running 64-bit Raspberry Pi OS.
+
+The aim is an appliance-style system that starts with the car, connects to an Android phone, displays Android Auto on a touchscreen, and uses Raspberry Pi hardware acceleration where available. The primary runtime is a normal Raspberry Pi OS application—not Docker—and the finished installer will be a Debian (`.deb`) package managed by systemd.
+
+> [!IMPORTANT]
+> This project is at an early hardware-diagnostics stage. It does **not** yet display Android Auto, play its audio, return touch input, or support wireless Android Auto. It is experimental, uncertified software for bench development and must not control safety-critical vehicle functions.
+
+## Current status
+
+Milestone 1 is building and testing the safe USB foundation needed before the Android Auto session itself.
+
+Working today:
+
+- native Rust build on 64-bit Raspberry Pi OS;
+- Raspberry Pi model, OS, and architecture preflight checks;
+- runtime detection of onboard and USB Wi-Fi/Bluetooth providers;
+- independent `Auto`, `Onboard`, or explicit USB provider selection for Wi-Fi and Bluetooth;
+- USB device discovery;
+- documented Android Open Accessory (AOA) negotiation;
+- phone re-enumeration detection and accessory bulk-endpoint discovery;
+- clean unplug/reconnect handling;
+- an `arm64` development `.deb` with unprivileged USB access rules.
+
+Verified on the Pi 5 reference system:
+
+- Raspberry Pi 5, 8 GB, booting from NVMe;
+- Debian 13/Raspberry Pi OS Trixie, 64-bit;
+- Samsung phone entering AOA 2 accessory mode;
+- reconnect without rebooting the Pi;
+- 100/100 repeated interface claim/release cycles;
+- no increase in open file handles or resident memory during that soak;
+- package install, remove, purge, and clean reinstall.
+
+Detailed results are recorded in [the Pi 5 evidence report](docs/hardware/evidence/pi5-2026-08-04.md).
+
+## Supported hardware target
+
+| Hardware | Intended support | Current validation |
+|---|---|---|
+| Raspberry Pi 5 | Yes | Primary development/reference board |
+| Raspberry Pi 4 | Yes | Physical testing follows the complete Pi 5 wired path |
+| Compute Module 5 | Yes | Carrier-board testing planned |
+| Compute Module 4 | Yes | Waveshare Mini Base Board (B) Rev 3.1 planned |
+
+Only 64-bit Raspberry Pi OS is targeted. Other Raspberry Pi models and 32-bit operating systems are outside the compatibility contract.
+
+The first display is the official 7-inch Raspberry Pi touchscreen. The design is resolution-independent so larger DSI or HDMI displays, different aspect ratios, rotation, bezel sizes, and USB touch controllers can be configured later.
+
+## Wi-Fi and Bluetooth design
+
+The software checks what Linux can actually use; it does not assume every Compute Module includes wireless hardware.
+
+- If onboard Wi-Fi or Bluetooth is present and working, `Auto` prefers it.
+- If either capability is absent, a supported USB adapter can provide it.
+- Wi-Fi and Bluetooth are selected independently, so mixed onboard/USB combinations are possible.
+- A settings screen will eventually expose `Auto`, `Onboard`, and each detected supported USB device.
+- A missing or broken radio disables only future wireless Android Auto; wired Android Auto remains available.
+
+Wireless Android Auto is deliberately scheduled after a stable wired release. Adapter support will be published by tested chipset and USB ID rather than claimed for every dongle.
+
+## Try the current diagnostics
+
+This is for development on a 64-bit Raspberry Pi OS system. Rust and the native build dependencies are currently required; end users should wait for a published `.deb` release.
+
+```bash
+cargo run -p aa-headunit-diagnostics -- preflight
+cargo run -p aa-headunit-diagnostics -- wireless
+cargo run -p aa-headunit-diagnostics -- usb list
+cargo run -p aa-headunit-diagnostics -- usb aoa --device BUS:ADDRESS
+```
+
+After a phone is already in accessory mode, developers can repeat the safe interface open/close check:
+
+```bash
+cargo run -p aa-headunit-diagnostics -- usb soak --device BUS:ADDRESS --cycles 100
+```
+
+The AOA command requires an explicit USB bus/address. It does not send vendor control requests indiscriminately to every attached USB device.
+
+## Planned finished installation
+
+The release installation will be native to Raspberry Pi OS:
+
+1. Install the signed `arm64` `.deb` with `apt`.
+2. Run the preflight/setup tool.
+3. Choose display, touch, audio, microphone, and radio providers.
+4. Enable the systemd service explicitly.
+5. Reboot into the full-screen appliance experience.
+
+No Docker runtime and no Rust toolchain will be required on the finished head unit. See [PACKAGING.md](PACKAGING.md) for the complete packaging policy.
+
+## Architecture
+
+The project keeps responsibilities separate so board changes do not leak into protocol or UI code:
+
+```text
+USB/wireless transport -> protocol and session -> media pipelines -> touchscreen UI
+                              |
+                              +-> platform and carrier-board services
+```
+
+Rust is preferred for transport, state machines, policy, and platform interfaces. Board-specific behavior sits behind capability interfaces. GTK 4 and GStreamer are the current UI/media candidates, subject to measurement on the Pi 5 reference system.
+
+Read [ARCHITECTURE.md](ARCHITECTURE.md) for component boundaries and [REPO_LAYOUT.md](REPO_LAYOUT.md) for the source-tree map.
+
+## Roadmap
+
+Development is Pi 5 first, followed by physical validation and adaptation on Pi 4, CM4, and CM5.
+
+1. Documented USB/AOA diagnostic — in progress
+2. Lawful protocol feasibility and session skeleton
+3. Hardware-accelerated media, audio, microphone, UI, and touch spike
+4. Complete wired projection on Pi 5
+5. Appliance startup, systemd integration, and release packaging
+6. Pi 4/CM4/CM5 porting and wired hardening
+7. Wired 1.0
+8. Wireless Android Auto research and implementation
+9. Custom CM4/CM5 carrier PCB track
+
+See [MILESTONES.md](MILESTONES.md) for deliverables and exit gates.
+
+## Protocol and legal policy
+
+The public Android Open Accessory requests are implemented from AOSP documentation. Google does not publicly document the complete production Android Auto head-unit protocol.
+
+Undocumented behavior is not guessed. Each protocol feature must be backed by a public specification, an authorized source, or a documented and legally reviewed interoperability process. Unknown behavior stays unimplemented. The project is independent and is not Google-certified.
+
+See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for the full policy.
+
+## Repository guide
+
+- [`apps/aa-headunit-diagnostics`](apps/aa-headunit-diagnostics) — current command-line diagnostic
+- [`crates/transport-api`](crates/transport-api) — transport interfaces and AOA state machine
+- [`crates/transport-usb`](crates/transport-usb) — Linux/libusb implementation
+- [`crates/platform-api`](crates/platform-api) — board/platform capability interfaces
+- [`crates/platform-linux`](crates/platform-linux) — Raspberry Pi OS discovery implementation
+- [`packaging/debian`](packaging/debian) — development Debian package metadata
+- [`docs`](docs) — design decisions, protocol evidence, and hardware reports
+
+## Contributing
+
+Contributions and hardware test reports will be welcome as the project matures. Please start by reading [ARCHITECTURE.md](ARCHITECTURE.md), [MILESTONE_01.md](MILESTONE_01.md), and the protocol certainty rules in [PRD.md](PRD.md). Do not submit copied protocol definitions, private captures, secrets, phone content, or code with unclear licensing.
+
+Before submitting Rust changes, run:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+## Documentation
+
+- [Product requirements](PRD.md)
+- [Architecture](ARCHITECTURE.md)
+- [Repository layout](REPO_LAYOUT.md)
+- [Milestones](MILESTONES.md)
+- [Exact first milestone](MILESTONE_01.md)
+- [Risk register](RISK_REGISTER.md)
+- [Packaging and installation plan](PACKAGING.md)
+
+## License and naming
+
+`Pi Auto Head Unit` is a working name. Trademark and final licensing decisions remain subject to the protocol-source and legal review described in the project documents.

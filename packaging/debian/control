@@ -1,0 +1,25 @@
+Source: aa-headunit
+Section: utils
+Priority: optional
+Maintainer: Pi Auto Head Unit Contributors <noreply@example.invalid>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc,
+ pkg-config,
+ libusb-1.0-0-dev
+Standards-Version: 4.7.2
+Homepage: https://github.com/OWNER/pi-auto-headunit
+Rules-Requires-Root: no
+
+Package: aa-headunit-diagnostics
+Architecture: arm64
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ libusb-1.0-0
+Description: Raspberry Pi head-unit milestone diagnostics
+ Read-only platform and wireless-provider inventory plus an explicitly selected,
+ documented Android Open Accessory USB transition diagnostic. This package does
+ not implement an Android Auto session.
+

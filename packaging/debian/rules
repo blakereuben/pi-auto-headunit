@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --locked --release -p aa-headunit-diagnostics
+
+override_dh_auto_test:
+	cargo test --locked --workspace
+
+override_dh_auto_install:
+	install -D -m0755 target/release/aa-headunit-diagnostics \
+		debian/aa-headunit-diagnostics/usr/bin/aa-headunit-diagnostics
+	install -D -m0644 config/default.toml \
+		debian/aa-headunit-diagnostics/etc/aa-headunit/config.toml
+	install -D -m0644 packaging/udev/70-aa-headunit.rules \
+		debian/aa-headunit-diagnostics/usr/lib/udev/rules.d/70-aa-headunit.rules
