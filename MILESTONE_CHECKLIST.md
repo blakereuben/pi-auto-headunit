@@ -57,6 +57,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [ ] Add parser fuzz/property tests for untrusted phone input.
 - [ ] Reach and name the first repeatable Android Auto session state on the Pi 5.
 - [x] Run the opt-in generated-credential probe and record its first sanitized Pi 5 result: version 1.6 accepted, TLS timed out cleanly.
+- [x] Record the phone's Android Auto error 7 security rejection of the generated identity and stop repeating that experiment.
 - [ ] Prove clean timeout, malformed-message, unplug, and reconnect recovery.
 
 ## M3 — Pi 5 display, media, audio, microphone, and touch

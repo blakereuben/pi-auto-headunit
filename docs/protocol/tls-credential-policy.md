@@ -32,8 +32,8 @@ A narrowly controlled bench handshake with temporary project-generated credentia
 
 ## First bench result
 
-On 4 August 2026, the Pi 5 probe reached an accepted AAP 1.6 version response and then timed out before TLS completed. No authentication-complete or service-discovery response was sent. This is not evidence that the generated identity was accepted or rejected; further diagnosis must distinguish TLS transport/configuration from credential handling without logging handshake payloads or weakening the stop boundary.
+On 4 August 2026, the Pi 5 probe reached an accepted AAP 1.6 version response and then timed out before TLS completed. No authentication-complete or service-discovery response was sent. The TLS-1.2 comparison received peer TLS data, and the phone displayed Android Auto error 7 stating that the software had not met its security requirement. Together, these observations establish that the temporary project-generated identity was rejected.
 
 A separate `--tls12-compat` mode is now available because the pinned AASDK source explicitly selects `TLSv1_2_client_method()` when built against OpenSSL older than 1.1. The ordinary probe retains AASDK's newer `TLS_client_method()` behaviour. Comparing these modes is source-backed diagnosis, not an inferred protocol requirement.
 
-The first TLS-1.2 comparison received peer TLS data but still timed out before completion. The next diagnostic revision exposes only OpenSSL's generic handshake state label on timeout; it does not expose records, lengths, cryptographic values, or payload contents.
+The repository will not repeat the generated-identity experiment. The next interoperability decision is whether to present AASDK's public shared compatibility certificate/key. That pair is GPL-covered source material but carries third-party identity names, so its use and redistribution require explicit project-owner approval and a documented independent-project disclaimer; legal certainty cannot be inferred from technical compatibility.
