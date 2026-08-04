@@ -20,6 +20,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         [command] if command == "preflight" => preflight(),
         [command] if command == "wireless" => wireless(&[]),
         [command, rest @ ..] if command == "wireless" => wireless(rest),
+        [group, command] if group == "media" && command == "probe" => media_probe(),
         [group, command] if group == "usb" && command == "list" => usb_list(),
         [group, command, flag, selector]
             if group == "usb" && command == "aoa" && flag == "--device" =>
@@ -60,6 +61,7 @@ fn print_help() {
          Commands:\n\
            preflight\n\
            wireless [--wifi auto|onboard|STABLE_ID] [--bluetooth auto|onboard|STABLE_ID]\n\
+           media probe\n\
            usb list\n\
            usb aoa --device BUS:ADDRESS\n\
            usb soak --device BUS:ADDRESS --cycles COUNT\n\
@@ -148,6 +150,59 @@ fn print_radios(providers: &[RadioProvider]) {
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn media_probe() -> Result<(), CliError> {
+    use media_api::{DecoderKind, DecoderPolicy, VideoCodec, VideoMode, VideoRequest};
+
+    let request = VideoRequest {
+        codec: VideoCodec::H264,
+        mode: VideoMode {
+            width: 800,
+            height: 480,
+            frames_per_second: 30,
+        },
+    };
+    let backend = media_gstreamer::GstreamerBackend::new()
+        .map_err(|error| CliError::Media(error.to_string()))?;
+    let capabilities = backend.available_decoders(&request);
+    for capability in &capabilities {
+        let kind = match capability.kind {
+            DecoderKind::Hardware => "hardware",
+            DecoderKind::Software => "software",
+        };
+        println!(
+            "media_decoder={} codec={} kind={kind} mode={}x{}@{}",
+            capability.id,
+            capability.codec,
+            request.mode.width,
+            request.mode.height,
+            request.mode.frames_per_second
+        );
+    }
+    let selected = media_api::select_decoder(
+        &request,
+        &capabilities,
+        DecoderPolicy {
+            allow_software: true,
+        },
+    )
+    .map_err(|error| CliError::Media(error.to_string()))?;
+    let elements = backend
+        .verify_pipeline_elements(selected)
+        .map_err(|error| CliError::Media(error.to_string()))?;
+    println!("media_selection={}", selected.id);
+    println!(
+        "media_pipeline={}!{}!{}!{}",
+        elements.parser, elements.decoder, elements.converter, elements.sink
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn media_probe() -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
 }
 
 fn usb_list() -> Result<(), CliError> {
@@ -337,6 +392,8 @@ enum CliError {
     Usage(String),
     UnsupportedPlatform,
     Io(std::io::Error),
+    #[cfg(target_os = "linux")]
+    Media(String),
     Aoa(transport_api::AoaError),
 }
 
@@ -346,6 +403,8 @@ impl CliError {
             Self::Usage(_) => 2,
             Self::UnsupportedPlatform => 10,
             Self::Io(_) => 12,
+            #[cfg(target_os = "linux")]
+            Self::Media(_) => 18,
             Self::Aoa(transport_api::AoaError::PermissionDenied(_)) => 13,
             Self::Aoa(transport_api::AoaError::Unsupported(_)) => 14,
             Self::Aoa(transport_api::AoaError::TimedOut(_)) => 15,
@@ -364,6 +423,8 @@ impl std::fmt::Display for CliError {
                 "this command requires 64-bit Raspberry Pi OS Trixie on CM4, CM5, Pi 4, or Pi 5"
             ),
             Self::Io(error) => write!(f, "I/O: {error}"),
+            #[cfg(target_os = "linux")]
+            Self::Media(error) => write!(f, "media: {error}"),
             Self::Aoa(error) => error.fmt(f),
         }
     }

@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+media-api = { path = "../../crates/media-api" }
+media-gstreamer = { path = "../../crates/media-gstreamer" }
 platform-api = { path = "../../crates/platform-api" }
 platform-linux = { path = "../../crates/platform-linux" }
 transport-api = { path = "../../crates/transport-api" }
@@ -14,4 +16,3 @@ transport-usb = { path = "../../crates/transport-usb" }
 
 [lints]
 workspace = true
-

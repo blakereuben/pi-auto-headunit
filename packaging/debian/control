@@ -7,9 +7,10 @@ Build-Depends:
  cargo,
  rustc,
  pkg-config,
- libusb-1.0-0-dev
+ libusb-1.0-0-dev,
+ libgstreamer1.0-dev
 Standards-Version: 4.7.2
-Homepage: https://github.com/OWNER/pi-auto-headunit
+Homepage: https://github.com/blakereuben/pi-auto-headunit
 Rules-Requires-Root: no
 
 Package: aa-headunit-diagnostics
@@ -17,9 +18,11 @@ Architecture: arm64
 Depends:
  ${misc:Depends},
  ${shlibs:Depends},
- libusb-1.0-0
+ libusb-1.0-0,
+ gstreamer1.0-libav,
+ gstreamer1.0-plugins-bad,
+ gstreamer1.0-plugins-base
 Description: Raspberry Pi head-unit milestone diagnostics
- Read-only platform and wireless-provider inventory plus an explicitly selected,
- documented Android Open Accessory USB transition diagnostic. This package does
- not implement an Android Auto session.
-
+ Platform, wireless-provider, USB/AOA, and media capability diagnostics for the
+ Raspberry Pi head-unit project. This package does not implement an Android
+ Auto session.

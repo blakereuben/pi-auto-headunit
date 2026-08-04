@@ -29,7 +29,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Reconnect without rebooting the Pi or resetting the service.
 - [x] Pass 100/100 repeated interface claim/release cycles.
 - [x] Show no file-handle or resident-memory growth during the interface soak.
-- [x] Pass native formatting, strict linting, and all 21 tests on the Pi 5.
+- [x] Pass native formatting, strict linting, and all 23 tests on the Pi 5.
 - [x] Build, install, remove, purge, and cleanly reinstall the development `.deb`.
 - [x] Upgrade from `0.0.9-1` to `0.1.0-1` while preserving a locally modified configuration.
 - [x] Detect a physical unplug while the accessory bulk interface is actively claimed.
@@ -55,6 +55,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [ ] Verify touch rotation and calibration in every supported screen orientation.
 - [x] Render synthetic H.264 video and measure Pi 5 decode/presentation performance.
 - [x] Select and document the Pi 5 software H.264 decode plus Wayland/GPU composition fallback path.
+- [x] Implement and verify the GStreamer decoder-capability adapter on the Pi 5.
 - [x] Detect Pi 5 audio routes and document that the DSI reference setup exposes no usable onboard/HDMI sink.
 - [x] Test the USB sound card as an audio-output fallback.
 - [ ] Select and test a microphone input.

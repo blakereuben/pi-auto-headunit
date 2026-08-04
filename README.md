@@ -26,6 +26,7 @@ Working today:
 - documented Android Open Accessory (AOA) negotiation;
 - phone re-enumeration detection and accessory bulk-endpoint discovery;
 - clean unplug/reconnect handling;
+- board-independent video-decoder selection and a native GStreamer capability probe;
 - an `arm64` development `.deb` with unprivileged USB access rules.
 
 Verified on the Pi 5 reference system:
@@ -37,6 +38,7 @@ Verified on the Pi 5 reference system:
 - 100/100 repeated interface claim/release cycles;
 - no increase in open file handles or resident memory during that soak;
 - package install, remove, purge, and clean reinstall.
+- Pi 5 H.264 software decoding selected at 800x480/30 with Wayland output.
 
 Detailed results are recorded in [the Pi 5 evidence report](docs/hardware/evidence/pi5-2026-08-04.md).
 
@@ -70,10 +72,10 @@ Wireless Android Auto is deliberately scheduled after a stable wired release. Ad
 - Raspberry Pi 5, Pi 4, CM5, or CM4; development and physical validation currently use the Pi 5 only.
 - 64-bit Raspberry Pi OS based on Debian 13 (Trixie).
 - A USB host port and data-capable USB cable for wired phone testing.
-- Rust 1.85 or newer, Cargo, a C build toolchain, `pkg-config`, and the `libusb-1.0` development package when building from source.
+- Rust 1.85 or newer, Cargo, a C build toolchain, `pkg-config`, and the libusb and GStreamer development packages when building from source.
 - An Android phone for hardware tests; no phone is required for ordinary unit tests.
 
-Current direct Rust dependencies and their licences are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Future display, media, audio, Bluetooth, and networking dependencies will be documented when they are actually added.
+Current direct Rust and native dependencies and their licences are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Future display, audio, Bluetooth, and networking dependencies will be documented when they are actually added.
 
 ## Installation
 
@@ -81,7 +83,7 @@ There is not yet an end-user release. The current diagnostic can be built on a 6
 
 ```bash
 sudo apt update
-sudo apt install build-essential cargo libusb-1.0-0-dev pkg-config rustc
+sudo apt install build-essential cargo libgstreamer1.0-dev libusb-1.0-0-dev pkg-config rustc
 git clone https://github.com/blakereuben/pi-auto-headunit.git
 cd pi-auto-headunit
 cargo build --workspace --locked
@@ -96,6 +98,7 @@ This is for development on a 64-bit Raspberry Pi OS system. Rust and the native 
 ```bash
 cargo run -p aa-headunit-diagnostics -- preflight
 cargo run -p aa-headunit-diagnostics -- wireless
+cargo run -p aa-headunit-diagnostics -- media probe
 cargo run -p aa-headunit-diagnostics -- usb list
 cargo run -p aa-headunit-diagnostics -- usb aoa --device BUS:ADDRESS
 ```
@@ -119,7 +122,7 @@ USB/wireless transport -> protocol and session -> media pipelines -> touchscreen
                               +-> platform and carrier-board services
 ```
 
-Rust is preferred for transport, state machines, policy, and platform interfaces. Board-specific behavior sits behind capability interfaces. GTK 4 and GStreamer are the current UI/media candidates, subject to measurement on the Pi 5 reference system.
+Rust is preferred for transport, state machines, policy, and platform interfaces. Board-specific behavior sits behind capability interfaces. GStreamer is now the measured media backend; the full-screen UI toolkit remains to be selected after a Pi 5 spike.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) for component boundaries and [REPO_LAYOUT.md](REPO_LAYOUT.md) for the source-tree map.
 
@@ -154,6 +157,8 @@ See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for
 - [`crates/transport-usb`](crates/transport-usb) — Linux/libusb implementation
 - [`crates/platform-api`](crates/platform-api) — board/platform capability interfaces
 - [`crates/platform-linux`](crates/platform-linux) — Raspberry Pi OS discovery implementation
+- [`crates/media-api`](crates/media-api) — board-independent decoder requirements and selection
+- [`crates/media-gstreamer`](crates/media-gstreamer) — Linux GStreamer capability adapter
 - [`packaging/debian`](packaging/debian) — development Debian package metadata
 - [`docs`](docs) — design decisions, protocol evidence, and hardware reports
 

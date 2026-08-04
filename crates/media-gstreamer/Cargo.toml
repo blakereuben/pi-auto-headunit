@@ -1,0 +1,16 @@
+[package]
+name = "media-gstreamer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+media-api = { path = "../media-api" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gstreamer = "=0.24.2"
+
+[lints]
+workspace = true
