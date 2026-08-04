@@ -20,6 +20,8 @@
 | Official developer-mode ADB-forwarded TCP 5277 transport | P0 product fact plus live negative result | Google DHU documentation and sanitized Pi 5 test | Implemented; version 1.6 accepted and TLS peer data received, but generated identity rejected with error 7 |
 | OpenAuto session and service behaviour | P1 partially adopted | GPL-3.0-or-later OpenAuto revision `aa90412`; exact file scope in adoption record | First bounded service-discovery event transition implemented with synthetic tests; remaining services not implemented |
 | Service-discovery request fields | P1 | Approved AASDK `ServiceDiscoveryRequest.proto` plus the attributed OpenAuto event boundary | Yes; bounded, privacy-preserving summary only, with no field content retained |
+| Internal service catalogue and readiness filtering | P1 | Approved OpenAuto `ServiceFactory.cpp`, `ServiceFactory.hpp`, and `IService.hpp` | Yes; bounded synthetic model, not wire encoded |
+| Service-discovery response wire format | PX pending mapping | Pinned OpenAuto uses an older `ChannelDescriptor` schema; pinned maintained AASDK uses newer repeated `Service` messages | No; field-by-field current-schema adoption required before encoding |
 | Wireless Android Auto bootstrap/session | PX | Not publicly specified in the sources reviewed | No |
 
 Public sources:

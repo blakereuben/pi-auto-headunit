@@ -2,8 +2,8 @@
 //!
 //! Framing behaviour is derived from AASDK at revision
 //! `9bf6adf933665dee26532201719fac14a047ccf1`, licensed GPL-3.0-or-later.
-//! Service-discovery event behaviour also uses OpenAuto revision
-//! `aa90412bf93b5a5078495ea85ac9270c6297d369`. See the AASDK and OpenAuto
+//! Service-discovery event behaviour also uses `OpenAuto` revision
+//! `aa90412bf93b5a5078495ea85ac9270c6297d369`. See the AASDK and `OpenAuto`
 //! adoption records under `docs/protocol` for exact provenance and exclusions.
 
 // Portions derived from AASDK framing behaviour.
@@ -15,6 +15,7 @@ use std::fmt;
 
 mod assembly;
 mod control;
+mod service_catalogue;
 mod service_discovery;
 mod tls;
 
@@ -23,6 +24,10 @@ pub use control::{
     AASDK_PROTOCOL_VERSION, CONTROL_CHANNEL_ID, ControlError, ControlMessage, ControlMessageId,
     DEFAULT_MAX_CONTROL_BODY_SIZE, DEFAULT_MAX_TLS_CHUNK_SIZE, HandshakeAction, HandshakeEvent,
     HandshakeState, HandshakeStateMachine, ProtocolVersion,
+};
+pub use service_catalogue::{
+    DEFAULT_MAX_SERVICE_CANDIDATES, ServiceAvailability, ServiceCandidate, ServiceCatalogue,
+    ServiceCatalogueError, ServiceDescriptor, ServiceKind,
 };
 pub use service_discovery::{
     DEFAULT_MAX_DISCOVERY_ICON_SIZE, DEFAULT_MAX_DISCOVERY_TEXT_SIZE, DEFAULT_MAX_PHONE_INFO_SIZE,

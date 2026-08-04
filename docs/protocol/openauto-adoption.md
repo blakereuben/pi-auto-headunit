@@ -52,6 +52,20 @@ Both reviewed files carry the 2018 f1x.studio (Michal Szwaj) copyright notice an
 
 Unlike OpenAuto, the Rust boundary does not log or retain the phone's label, device name, icons, or nested phone information. It validates the request with explicit total, icon, text, and nested-message limits and exposes only field presence and byte counts. Unknown non-group protobuf fields are skipped safely; malformed, oversized, invalid-wire-type, and invalid-UTF-8 inputs fail closed. Four deterministic unit tests use synthetic data only. No service-discovery response, upstream identity string, phone connection, certificate, key, or authentication behaviour is included in this scope.
 
+## Adopted service-catalogue scope
+
+The bounded internal catalogue and conditional service-composition behaviour are derived from:
+
+- `src/autoapp/Service/ServiceFactory.cpp`
+- `include/f1x/openauto/autoapp/Service/ServiceFactory.hpp`
+- `include/f1x/openauto/autoapp/Service/IService.hpp`
+
+Each file carries the 2018 f1x.studio (Michal Szwaj) copyright notice and GPL-3.0-or-later terms. The Rust destination is `crates/protocol-aap/src/service_catalogue.rs`.
+
+The Rust model separates microphone, media audio, speech audio, system audio, sensors, video, Bluetooth, and input roles. It advertises only locally ready services, reserves channel zero for control, rejects duplicate channel identifiers and roles, and bounds the candidate count. Four deterministic tests cover filtering, lookup, conflicts, duplicate roles, and limits. Hardware selection remains outside the protocol crate and will supply availability through an interface.
+
+The approved OpenAuto revision uses an older AASDK `ChannelDescriptor` service-discovery schema, while approved AASDK revision `9bf6adf` uses a newer repeated `Service` schema. No wire response encoder, old-to-new field mapping, OpenAuto channel number, deprecated vehicle identity, Bluetooth address, display capability, or other upstream value is adopted in this slice. Each newer service schema must be mapped and attributed separately before response bytes are generated.
+
 ## Permanent exclusions
 
 - All certificates, private keys, authentication material, shared identities, and security-bypass behaviour

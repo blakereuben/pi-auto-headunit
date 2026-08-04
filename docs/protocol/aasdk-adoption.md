@@ -59,6 +59,8 @@ The control-state test uses fake TLS bytes. The separate `security-openssl` crat
 
 The Rust service-discovery parser uses the AASDK schema only for field numbers and wire types. It adds strict per-field and total bounds, validates text as UTF-8, does not decode the nested phone-info message, and discards all field content after recording byte counts. The accompanying event transition is attributed separately to OpenAuto.
 
+`protobuf/aap_protobuf/service/control/message/ServiceDiscoveryResponse.proto` and `protobuf/aap_protobuf/service/Service.proto` were reviewed for the next response slice but are not yet adopted into Rust wire encoding. Their service representation differs materially from the older AASDK schema used by pinned OpenAuto. Response encoding remains gated until every advertised service's current nested schema, required fields, identifiers, limits, and source notices are recorded here.
+
 The shared AASDK certificate identifies organisations named Google Automotive Link and JVC Kenwood and is paired with a publicly distributed private key. GPL compatibility does not authorise this independent project to present that identity. The repository does not contain it, and the credential is permanently excluded by `tls-credential-policy.md` and the OpenAuto adoption decision.
 
 ## Adopted USB interoperability-probe scope

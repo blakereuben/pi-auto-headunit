@@ -48,7 +48,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Implement the bounded version/TLS/authentication/service-discovery control state sequence against fake TLS data.
 - [x] Add a replaceable, bounded OpenSSL TLS client with injected credentials and no embedded shared key.
 - [x] Add an explicit live TLS bench probe using fresh in-memory credentials and a hard stop before authentication/service discovery.
-- [x] Pass native formatting, strict linting, and all 62 workspace tests after adding the privacy-preserving service-discovery request parser.
+- [x] Pass native formatting, strict linting, and all 66 workspace tests after adding the privacy-preserving service-discovery request parser and bounded service catalogue.
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.
@@ -58,6 +58,8 @@ Architecture and automated tests must remain portable throughout development, bu
 - [ ] Build all required protocol parsing and framing behind transport interfaces.
 - [x] Add the first deterministic fake-phone handshake test without sending new session messages to a real phone.
 - [x] Parse the first service-discovery request into a bounded summary without retaining phone names, labels, icons, nested phone details, or raw payloads.
+- [x] Model the service catalogue with bounded candidates, hardware-readiness filtering, unique roles, and non-conflicting channel identifiers.
+- [ ] Map the newer AASDK `Service` response schema field by field; do not reuse OpenAuto's older `ChannelDescriptor` wire shape.
 - [ ] Add parser fuzz/property tests for untrusted phone input.
 - [x] Reach and name `VersionAccepted` as the first repeatable live Android Auto session state on the Pi 5; authentication remains blocked.
 - [x] Run the opt-in generated-credential probe and record its first sanitized Pi 5 result: version 1.6 accepted, TLS timed out cleanly.

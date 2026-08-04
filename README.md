@@ -166,7 +166,7 @@ See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for
 - [`crates/platform-linux`](crates/platform-linux) — Raspberry Pi OS discovery implementation
 - [`crates/media-api`](crates/media-api) — board-independent decoder requirements and selection
 - [`crates/media-gstreamer`](crates/media-gstreamer) — Linux GStreamer capability adapter
-- [`crates/protocol-aap`](crates/protocol-aap) — bounded GPL-derived Android Auto frame codec
+- [`crates/protocol-aap`](crates/protocol-aap) — bounded GPL-derived framing, discovery parsing, and wire-neutral service catalogue
 - [`crates/security-openssl`](crates/security-openssl) — Linux OpenSSL adapter with injected credentials
 - [`packaging/debian`](packaging/debian) — development Debian package metadata
 - [`docs`](docs) — design decisions, protocol evidence, and hardware reports

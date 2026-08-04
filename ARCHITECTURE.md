@@ -61,6 +61,8 @@ Linux/libusb implementation for discovery, AOA identification/transition, re-enu
 
 Message framing, channel identifiers, serialization, validation limits, and protocol errors. Generated definitions, if any, live in a visibly provenance-tracked submodule/crate with source and license metadata. Unknown fields are preserved or rejected according to a written rule; they are never guessed.
 
+The internal service catalogue is wire-neutral and receives readiness from platform/media composition. It assigns no hardware policy of its own, excludes unavailable roles, and validates channel uniqueness before a response can be built. Because the approved OpenAuto and maintained AASDK revisions use different service-discovery schema generations, the catalogue must not be serialized until each current nested `Service` message is separately mapped, attributed, bounded, and tested.
+
 ### `session`
 
 An explicit state machine for discovery, version/security negotiation, service discovery, channel setup, running, draining, and teardown. Each transition records its allowed inputs, timeout, cancellation behavior, and user-visible failure category.
