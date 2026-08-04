@@ -110,19 +110,19 @@ Read [ARCHITECTURE.md](ARCHITECTURE.md) for component boundaries and [REPO_LAYOU
 
 ## Roadmap
 
-Development is Pi 5 first, followed by physical validation and adaptation on Pi 4, CM4, and CM5.
+Development remains exclusively on the Pi 5 reference system until both wired and wireless Android Auto, appliance startup, packaging, and stability are complete. Only then does physical validation and adaptation begin on Pi 4, CM4, and CM5.
 
 1. Documented USB/AOA diagnostic — in progress
 2. Lawful protocol feasibility and session skeleton
 3. Hardware-accelerated media, audio, microphone, UI, and touch spike
 4. Complete wired projection on Pi 5
 5. Appliance startup, systemd integration, and release packaging
-6. Pi 4/CM4/CM5 porting and wired hardening
-7. Wired 1.0
-8. Wireless Android Auto research and implementation
-9. Custom CM4/CM5 carrier PCB track
+6. Complete wireless Android Auto on Pi 5
+7. Pi 5 wired/wireless completion gate
+8. Pi 4, CM4, and CM5 porting and validation
+9. Project 1.0 and custom CM4/CM5 carrier PCB track
 
-See [MILESTONES.md](MILESTONES.md) for deliverables and exit gates.
+Track progress in [MILESTONE_CHECKLIST.md](MILESTONE_CHECKLIST.md). See [MILESTONES.md](MILESTONES.md) for the supporting deliverables and exit gates.
 
 ## Protocol and legal policy
 
@@ -160,6 +160,7 @@ cargo test --workspace
 - [Architecture](ARCHITECTURE.md)
 - [Repository layout](REPO_LAYOUT.md)
 - [Milestones](MILESTONES.md)
+- [Milestone checklist](MILESTONE_CHECKLIST.md)
 - [Exact first milestone](MILESTONE_01.md)
 - [Risk register](RISK_REGISTER.md)
 - [Packaging and installation plan](PACKAGING.md)

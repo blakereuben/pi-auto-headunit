@@ -4,7 +4,9 @@ Milestones are exit-gated. Dates are intentionally omitted until the protocol so
 
 ## Execution order
 
-Development is Pi 5 reference-first. M1 through the first complete wired projection are implemented and stabilized on the Pi 5/NVMe reference system before physical Pi 4, CM4/Waveshare, and CM5 validation. Cross-board work remains mandatory before product 1.0, but it is grouped into the later hardware-validation gate rather than blocking forward feature development after each Pi 5 milestone.
+Development is Pi 5 reference-first. Wired projection, wireless projection, appliance startup, packaging, and stability are implemented and completed on the Pi 5/NVMe reference system before any physical Pi 4, CM4/Waveshare, or CM5 validation. Cross-board work remains mandatory before product 1.0, but begins only after the Pi 5 completion gate.
+
+`MILESTONE_CHECKLIST.md` is the operational source of truth for progress and the exact gate between Pi 5 development and other-board testing.
 
 Each milestone records two statuses where relevant:
 
@@ -52,13 +54,13 @@ Exit gate: the team can show a lawful, maintainable route to full session intero
 
 Deliverables:
 
-- Validate GTK 4 + GStreamer + Wayland/DRM on Pi 4 and Pi 5 families.
+- Validate GTK 4 + GStreamer + Wayland/DRM on the Pi 5 reference system.
 - Render synthetic and approved captured encoded streams; measure startup, decode, presentation, memory, CPU, dropped frames, and end-to-end latency.
-- Validate H.264 hardware decode on Pi 4/CM4 and the Pi 5/CM5 fallback; probe HEVC without assuming the phone can negotiate it.
+- Validate the Pi 5 H.264 decode path and software fallback; probe HEVC without assuming the phone can negotiate it. Pi 4/CM4 media validation is deferred until M9.
 - Validate ALSA playback/capture, stream-role policy, touchscreen geometry/rotation, and full-screen compositor startup.
 - Decide ADR-0003/0005/0006.
 
-Exit gate: 720p30, touch, audio output, and microphone meet provisional targets on one board from each SoC family, with documented fallbacks.
+Reference exit gate: 720p30, touch, audio output, and microphone meet provisional targets on the Pi 5, with documented fallbacks. Cross-SoC validation is deferred until the Pi 5 completion gate.
 
 ## M4 — First complete wired projection
 
@@ -69,7 +71,7 @@ Deliverables:
 - Add capability negotiation derived only from approved protocol evidence.
 - Publish initial phone compatibility matrix and known limitations.
 
-Exit gate: a 30-minute interactive drive-bench scenario passes on Pi 4 and Pi 5 reference setups without crash, unbounded memory growth, or private payload logging.
+Reference exit gate: a 30-minute interactive drive-bench scenario passes on the Pi 5 without crash, unbounded memory growth, or private payload logging.
 
 ## M5 — Appliance integration and package beta
 
@@ -82,30 +84,62 @@ Deliverables:
 
 Exit gate: fresh install to usable appliance by following the published steps, service recovery works, and package tests pass.
 
-## M6 — Wired beta hardening
+## M6 — Pi 5 wired beta hardening
 
 Deliverables:
 
-- Port and validate the Pi 5 reference implementation on Pi 4, CM4/Waveshare, and CM5, resolving differences through existing platform/media/carrier interfaces or reviewed architecture changes.
-
-- Full four-board and carrier matrix, multiple phones/Android versions, 100-cycle reconnect, multi-hour soak, power interruption, thermal, low-storage, and missing-device tests.
+- Multiple phones/Android versions, 100-cycle reconnect, multi-hour soak, power interruption, thermal, low-storage, and missing-device tests on Pi 5.
 - Fuzz/property testing and external security/license review.
 - Accessibility and touch-target review, redacted support bundles, contributor documentation, issue templates, and release process.
-- Performance budgets enforced in hardware CI where stable.
+- Performance budgets enforced against the Pi 5 reference where stable.
 
-Exit gate: no open release-blocking defect, protocol provenance risk, or critical/high security issue.
+Reference exit gate: no open Pi 5 wired release-blocking defect, protocol provenance risk, or critical/high security issue.
 
-## M7 — Wired 1.0
+## M7 — Pi 5 wireless Android Auto
+
+Deliverables:
+
+- Complete the approved wireless protocol and security research before implementation.
+- Support onboard and tested external USB Wi-Fi/Bluetooth providers through the existing transport/platform boundaries.
+- Add independent `Auto`/`Onboard`/USB settings, persistence, actionable failures, and hotplug recovery.
+- Complete wireless video, audio, microphone, touch, reconnect, and multi-hour soak testing on Pi 5.
+- Prove wired operation is unaffected when wireless hardware is missing or degraded.
+
+Reference exit gate: wireless Android Auto passes the Pi 5 acceptance checklist and has no unresolved protocol, security, privacy, or licence blocker.
+
+## M8 — Pi 5 completion gate
+
+Deliverables:
+
+- Complete wired and wireless operation from cold boot without VNC.
+- Complete Pi 5 package, recovery, power, thermal, missing-device, low-storage, and sustained-use validation.
+- Publish a Pi 5 preview package and compatibility/limitations matrix.
+
+Exit gate: every required Pi 5 item in `MILESTONE_CHECKLIST.md` passes. Only after this gate may physical work begin on other supported boards.
+
+## M9 — Pi 4, CM4, and CM5 validation
+
+Deliverables:
+
+- Port and validate the frozen Pi 5 reference behaviour on Pi 4, CM4/Waveshare, and CM5.
+- Test the non-wireless CM4 with external USB Wi-Fi/Bluetooth providers.
+- Repeat wired, wireless, appliance, package, reconnect, soak, power, thermal, display, touch, and audio tests.
+- Resolve board differences through platform/media/carrier interfaces or reviewed architecture changes.
+- Publish the full board/carrier and peripheral compatibility matrix.
+
+Exit gate: every supported target meets the published compatibility contract with no release-blocking defect.
+
+## M10 — Project 1.0
 
 Deliverables:
 
 - Versioned compatibility contract, release notes, signed package/checksums, SBOM/source offer as required, and rollback instructions.
 - Stable configuration migration and support policy.
-- Published limitations: experimental/uncertified status, Pi 5 codec fallback, supported displays/audio, and phone matrix.
+- Published limitations: experimental/uncertified status, codec fallbacks, supported displays/audio/radios, and phone matrix.
 
 Exit gate: all PRD 1.0 acceptance criteria pass.
 
-## M8 — Wireless research and implementation (post-1.0)
+## Wireless implementation policy
 
 Research first: discovery/pairing, Bluetooth role, Wi-Fi AP/client policy, credentials, encryption, coexistence, reconnect, regulatory/user experience, protocol provenance, BlueZ, and NetworkManager integration.
 
@@ -119,7 +153,7 @@ The settings UI must demonstrate independent `Auto`/`Onboard`/USB selection for 
 
 ## Parallel hardware track — production carrier PCB
 
-This track begins after the Waveshare reference setup is stable and does not block early wired software work.
+Requirements research may proceed in parallel, but physical carrier-board validation begins only after the Pi 5 completion gate. This track does not block Pi 5 software work.
 
 1. **H0 requirements:** exact phone USB role/power, display connector, touch, audio codec/amplifier/microphone, regulated automotive power, ignition/shutdown, eMMC flashing, cooling, antenna, service ports, and enclosure constraints.
 2. **H1 compatibility matrix:** compare every used CM4/CM5 pin and peripheral against both datasheets and transition guidance; select only a verified common path or add explicit straps/muxes/assembly options.

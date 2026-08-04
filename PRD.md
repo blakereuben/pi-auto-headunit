@@ -183,7 +183,7 @@ Version 1.0 requires:
 
 ## 10.1 Development and validation order
 
-Raspberry Pi 5 is the reference development platform. Features are implemented and brought to end-to-end working state on Pi 5 first. Pi 4, CM4/Waveshare, and CM5 physical validation follows after the Pi 5 wired head unit is functional.
+Raspberry Pi 5 is the reference development platform. Features are implemented and brought to end-to-end working state on Pi 5 first, including wired Android Auto, wireless Android Auto, appliance startup, packaging, and stability. Pi 4, CM4/Waveshare, and CM5 physical validation begins only after the Pi 5 completion gate passes.
 
 This sequencing does not relax the final four-board support contract. Protocol, platform, media, UI, and carrier boundaries remain enforced from the start; Linux CI and capability-based code prevent deliberate Pi 5 coupling. A feature is **reference complete** when it passes on Pi 5 and **product complete** only after the required cross-board matrix passes.
 
