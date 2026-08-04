@@ -119,6 +119,8 @@ An advanced, explicitly opted-in bench command tests only Android Auto version n
 cargo run -p aa-headunit-diagnostics -- usb tls-probe --device BUS:ADDRESS --allow-live-aap
 ```
 
+For a controlled comparison with AASDK's older OpenSSL path, append `--tls12-compat`. This explicitly pins TLS 1.2 for that probe only; it is not yet a product default.
+
 ## Architecture
 
 The project keeps responsibilities separate so board changes do not leak into protocol or UI code:

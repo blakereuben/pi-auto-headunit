@@ -49,7 +49,16 @@ fn run(args: &[String]) -> Result<(), CliError> {
                 && device_flag == "--device"
                 && allow == "--allow-live-aap" =>
         {
-            usb_tls_probe(selector)
+            usb_tls_probe(selector, false)
+        }
+        [group, command, device_flag, selector, allow, compatibility]
+            if group == "usb"
+                && command == "tls-probe"
+                && device_flag == "--device"
+                && allow == "--allow-live-aap"
+                && compatibility == "--tls12-compat" =>
+        {
+            usb_tls_probe(selector, true)
         }
         [] | [..] if args.iter().any(|arg| arg == "--help" || arg == "-h") => {
             print_help();
@@ -75,6 +84,7 @@ fn print_help() {
            usb soak --device BUS:ADDRESS --cycles COUNT\n\
            usb hold --device BUS:ADDRESS --seconds COUNT\n\
            usb tls-probe --device BUS:ADDRESS --allow-live-aap\n\
+           usb tls-probe --device BUS:ADDRESS --allow-live-aap --tls12-compat\n\
          \n\
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
         env!("CARGO_PKG_VERSION")
@@ -383,13 +393,13 @@ fn usb_hold(_: &str, _: u64) -> Result<(), CliError> {
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_lines, clippy::items_after_statements)]
-fn usb_tls_probe(selector: &str) -> Result<(), CliError> {
+fn usb_tls_probe(selector: &str, tls12_compatibility: bool) -> Result<(), CliError> {
     use protocol_aap::{
         AASDK_MAX_FRAME_PAYLOAD_SIZE, ControlMessage, Encryption, FrameError, FrameHeader,
         FrameType, HandshakeAction, HandshakeEvent, HandshakeStateMachine, MessageAssembler,
         MessageType, ProtocolLimits, TlsClient, decode_frame, encode_frame,
     };
-    use security_openssl::{OpenSslTlsClient, generate_ephemeral_credentials};
+    use security_openssl::{OpenSslTlsClient, TlsVersionPolicy, generate_ephemeral_credentials};
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
     use transport_api::{AoaIdentification, AoaMachine};
@@ -409,6 +419,14 @@ fn usb_tls_probe(selector: &str) -> Result<(), CliError> {
 
     println!("probe_scope=version_and_tls_only");
     println!("probe_credentials=temporary_project_generated");
+    println!(
+        "probe_tls_policy={}",
+        if tls12_compatibility {
+            "tls12_compat"
+        } else {
+            "system_default"
+        }
+    );
     println!("probe_payload_logging=disabled");
     println!("probe_state=preparing_accessory_transport");
 
@@ -423,10 +441,15 @@ fn usb_tls_probe(selector: &str) -> Result<(), CliError> {
 
     let credentials =
         generate_ephemeral_credentials().map_err(|error| CliError::Protocol(error.to_string()))?;
-    let mut tls = OpenSslTlsClient::from_pem(
+    let mut tls = OpenSslTlsClient::from_pem_with_policy(
         &credentials.certificate_pem,
         &credentials.private_key_pem,
         64 * 1024,
+        if tls12_compatibility {
+            TlsVersionPolicy::Tls12Only
+        } else {
+            TlsVersionPolicy::SystemDefault
+        },
     )
     .map_err(|error| CliError::Protocol(error.to_string()))?;
     drop(credentials);
@@ -533,6 +556,7 @@ fn usb_tls_probe(selector: &str) -> Result<(), CliError> {
                     }
                 }
                 HandshakeAction::FeedTls(inbound) => {
+                    println!("probe_state=tls_peer_data_received");
                     let progress = tls
                         .feed(&inbound)
                         .map_err(|error| CliError::Protocol(error.to_string()))?;
@@ -605,7 +629,7 @@ fn usb_tls_probe(selector: &str) -> Result<(), CliError> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn usb_tls_probe(_: &str) -> Result<(), CliError> {
+fn usb_tls_probe(_: &str, _: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 

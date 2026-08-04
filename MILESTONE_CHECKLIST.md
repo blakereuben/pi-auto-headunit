@@ -47,7 +47,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Implement the bounded version/TLS/authentication/service-discovery control state sequence against fake TLS data.
 - [x] Add a replaceable, bounded OpenSSL TLS client with injected credentials and no embedded shared key.
 - [x] Add an explicit live TLS bench probe using fresh in-memory credentials and a hard stop before authentication/service discovery.
-- [x] Pass native formatting, strict linting, and all 52 workspace tests after adding the opt-in probe.
+- [x] Pass native formatting, strict linting, and all 53 workspace tests after adding the source-backed TLS 1.2 compatibility probe.
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.

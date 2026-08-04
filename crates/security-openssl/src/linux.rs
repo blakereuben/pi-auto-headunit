@@ -3,7 +3,9 @@ use std::io::{self, Read, Write};
 
 use openssl::pkey::{PKey, Private};
 use openssl::rsa::Rsa;
-use openssl::ssl::{ErrorCode, Ssl, SslContextBuilder, SslMethod, SslStream, SslVerifyMode};
+use openssl::ssl::{
+    ErrorCode, Ssl, SslContextBuilder, SslMethod, SslStream, SslVerifyMode, SslVersion,
+};
 use openssl::x509::X509;
 use protocol_aap::{TlsClient, TlsProgress};
 
@@ -93,6 +95,14 @@ pub struct OpenSslTlsClient {
     maximum_chunk_size: usize,
     started: bool,
     complete: bool,
+    version_policy: TlsVersionPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TlsVersionPolicy {
+    #[default]
+    SystemDefault,
+    Tls12Only,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,6 +175,20 @@ impl OpenSslTlsClient {
         private_key_pem: &[u8],
         maximum_chunk_size: usize,
     ) -> Result<Self, OpenSslTlsError> {
+        Self::from_pem_with_policy(
+            certificate_pem,
+            private_key_pem,
+            maximum_chunk_size,
+            TlsVersionPolicy::SystemDefault,
+        )
+    }
+
+    pub fn from_pem_with_policy(
+        certificate_pem: &[u8],
+        private_key_pem: &[u8],
+        maximum_chunk_size: usize,
+        version_policy: TlsVersionPolicy,
+    ) -> Result<Self, OpenSslTlsError> {
         if maximum_chunk_size == 0 {
             return Err(OpenSslTlsError::InvalidLimit);
         }
@@ -185,6 +209,12 @@ impl OpenSslTlsClient {
             .check_private_key()
             .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
         context.set_verify(SslVerifyMode::NONE);
+        if version_policy == TlsVersionPolicy::Tls12Only {
+            context
+                .set_min_proto_version(Some(SslVersion::TLS1_2))
+                .and_then(|()| context.set_max_proto_version(Some(SslVersion::TLS1_2)))
+                .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+        }
 
         let mut ssl = Ssl::new(&context.build())
             .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
@@ -197,7 +227,13 @@ impl OpenSslTlsClient {
             maximum_chunk_size,
             started: false,
             complete: false,
+            version_policy,
         })
+    }
+
+    #[must_use]
+    pub const fn version_policy(&self) -> TlsVersionPolicy {
+        self.version_policy
     }
 
     fn progress(&mut self) -> Result<TlsProgress, OpenSslTlsError> {
@@ -319,6 +355,20 @@ mod tests {
         assert_ne!(first.private_key_pem, second.private_key_pem);
         OpenSslTlsClient::from_pem(&first.certificate_pem, &first.private_key_pem, 64 * 1024)
             .expect("generated credentials should load");
+    }
+
+    #[test]
+    fn tls12_compatibility_policy_is_explicit() {
+        let credentials = generate_ephemeral_credentials().expect("credentials");
+        let mut client = OpenSslTlsClient::from_pem_with_policy(
+            &credentials.certificate_pem,
+            &credentials.private_key_pem,
+            64 * 1024,
+            TlsVersionPolicy::Tls12Only,
+        )
+        .expect("TLS 1.2 client");
+        assert_eq!(client.version_policy(), TlsVersionPolicy::Tls12Only);
+        assert!(!client.start().expect("client hello").outbound.is_empty());
     }
 
     #[test]
