@@ -3,6 +3,9 @@ use platform_api::{
 };
 use std::env;
 
+#[cfg(target_os = "linux")]
+mod live_probe;
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match run(&args) {
@@ -23,6 +26,19 @@ fn run(args: &[String]) -> Result<(), CliError> {
         [group, command] if group == "media" && command == "probe" => media_probe(),
         [group, command] if group == "usb" && command == "list" => usb_list(),
         [group, command] if group == "developer" && command == "tcp-probe" => developer_tcp_probe(),
+        [group, command, allow]
+            if group == "developer" && command == "tls-probe" && allow == "--allow-live-aap" =>
+        {
+            developer_tls_probe(false)
+        }
+        [group, command, allow, compatibility]
+            if group == "developer"
+                && command == "tls-probe"
+                && allow == "--allow-live-aap"
+                && compatibility == "--tls12-compat" =>
+        {
+            developer_tls_probe(true)
+        }
         [group, command, flag, selector]
             if group == "usb" && command == "aoa" && flag == "--device" =>
         {
@@ -81,6 +97,7 @@ fn print_help() {
            wireless [--wifi auto|onboard|STABLE_ID] [--bluetooth auto|onboard|STABLE_ID]\n\
            media probe\n\
            developer tcp-probe\n\
+           developer tls-probe --allow-live-aap [--tls12-compat]\n\
            usb list\n\
            usb aoa --device BUS:ADDRESS\n\
            usb soak --device BUS:ADDRESS --cycles COUNT\n\
@@ -102,10 +119,34 @@ fn developer_tcp_probe() -> Result<(), CliError> {
         Duration::from_secs(2),
     )
     .map_err(CliError::Transport)?;
+    transport
+        .verify_peer_available()
+        .map_err(CliError::Transport)?;
     println!("developer_transport=tcp");
     println!("developer_endpoint={}", transport.peer());
     println!("developer_connection=ready");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn developer_tls_probe(tls12_compatibility: bool) -> Result<(), CliError> {
+    use std::time::Duration;
+
+    reject_completed_generated_identity_probe()?;
+    let mut transport = transport_tcp::DeveloperTcpTransport::connect(
+        transport_tcp::DEFAULT_DEVELOPER_ADDRESS,
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+    )
+    .map_err(CliError::Transport)?;
+    println!("developer_transport=tcp");
+    println!("developer_endpoint={}", transport.peer());
+    live_probe::run(&mut transport, tls12_compatibility)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn developer_tls_probe(_: bool) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
 }
 
 fn preflight() -> Result<(), CliError> {
@@ -425,6 +466,7 @@ fn usb_tls_probe(selector: &str, tls12_compatibility: bool) -> Result<(), CliErr
     const IO_TIMEOUT: Duration = Duration::from_millis(500);
     const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
 
+    reject_completed_generated_identity_probe()?;
     let (bus, address) = transport_usb::parse_bus_address(selector).map_err(CliError::Aoa)?;
     let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
     let candidate = backend
@@ -651,6 +693,13 @@ fn usb_tls_probe(_: &str, _: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
+fn reject_completed_generated_identity_probe() -> Result<(), CliError> {
+    Err(CliError::Usage(
+        "generated-identity phone probes are permanently disabled after the recorded Android Auto error-7 rejection"
+            .into(),
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn open_fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
@@ -771,5 +820,16 @@ mod tests {
             "1:2".into(),
         ];
         assert!(matches!(run(&args), Err(CliError::Usage(_))));
+    }
+
+    #[test]
+    fn completed_generated_identity_probe_stays_disabled() {
+        let args = vec![
+            "developer".into(),
+            "tls-probe".into(),
+            "--allow-live-aap".into(),
+        ];
+        let error = run(&args).expect_err("completed experiment must stay disabled");
+        assert!(error.to_string().contains("permanently disabled"));
     }
 }

@@ -2,7 +2,10 @@ use crate::is_accessory_id;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 use std::thread;
 use std::time::{Duration, Instant};
-use transport_api::{AoaBackend, AoaError, AoaIdentification, BulkTransportInfo, UsbDeviceId};
+use transport_api::{
+    AoaBackend, AoaError, AoaIdentification, BulkTransportInfo, SessionTransport, TransportError,
+    UsbDeviceId,
+};
 
 const REQUEST_GET_PROTOCOL: u8 = 51;
 const REQUEST_SEND_STRING: u8 = 52;
@@ -171,6 +174,26 @@ impl LibUsbBulkTransport {
             Err(rusb::Error::Timeout) => Ok(0),
             Err(error) => Err(map_usb_error(error)),
         }
+    }
+}
+
+impl SessionTransport for LibUsbBulkTransport {
+    fn receive(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
+        self.read(buffer, Duration::from_millis(500))
+            .map_err(map_transport_error)
+    }
+
+    fn send_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        self.write_all(bytes, Duration::from_secs(2))
+            .map_err(map_transport_error)
+    }
+}
+
+fn map_transport_error(error: AoaError) -> TransportError {
+    match error {
+        AoaError::Unplugged => TransportError::Closed,
+        AoaError::TimedOut(_) => TransportError::TimedOut,
+        error => TransportError::Io(error.to_string()),
     }
 }
 

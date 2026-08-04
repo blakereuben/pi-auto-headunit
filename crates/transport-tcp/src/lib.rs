@@ -50,6 +50,24 @@ impl DeveloperTcpTransport {
     pub const fn peer(&self) -> SocketAddr {
         self.peer
     }
+
+    /// Confirms that the forwarded peer does not immediately close the stream.
+    /// A timeout means the peer remained connected without sending data.
+    pub fn verify_peer_available(&self) -> Result<(), TransportError> {
+        match self.stream.peek(&mut [0_u8; 1]) {
+            Ok(0) => Err(TransportError::Closed),
+            Ok(_) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(map_io(&error)),
+        }
+    }
 }
 
 impl SessionTransport for DeveloperTcpTransport {
@@ -146,5 +164,38 @@ mod tests {
             Err(TransportError::TimedOut)
         );
         server.join().expect("server");
+    }
+
+    #[test]
+    fn distinguishes_idle_peer_from_immediate_close() {
+        let idle_listener = TcpListener::bind("127.0.0.1:0").expect("idle listener");
+        let idle_address = idle_listener.local_addr().expect("idle address");
+        let idle_server = thread::spawn(move || {
+            let (_socket, _) = idle_listener.accept().expect("idle accept");
+            thread::sleep(Duration::from_millis(100));
+        });
+        let idle = DeveloperTcpTransport::connect(
+            idle_address,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .expect("idle connect");
+        assert_eq!(idle.verify_peer_available(), Ok(()));
+        idle_server.join().expect("idle server");
+
+        let closing_listener = TcpListener::bind("127.0.0.1:0").expect("closing listener");
+        let closing_address = closing_listener.local_addr().expect("closing address");
+        let closing_server = thread::spawn(move || {
+            let (socket, _) = closing_listener.accept().expect("closing accept");
+            drop(socket);
+        });
+        let closing = DeveloperTcpTransport::connect(
+            closing_address,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("closing connect");
+        assert_eq!(closing.verify_peer_available(), Err(TransportError::Closed));
+        closing_server.join().expect("closing server");
     }
 }

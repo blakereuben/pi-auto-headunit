@@ -12,7 +12,7 @@ The certificate subject names JVC Kenwood and its issuer names Google Automotive
 
 ## Implemented boundary
 
-`security-openssl` accepts certificate and private-key PEM bytes at runtime, checks that they match, and drives OpenSSL through bounded in-memory transport. Tests generate temporary credentials at runtime. The repository contains no compatibility credential, and the backend is not yet connected to a phone session.
+`security-openssl` accepts certificate and private-key PEM bytes at runtime, checks that they match, and drives OpenSSL through bounded in-memory transport. Tests generate temporary credentials at runtime. The repository contains no compatibility credential. Bounded phone probes reached TLS over both USB/AOA and the official developer tunnel, with the negative results below.
 
 The diagnostic now contains an explicit `usb tls-probe` path that generates a fresh keypair in memory for each invocation. It cannot run without `--allow-live-aap`, rejects an already-accessory-mode phone, and stops before authentication completion and service discovery. Passing native tests does not count as a live interoperability result.
 
@@ -22,13 +22,13 @@ Production Android Auto authentication must use a legitimate project-owned or of
 
 1. do not attempt to bypass Android Auto's security decision;
 2. do not treat a commercial product's functionality as permission to copy its internal material;
-3. use fake peers and Google's documented developer-mode DHU/head-unit-server path for continued protocol, media, UI, and transport development;
+3. use fake peers for continued protocol, media, UI, and transport development; the official DHU may be used only as an external reference because the custom client was also rejected through the developer tunnel;
 4. keep production wired projection marked blocked by authentication rather than claiming compatibility;
 5. pursue an official partner/certification route if a distributable production receiver requires provisioning unavailable to independent projects.
 
 No credential experiments may log PEM material, decrypted traffic, phone identifiers, or user content.
 
-A narrowly controlled bench handshake with temporary project-generated credentials may be used to determine whether an independent identity is accepted. It must remain opt-in, stop at the first named handshake result, send no service-discovery response or media/channel traffic, and record only a sanitized success/failure state.
+A narrowly controlled bench handshake with temporary project-generated credentials was used to determine whether an independent identity is accepted. The result is conclusive and the experiment must not be repeated. It remained opt-in, stopped before authentication completion and service discovery, sent no media/channel traffic, and recorded only sanitized states.
 
 ## First bench result
 
@@ -37,3 +37,11 @@ On 4 August 2026, the Pi 5 probe reached an accepted AAP 1.6 version response an
 A separate `--tls12-compat` mode is now available because the pinned AASDK source explicitly selects `TLSv1_2_client_method()` when built against OpenSSL older than 1.1. The ordinary probe retains AASDK's newer `TLS_client_method()` behaviour. Comparing these modes is source-backed diagnosis, not an inferred protocol requirement.
 
 The repository will not repeat the generated-identity experiment and will not test AASDK's public shared compatibility certificate/key. The implementation remains useful as a bounded, replaceable TLS engine and negative interoperability fixture, but no third-party credential will be added later merely to make the phone accept the software.
+
+## Developer-tunnel result
+
+The user enabled Android Auto developer mode and started the documented head-unit server on a Samsung Galaxy S23 Ultra. The Pi used ADB forwarding on loopback TCP port 5277. The project sent the same bounded version/TLS probe with fresh credentials: Android Auto accepted protocol version 1.6, returned TLS peer data, closed the connection, and displayed error 7 on the phone. No authentication-complete message, service discovery, channel setup, media, identifiers, or user content was sent or logged.
+
+This proves the developer transport works through the first protocol/TLS exchange, but it also proves that developer mode is not an identity bypass for this client. The temporary ADB forward was removed after the result, and the restarted phone server was not probed again.
+
+Both live generated-identity CLI paths now fail before opening USB or TCP transport, even when their former explicit opt-in flag is supplied. Automated coverage enforces this permanent lockout.
