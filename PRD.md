@@ -161,6 +161,8 @@ The original 800 × 480 display is the first known-good profile, not the product
 
 The public Google documentation confirms that Desktop Head Unit 2.x can connect over USB using Android Open Accessory. It does not publicly specify the complete production head-unit session protocol, media channel messages, or certification requirements.
 
+The project must not reuse shared credentials, certificates, private keys, authentication material, or security bypasses from another head-unit implementation. Google's documented developer-mode DHU/head-unit-server connection may be used as a lab transport, but it does not satisfy production authentication or the wired-release acceptance criteria.
+
 Every protocol feature must be labelled with one of these provenance levels:
 
 - **P0 — public specification:** directly supported by public Google/AOSP documentation.

@@ -113,13 +113,7 @@ cargo run -p aa-headunit-diagnostics -- usb hold --device BUS:ADDRESS --seconds 
 
 The AOA command requires an explicit USB bus/address. It does not send vendor control requests indiscriminately to every attached USB device. After an AOA transition, `usb hold` keeps the selected accessory interface open for a controlled physical-unplug test.
 
-An advanced, explicitly opted-in bench command tests only Android Auto version negotiation and a temporary generated-identity TLS handshake. It requires a freshly connected phone, uses the owner-approved AASDK accessory identity, logs no payloads, and stops before authentication completion or service discovery:
-
-```bash
-cargo run -p aa-headunit-diagnostics -- usb tls-probe --device BUS:ADDRESS --allow-live-aap
-```
-
-For a controlled comparison with AASDK's older OpenSSL path, append `--tls12-compat`. This explicitly pins TLS 1.2 for that probe only; it is not yet a product default.
+The repository retains an explicitly guarded TLS bench diagnostic as reproducible evidence of the Android Auto error-7 security rejection. That generated-identity experiment is complete and must not be repeated or repurposed with credentials from another head-unit implementation. Continued session development will use fake peers and Google's documented developer-mode head-unit server path.
 
 ## Architecture
 
@@ -155,7 +149,7 @@ Track progress in [MILESTONE_CHECKLIST.md](MILESTONE_CHECKLIST.md). See [MILESTO
 
 The public Android Open Accessory requests are implemented from AOSP documentation. Google does not publicly document the complete production Android Auto head-unit protocol.
 
-Undocumented behavior is not guessed. Each protocol feature must be backed by a public specification or an approved licensed source. Google and OpenAuto code remain excluded. GPLv3 AASDK-derived behaviour is permitted only when its exact source files and attribution are added to the [AASDK adoption record](docs/protocol/aasdk-adoption.md).
+Undocumented behavior is not guessed. Each protocol feature must be backed by a public specification or an approved licensed source. Google and OpenAuto code remain excluded. GPLv3 AASDK-derived behaviour is permitted only when its exact source files and attribution are added to the [AASDK adoption record](docs/protocol/aasdk-adoption.md). Credentials, certificates, keys, authentication material, and security bypasses from OpenAuto, OpenAuto Pro, AASDK, or another receiver are prohibited regardless of source-code licence.
 
 See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for the full policy.
 

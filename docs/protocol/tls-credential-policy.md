@@ -2,7 +2,7 @@
 
 ## Current decision
 
-The project may implement AASDK-derived TLS behaviour, but it will not embed, present, or redistribute AASDK's shared certificate/private-key pair until its compatibility and identity implications have been reviewed and explicitly approved.
+The project will not copy, embed, present, or redistribute credentials, certificates, private keys, authentication material, or security bypasses from OpenAuto, OpenAuto Pro, AASDK, or another head-unit implementation. GPL compatibility for source code does not make third-party identity material appropriate or legitimate to reuse.
 
 ## Verified source behaviour
 
@@ -16,15 +16,15 @@ The certificate subject names JVC Kenwood and its issuer names Google Automotive
 
 The diagnostic now contains an explicit `usb tls-probe` path that generates a fresh keypair in memory for each invocation. It cannot run without `--allow-live-aap`, rejects an already-accessory-mode phone, and stops before authentication completion and service discovery. Passing native tests does not count as a live interoperability result.
 
-## Gate for product integration
+## Product integration rule
 
-Before normal phone-session integration or redistribution of compatibility credentials, record:
+Production Android Auto authentication must use a legitimate project-owned or officially provisioned route. Until such a route is available:
 
-1. whether the AASDK pair is technically required or an independently generated identity is accepted, based on an approved source or controlled interoperability test;
-2. the legal/trademark rationale for any third-party-named certificate that would be presented or distributed;
-3. the package location, permissions, replacement mechanism, and disclosure that the key is a public compatibility credential rather than a secret;
-4. the security consequence of disabled peer verification and any safer compatible alternative;
-5. exact provenance and notices for whichever credential material is selected.
+1. do not attempt to bypass Android Auto's security decision;
+2. do not treat a commercial product's functionality as permission to copy its internal material;
+3. use fake peers and Google's documented developer-mode DHU/head-unit-server path for continued protocol, media, UI, and transport development;
+4. keep production wired projection marked blocked by authentication rather than claiming compatibility;
+5. pursue an official partner/certification route if a distributable production receiver requires provisioning unavailable to independent projects.
 
 No credential experiments may log PEM material, decrypted traffic, phone identifiers, or user content.
 
@@ -36,4 +36,4 @@ On 4 August 2026, the Pi 5 probe reached an accepted AAP 1.6 version response an
 
 A separate `--tls12-compat` mode is now available because the pinned AASDK source explicitly selects `TLSv1_2_client_method()` when built against OpenSSL older than 1.1. The ordinary probe retains AASDK's newer `TLS_client_method()` behaviour. Comparing these modes is source-backed diagnosis, not an inferred protocol requirement.
 
-The repository will not repeat the generated-identity experiment. The next interoperability decision is whether to present AASDK's public shared compatibility certificate/key. That pair is GPL-covered source material but carries third-party identity names, so its use and redistribution require explicit project-owner approval and a documented independent-project disclaimer; legal certainty cannot be inferred from technical compatibility.
+The repository will not repeat the generated-identity experiment and will not test AASDK's public shared compatibility certificate/key. The implementation remains useful as a bounded, replaceable TLS engine and negative interoperability fixture, but no third-party credential will be added later merely to make the phone accept the software.

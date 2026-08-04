@@ -51,7 +51,9 @@ Architecture and automated tests must remain portable throughout development, bu
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.
-- [ ] Approve the compatibility certificate/private-key distribution and identity policy before presenting or shipping AASDK's shared credential.
+- [x] Exclude OpenAuto/OpenAuto Pro/AASDK shared credentials and security bypasses from implementation and distribution.
+- [ ] Add the official developer-mode ADB-forwarded TCP 5277 transport for lawful session development.
+- [ ] Validate the session skeleton against the user-enabled Android Auto head-unit server without treating that path as production authentication.
 - [ ] Build all required protocol parsing and framing behind transport interfaces.
 - [x] Add the first deterministic fake-phone handshake test without sending new session messages to a real phone.
 - [ ] Add parser fuzz/property tests for untrusted phone input.

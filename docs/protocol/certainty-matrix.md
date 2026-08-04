@@ -16,7 +16,8 @@
 | Control envelope, version 1.6 negotiation, encapsulated TLS flow, successful authentication response, and transition to service discovery | P1 | Owner-approved GPL-3.0-or-later AASDK revision `9bf6adf`; exact control/cryptor/schema paths recorded | Yes; bounded state machine with fake TLS only |
 | Replaceable OpenSSL client using bounded memory transport and injected credentials | P1 | Approved AASDK cryptor/SSL wrapper paths plus maintained Rust OpenSSL bindings | Yes; native tests pass; first live probe accepted version 1.6 then TLS timed out |
 | Independently generated TLS identity | P1 negative result | Pi 5 live probe: AAP 1.6 accepted, TLS peer data received, phone displayed Android Auto error 7 security rejection | Rejected; do not repeat |
-| AASDK shared compatibility certificate/key policy, service-discovery parsing, and subsequent channels | PX | Shared credential identity/distribution decision and further AASDK paths are not yet approved | No |
+| AASDK/OpenAuto shared compatibility credentials or security bypasses | Excluded | Project-owner decision following error-7 research and identity review | No; must not be added or tested |
+| Official developer-mode ADB-forwarded TCP 5277 transport | P0 product fact | Google DHU documentation | Planned for session development only |
 | Wireless Android Auto bootstrap/session | PX | Not publicly specified in the sources reviewed | No |
 
 Public sources:
