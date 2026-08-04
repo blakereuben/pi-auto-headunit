@@ -50,7 +50,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.
-- [ ] Approve the compatibility certificate/private-key distribution and identity policy before a live TLS handshake.
+- [ ] Approve the compatibility certificate/private-key distribution and identity policy before presenting or shipping AASDK's shared credential.
 - [ ] Build all required protocol parsing and framing behind transport interfaces.
 - [x] Add the first deterministic fake-phone handshake test without sending new session messages to a real phone.
 - [ ] Add parser fuzz/property tests for untrusted phone input.

@@ -14,9 +14,9 @@ The certificate subject names JVC Kenwood and its issuer names Google Automotive
 
 `security-openssl` accepts certificate and private-key PEM bytes at runtime, checks that they match, and drives OpenSSL through bounded in-memory transport. Tests generate temporary credentials at runtime. The repository contains no compatibility credential, and the backend is not yet connected to a phone session.
 
-## Gate for live testing
+## Gate for product integration
 
-Before the first live TLS handshake, record:
+Before normal phone-session integration or redistribution of compatibility credentials, record:
 
 1. whether the AASDK pair is technically required or an independently generated identity is accepted, based on an approved source or controlled interoperability test;
 2. the legal/trademark rationale for any third-party-named certificate that would be presented or distributed;
@@ -25,3 +25,5 @@ Before the first live TLS handshake, record:
 5. exact provenance and notices for whichever credential material is selected.
 
 No credential experiments may log PEM material, decrypted traffic, phone identifiers, or user content.
+
+A narrowly controlled bench handshake with temporary project-generated credentials may be used to determine whether an independent identity is accepted. It must remain opt-in, stop at the first named handshake result, send no service-discovery response or media/channel traffic, and record only a sanitized success/failure state.
