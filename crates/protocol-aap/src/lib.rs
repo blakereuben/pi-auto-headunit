@@ -12,8 +12,14 @@
 use std::fmt;
 
 mod assembly;
+mod control;
 
 pub use assembly::{AssemblyError, Message, MessageAssembler};
+pub use control::{
+    AASDK_PROTOCOL_VERSION, CONTROL_CHANNEL_ID, ControlError, ControlMessage, ControlMessageId,
+    DEFAULT_MAX_CONTROL_BODY_SIZE, DEFAULT_MAX_TLS_CHUNK_SIZE, HandshakeAction, HandshakeEvent,
+    HandshakeState, HandshakeStateMachine, ProtocolVersion,
+};
 
 pub const AASDK_MAX_FRAME_PAYLOAD_SIZE: usize = 0x4000;
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;

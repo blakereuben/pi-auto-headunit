@@ -13,7 +13,8 @@
 | Android Auto accessory identification values | PX | Not publicly specified in the sources reviewed | No |
 | Two-byte AAP frame header, flags, short/extended big-endian lengths, and `0x4000` frame limit | P1 | Owner-approved GPL-3.0-or-later AASDK revision `9bf6adf` | Yes; bounded Rust codec and tests |
 | Per-channel first/middle/last/bulk message reassembly | P1 | Same approved AASDK revision and recorded `MessageInStream` source | Yes; bounded Rust assembler and tests |
-| Android Auto security negotiation, services, or channels beyond the adopted framing scope | PX | AASDK paths not yet individually reviewed/adopted | No |
+| Control envelope, version 1.6 negotiation, encapsulated TLS flow, successful authentication response, and transition to service discovery | P1 | Owner-approved GPL-3.0-or-later AASDK revision `9bf6adf`; exact control/cryptor/schema paths recorded | Yes; bounded state machine with fake TLS only |
+| TLS backend, certificate/key policy, service-discovery parsing, and subsequent channels | PX | Not yet separately approved and implemented | No |
 | Wireless Android Auto bootstrap/session | PX | Not publicly specified in the sources reviewed | No |
 
 Public sources:

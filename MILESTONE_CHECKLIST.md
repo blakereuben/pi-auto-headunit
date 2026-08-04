@@ -44,12 +44,13 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Pin the approved AASDK revision and record file-level attribution for the first framing scope.
 - [x] Implement bounded Rust frame encoding/decoding without sending protocol messages to a phone.
 - [x] Add bounded per-channel message reassembly with deterministic interleaving and malformed-sequence tests.
-- [x] Pass native formatting, strict linting, and all 38 workspace tests after adding framing and reassembly.
+- [x] Implement the bounded version/TLS/authentication/service-discovery control state sequence against fake TLS data.
+- [x] Pass native formatting, strict linting, and all 46 workspace tests after adding the fake handshake state machine.
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.
-- [ ] Build protocol parsing and framing behind transport interfaces.
-- [ ] Add deterministic fake-phone/session tests and sanitized fixtures.
+- [ ] Build all required protocol parsing and framing behind transport interfaces.
+- [x] Add the first deterministic fake-phone handshake test without sending new session messages to a real phone.
 - [ ] Add parser fuzz/property tests for untrusted phone input.
 - [ ] Reach and name the first repeatable Android Auto session state on the Pi 5.
 - [ ] Prove clean timeout, malformed-message, unplug, and reconnect recovery.

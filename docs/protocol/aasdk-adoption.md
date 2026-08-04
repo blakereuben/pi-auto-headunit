@@ -15,7 +15,7 @@ The project owner approved AASDK as a GPLv3-compatible source for Android Auto P
 
 The maintained repository README links to a root `LICENSE` file that is absent at the pinned revision. Adoption therefore relies on the explicit GPL-3.0-or-later notices in each source file used, not the broken README link.
 
-## First derived scope
+## Adopted framing scope
 
 The Rust `protocol-aap` framing implementation is derived from these files:
 
@@ -32,6 +32,30 @@ The Rust `protocol-aap` framing implementation is derived from these files:
 - `src/Messenger/MessageOutStream.cpp`
 
 Derived facts currently cover the two-byte frame header, flag layout, big-endian short/extended sizes, first-frame total size, the `0x4000` frame payload limit, and per-channel fragment reassembly. The Rust implementation adds stricter reserved-bit validation, independent bounded total-message/concurrent-channel limits, and rejects restarted, incomplete, inconsistent, or metadata-changing fragment sequences.
+
+## Adopted control-handshake scope
+
+The bounded control envelope and fake-transport handshake state machine are derived from these files:
+
+- `include/aasdk/Version.hpp`
+- `include/aasdk/Messenger/Cryptor.hpp`
+- `include/aasdk/Messenger/ICryptor.hpp`
+- `src/Messenger/Cryptor.cpp`
+- `include/aasdk/Transport/ISSLWrapper.hpp`
+- `include/aasdk/Transport/SSLWrapper.hpp`
+- `src/Transport/SSLWrapper.cpp`
+- `include/aasdk/Channel/Control/ControlServiceChannel.hpp`
+- `include/aasdk/Channel/Control/IControlServiceChannel.hpp`
+- `include/aasdk/Channel/Control/IControlServiceChannelEventHandler.hpp`
+- `src/Channel/Control/ControlServiceChannel.cpp`
+- `protobuf/aap_protobuf/service/control/ControlMessageType.proto`
+- `protobuf/aap_protobuf/service/control/message/AuthResponse.proto`
+- `protobuf/aap_protobuf/service/control/message/ServiceDiscoveryRequest.proto`
+- `protobuf/aap_protobuf/shared/MessageStatus.proto`
+
+Derived facts cover protocol version 1.6, two-byte big-endian control-message identifiers, the version request/response layout, TLS records encapsulated as control message 3, the successful proto2 authentication response, and transition to a received service-discovery request. The negotiated version returned by the phone is retained instead of assuming it matches the offered version.
+
+This implementation uses fake TLS bytes only. It does not yet contain a TLS engine, copy AASDK's embedded certificate/private-key material, parse service discovery, or send any new Android Auto control message to a phone. Those items require a separate recorded adoption and security decision.
 
 ## Expansion rule
 
