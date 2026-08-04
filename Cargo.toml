@@ -6,6 +6,7 @@ members = [
     "crates/media-gstreamer",
     "crates/platform-api",
     "crates/platform-linux",
+    "crates/protocol-aap",
     "crates/transport-api",
     "crates/transport-usb",
 ]

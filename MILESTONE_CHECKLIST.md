@@ -40,9 +40,12 @@ Architecture and automated tests must remain portable throughout development, bu
 
 - [x] Survey official public documentation and open-source receiver/protocol candidates without copying protocol material.
 - [x] Record why AASDK's GPLv3 declaration is licence-compatible but does not alone resolve protocol provenance.
-- [ ] Obtain written provenance answers from the original AASDK author or obtain an official permitted source.
+- [x] Record the project owner's decision to approve GPLv3 AASDK while excluding OpenAuto code.
+- [x] Pin the approved AASDK revision and record file-level attribution for the first framing scope.
+- [x] Implement bounded Rust frame encoding/decoding without sending protocol messages to a phone.
+- [x] Pass native formatting, strict linting, and all 30 workspace tests after adding the frame codec.
 - [ ] Identify an approved source for every required session/protocol behaviour.
-- [ ] Record the licence and provenance decision in an architecture decision record.
+- [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.
 - [ ] Build protocol parsing and framing behind transport interfaces.
 - [ ] Add deterministic fake-phone/session tests and sanitized fixtures.

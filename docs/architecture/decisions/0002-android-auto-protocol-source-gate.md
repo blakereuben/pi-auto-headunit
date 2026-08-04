@@ -1,6 +1,6 @@
 # ADR-0002: Android Auto Protocol Source Gate
 
-- Status: accepted for the current source set; session implementation blocked pending an approved source
+- Status: superseded in part by the owner-approved AASDK adoption on 4 August 2026
 - Date: 4 August 2026
 
 ## Context
@@ -31,7 +31,7 @@ Those sources do not specify Android Auto accessory identification values, strea
 - The project can still validate bounded I/O, cancellation, media performance, display/touch/audio integration, packaging, and appliance behaviour without protocol constants.
 - A future proposal must list every source, its licence, the exact behaviours derived from it, and the separation or attribution required before session code begins.
 
-The subsequent public/open-source candidate survey is recorded in [the 4 August 2026 source assessment](../../protocol/source-assessment-2026-08-04.md). It found that AASDK declares GPLv3 and is separate from OpenAuto, but no reviewed public material establishes the provenance of its undocumented protocol definitions. AASDK therefore remains unapproved pending written provenance and legal/licence review.
+The subsequent public/open-source candidate survey is recorded in [the 4 August 2026 source assessment](../../protocol/source-assessment-2026-08-04.md). The project owner then explicitly approved AASDK under GPLv3 while continuing to exclude OpenAuto. The exact source revision, file-level notices, derived scope, and expansion rules are recorded in [the AASDK adoption record](../../protocol/aasdk-adoption.md).
 
 ## Official sources reviewed
 

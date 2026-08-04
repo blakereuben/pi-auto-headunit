@@ -4,7 +4,7 @@ This assessment concerns source provenance and project policy. It is not legal a
 
 ## Result
 
-No complete public specification or provenance-cleared open-source source has yet been identified for the production Android Auto head-unit session. Post-AOA implementation therefore remains blocked.
+The original assessment found no complete public specification. The project owner subsequently approved GPLv3-licensed AASDK as the protocol implementation source. That decision and the pinned upstream revision are recorded in [the AASDK adoption record](aasdk-adoption.md).
 
 ## Sources assessed
 
@@ -20,7 +20,7 @@ These sources do not publish the production receiver's framing, security handsha
 
 The repository describes AASDK as a C++ implementation of the Android Auto protocol and declares GNU GPLv3 in its README. Its listed features cover the missing session, encryption, media, input, sensor, and control layers. OpenAuto's own repository states that OpenAuto is built on AASDK.
 
-This establishes an open-source copyright licence declaration for AASDK. It does not, by itself, establish how the undocumented protocol definitions were obtained, whether confidential material was involved, or whether any separate patent, certification, trademark, or contractual issue applies. The project has not inspected or copied AASDK protocol files.
+This establishes an open-source copyright licence declaration for AASDK. It does not, by itself, establish how the undocumented protocol definitions were obtained, whether confidential material was involved, or whether any separate patent, certification, trademark, or contractual issue applies. At the time of this initial assessment, the project had not inspected or copied AASDK protocol files. Inspection began only after the owner's approval and is tracked in the adoption record.
 
 ### `opencardev/aasdk`
 
@@ -41,7 +41,7 @@ The DHU is a downloadable testing tool, not published receiver source or a publi
 3. **Legally reviewed clean-room interoperability:** establish a documented two-team process using lawfully observed behaviour, with no DHU/OpenAuto/AASDK code supplied to the implementation team. This is substantial work and requires jurisdiction-specific legal advice before starting.
 4. **Reduce scope:** retain the proven AOA/platform/media work but do not claim Android Auto receiver functionality if none of the routes above becomes acceptable.
 
-## Questions required before considering AASDK
+## Provenance questions retained from the initial assessment
 
 - Who authored the protocol schemas, numeric identifiers, framing rules, and security/session behaviour?
 - Were they produced from public documentation, independent observation, licensed partner documentation, decompilation, or another source?
@@ -49,7 +49,7 @@ The DHU is a downloadable testing tool, not published receiver source or a publi
 - Does the copyright holder affirm that these specific files are offered for reuse and modification under GPLv3?
 - Are there contributions or bundled materials with different terms that require separate permission or notices?
 
-Until those questions are answered and reviewed, AASDK remains a research leadâ€”not an approved implementation source.
+These questions remain useful provenance context, but the project owner has accepted the GPLv3 source and authorised implementation. AASDK is now approved subject to file-level licence verification, attribution, and the scope controls in the adoption record.
 
 ## References
 
@@ -59,4 +59,3 @@ Until those questions are answered and reviewed, AASDK remains a research leadâ€
 - Original AASDK repository: https://github.com/f1xpl/aasdk
 - OpenAuto repository: https://github.com/f1xpl/openauto
 - Maintained AASDK fork: https://github.com/opencardev/aasdk
-

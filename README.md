@@ -146,7 +146,7 @@ Track progress in [MILESTONE_CHECKLIST.md](MILESTONE_CHECKLIST.md). See [MILESTO
 
 The public Android Open Accessory requests are implemented from AOSP documentation. Google does not publicly document the complete production Android Auto head-unit protocol.
 
-Undocumented behavior is not guessed. Each protocol feature must be backed by a public specification, an authorized source, or a documented and legally reviewed interoperability process. Unknown behavior stays unimplemented. Google or OpenAuto source code must not be copied into the project.
+Undocumented behavior is not guessed. Each protocol feature must be backed by a public specification or an approved licensed source. Google and OpenAuto code remain excluded. GPLv3 AASDK-derived behaviour is permitted only when its exact source files and attribution are added to the [AASDK adoption record](docs/protocol/aasdk-adoption.md).
 
 See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for the full policy.
 
@@ -159,6 +159,7 @@ See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for
 - [`crates/platform-linux`](crates/platform-linux) — Raspberry Pi OS discovery implementation
 - [`crates/media-api`](crates/media-api) — board-independent decoder requirements and selection
 - [`crates/media-gstreamer`](crates/media-gstreamer) — Linux GStreamer capability adapter
+- [`crates/protocol-aap`](crates/protocol-aap) — bounded GPL-derived Android Auto frame codec
 - [`packaging/debian`](packaging/debian) — development Debian package metadata
 - [`docs`](docs) — design decisions, protocol evidence, and hardware reports
 
