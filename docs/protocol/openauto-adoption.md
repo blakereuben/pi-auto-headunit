@@ -41,7 +41,16 @@ The following paths may be reviewed for Rust behaviour on a file-by-file basis. 
 - `src/autoapp/Service/Pinger.cpp` and matching header: liveness behaviour
 - `src/autoapp/Projection/*.cpp` and matching interfaces, except `OMXVideoOutput.cpp`: adapter boundaries for video, audio, microphone, input, buffering, and Bluetooth
 
-No OpenAuto-derived Rust behaviour has been implemented at the time this record is created. The first proposed adoption is the service-discovery/session-service model against a deterministic fake peer.
+## Adopted service-discovery event scope
+
+The first OpenAuto-derived behaviour is the transition from successful authentication to handling the phone's service-discovery request. It is derived from:
+
+- `src/autoapp/Service/AndroidAutoEntity.cpp`
+- `include/f1x/openauto/autoapp/Service/AndroidAutoEntity.hpp`
+
+Both reviewed files carry the 2018 f1x.studio (Michal Szwaj) copyright notice and GPL-3.0-or-later terms. The Rust destinations are `crates/protocol-aap/src/control.rs` and `crates/protocol-aap/src/service_discovery.rs`. The protobuf field definitions are separately attributed to the pinned AASDK `ServiceDiscoveryRequest.proto` in the AASDK adoption record.
+
+Unlike OpenAuto, the Rust boundary does not log or retain the phone's label, device name, icons, or nested phone information. It validates the request with explicit total, icon, text, and nested-message limits and exposes only field presence and byte counts. Unknown non-group protobuf fields are skipped safely; malformed, oversized, invalid-wire-type, and invalid-UTF-8 inputs fail closed. Four deterministic unit tests use synthetic data only. No service-discovery response, upstream identity string, phone connection, certificate, key, or authentication behaviour is included in this scope.
 
 ## Permanent exclusions
 

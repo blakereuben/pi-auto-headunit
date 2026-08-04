@@ -18,7 +18,8 @@
 | Independently generated TLS identity | P1 negative result | Pi 5 live probes over USB/AOA and the official ADB tunnel: AAP 1.6 accepted, TLS peer data received, phone displayed Android Auto error 7 | Rejected on both transports; do not repeat |
 | AASDK/OpenAuto shared compatibility credentials or security bypasses | Excluded | Project-owner decision following error-7 research and identity review | No; must not be added or tested |
 | Official developer-mode ADB-forwarded TCP 5277 transport | P0 product fact plus live negative result | Google DHU documentation and sanitized Pi 5 test | Implemented; version 1.6 accepted and TLS peer data received, but generated identity rejected with error 7 |
-| OpenAuto session and service behaviour | P1 approved candidate | GPL-3.0-or-later OpenAuto revision `aa90412`; exact file scope in adoption record | Approved for file-attributed Rust adoption; no OpenAuto-derived behaviour implemented yet |
+| OpenAuto session and service behaviour | P1 partially adopted | GPL-3.0-or-later OpenAuto revision `aa90412`; exact file scope in adoption record | First bounded service-discovery event transition implemented with synthetic tests; remaining services not implemented |
+| Service-discovery request fields | P1 | Approved AASDK `ServiceDiscoveryRequest.proto` plus the attributed OpenAuto event boundary | Yes; bounded, privacy-preserving summary only, with no field content retained |
 | Wireless Android Auto bootstrap/session | PX | Not publicly specified in the sources reviewed | No |
 
 Public sources:

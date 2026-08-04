@@ -1,5 +1,10 @@
 use std::fmt;
 
+use crate::{
+    ServiceDiscoveryError, ServiceDiscoveryLimits, ServiceDiscoveryRequestSummary,
+    summarize_service_discovery_request,
+};
+
 // Portions derived from AASDK control-channel behaviour and protobuf schemas.
 // Copyright (C) 2018 f1x.studio (Michal Szwaj)
 // Copyright (C) 2024 CubeOne (Simon Dean)
@@ -150,7 +155,7 @@ pub enum HandshakeAction {
     SendControl(ControlMessage),
     StartTlsClient,
     FeedTls(Vec<u8>),
-    ServiceDiscoveryRequest(Vec<u8>),
+    ServiceDiscoveryRequest(ServiceDiscoveryRequestSummary),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +182,7 @@ pub enum ControlError {
         maximum: usize,
     },
     EmptyTlsProgress,
+    InvalidServiceDiscovery(ServiceDiscoveryError),
 }
 
 impl fmt::Display for ControlError {
@@ -217,6 +223,7 @@ impl fmt::Display for ControlError {
             Self::EmptyTlsProgress => {
                 formatter.write_str("TLS progress contained no output and was not complete")
             }
+            Self::InvalidServiceDiscovery(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -319,8 +326,12 @@ impl HandshakeStateMachine {
                 HandshakeState::AwaitingServiceDiscovery,
                 ControlMessageId::ServiceDiscoveryRequest,
             ) => {
+                let summary = summarize_service_discovery_request(
+                    &message.body,
+                    ServiceDiscoveryLimits::default(),
+                )?;
                 self.state = HandshakeState::ServiceDiscoveryReceived;
-                Ok(vec![HandshakeAction::ServiceDiscoveryRequest(message.body)])
+                Ok(vec![HandshakeAction::ServiceDiscoveryRequest(summary)])
             }
             (state, id) => Err(ControlError::UnexpectedMessage { state, id }),
         }
@@ -358,6 +369,12 @@ impl HandshakeStateMachine {
         } else {
             Ok(())
         }
+    }
+}
+
+impl From<ServiceDiscoveryError> for ControlError {
+    fn from(error: ServiceDiscoveryError) -> Self {
+        Self::InvalidServiceDiscovery(error)
     }
 }
 
@@ -465,7 +482,12 @@ mod tests {
             machine
                 .advance(HandshakeEvent::InboundControl(&discovery))
                 .expect("discovery"),
-            vec![HandshakeAction::ServiceDiscoveryRequest(vec![0x0a, 0x00])]
+            vec![HandshakeAction::ServiceDiscoveryRequest(
+                ServiceDiscoveryRequestSummary {
+                    small_icon_bytes: Some(0),
+                    ..ServiceDiscoveryRequestSummary::default()
+                }
+            )]
         );
         assert_eq!(machine.state(), HandshakeState::ServiceDiscoveryReceived);
     }

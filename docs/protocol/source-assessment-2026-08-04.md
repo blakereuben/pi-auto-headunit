@@ -4,7 +4,7 @@ This assessment concerns source provenance and project policy. It is not legal a
 
 ## Result
 
-The original assessment found no complete public specification. The project owner subsequently approved GPLv3-licensed AASDK as the protocol implementation source. That decision and the pinned upstream revision are recorded in [the AASDK adoption record](aasdk-adoption.md).
+The original assessment found no complete public specification. The project owner subsequently approved pinned GPLv3-licensed AASDK and OpenAuto revisions as attributed implementation sources. Those later decisions, exact revisions, scope, and exclusions are recorded in the [AASDK](aasdk-adoption.md) and [OpenAuto](openauto-adoption.md) adoption records.
 
 ## Sources assessed
 
@@ -28,7 +28,7 @@ This is a maintained public fork of `f1xpl/aasdk`. It contains the same protocol
 
 ### OpenAuto and other receivers
 
-OpenAuto is GPLv3 but is explicitly excluded as a code source by the project owner. Other public receivers found during the survey either derive from AASDK/OpenAuto or describe reverse engineering and protocol sniffing. They are not independent public specifications and are not approved sources.
+At the time of this assessment, OpenAuto was excluded as a code source. The owner superseded that initial position on 5 August 2026 by approving one pinned GPLv3 revision under the permanent exclusions recorded in the OpenAuto adoption record. Other public receivers remain unapproved unless they receive the same provenance and licence review.
 
 ### Google Desktop Head Unit binary
 
