@@ -31,6 +31,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Show no file-handle or resident-memory growth during the interface soak.
 - [x] Pass native formatting, strict linting, and all 16 tests on the Pi 5.
 - [x] Build, install, remove, purge, and cleanly reinstall the development `.deb`.
+- [x] Upgrade from `0.0.9-1` to `0.1.0-1` while preserving a locally modified configuration.
 - [x] Detect a physical unplug while the accessory bulk interface is actively claimed.
 - [x] Inject unplug at every backend-driven AOA state in deterministic automated tests.
 - [ ] Record a final Pi 5 M1 report and mark the milestone reference-complete.
@@ -48,13 +49,14 @@ Architecture and automated tests must remain portable throughout development, bu
 
 ## M3 — Pi 5 display, media, audio, microphone, and touch
 
-- [ ] Connect and identify the official 7-inch DSI touchscreen.
+- [x] Connect and identify the official 7-inch DSI touchscreen.
 - [ ] Bring up a native full-screen development UI without relying on VNC.
-- [ ] Verify touch press, move, release, multi-touch, rotation, and calibration.
+- [x] Verify native touch press, move, release, coordinates, and two-finger multi-touch.
+- [ ] Verify touch rotation and calibration in every supported screen orientation.
 - [ ] Render synthetic H.264 video and measure Pi 5 decode/presentation performance.
 - [ ] Select and document the Pi 5 hardware-accelerated or software fallback video path.
 - [ ] Detect and test available onboard/HDMI audio outputs.
-- [ ] Test the USB sound card as an audio fallback.
+- [x] Test the USB sound card as an audio-output fallback.
 - [ ] Select and test a microphone input.
 - [ ] Measure video, audio, memory, CPU, and touch latency against provisional targets.
 

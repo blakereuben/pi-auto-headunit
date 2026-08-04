@@ -20,10 +20,10 @@ Validated locally and on the Pi 5 reference system:
 
 Pending Pi 5 reference evidence:
 
-- finish the repeated physical cable soak, USB-radio fallback, and older-version package upgrade test;
+- finish the repeated physical cable soak;
 - run the documented AOA transition against additional phones when available (first Samsung/Pi 5 transition and reconnect passed);
 - retain the passing controlled physical unplug test while the bulk interface is actively claimed; faster control-stage unplug paths are covered deterministically with the fake backend;
-- complete USB-radio fallback tests (the native `.deb` build/install/remove/purge/reinstall lifecycle passes);
+- retain the passing Pi 5 USB-radio discovery, disabled-state, explicit USB/USB selection, hot-unplug, and return-to-onboard tests (the native `.deb` build/install/remove/purge/reinstall lifecycle also passes);
 - defer Pi 4, CM4/Waveshare, and CM5 physical evidence to the later cross-board validation phase.
 
 Milestone 1 is therefore **Pi 5 reference in progress** and **product in progress**. Pi 4, CM4/Waveshare, and CM5 physical checks are intentionally deferred to the later cross-board validation phase by product-owner decision.
