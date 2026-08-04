@@ -153,7 +153,7 @@ Track progress in [MILESTONE_CHECKLIST.md](MILESTONE_CHECKLIST.md). See [MILESTO
 
 The public Android Open Accessory requests are implemented from AOSP documentation. Google does not publicly document the complete production Android Auto head-unit protocol.
 
-Undocumented behavior is not guessed. Each protocol feature must be backed by a public specification or an approved licensed source. Google and OpenAuto code remain excluded. GPLv3 AASDK-derived behaviour is permitted only when its exact source files and attribution are added to the [AASDK adoption record](docs/protocol/aasdk-adoption.md). Credentials, certificates, keys, authentication material, and security bypasses from OpenAuto, OpenAuto Pro, AASDK, or another receiver are prohibited regardless of source-code licence.
+Undocumented behavior is not guessed. Each protocol feature must be backed by a public specification or an approved licensed source. Proprietary Google code remains excluded. GPLv3 AASDK- and OpenAuto-derived behaviour is permitted only when its exact source files and attribution are added to the [AASDK](docs/protocol/aasdk-adoption.md) or [OpenAuto](docs/protocol/openauto-adoption.md) adoption record. Credentials, certificates, keys, authentication material, security bypasses, trademarks, and bundled assets from OpenAuto, OpenAuto Pro, AASDK, Google, or another receiver remain prohibited regardless of source-code licence.
 
 See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for the full policy.
 
@@ -200,6 +200,8 @@ By contributing, you must have the right to submit the work under GPL-3.0-or-lat
 - [Exact first milestone](MILESTONE_01.md)
 - [Risk register](RISK_REGISTER.md)
 - [Android Auto protocol source assessment](docs/protocol/source-assessment-2026-08-04.md)
+- [AASDK adoption record](docs/protocol/aasdk-adoption.md)
+- [OpenAuto adoption record](docs/protocol/openauto-adoption.md)
 - [Packaging and installation plan](PACKAGING.md)
 
 ## License and disclaimer

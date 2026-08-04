@@ -15,7 +15,6 @@ This file records third-party software currently present in the locked dependenc
 | [`glib`](https://gtk-rs.org/) | 0.21.5 | MIT | Rust bindings required by GStreamer. |
 | [GStreamer](https://gstreamer.freedesktop.org/) | Raspberry Pi OS package version | LGPL-2.1-or-later | Dynamically linked media framework and distribution plugins. |
 | [Rust standard library](https://github.com/rust-lang/rust) | release toolchain | MIT OR Apache-2.0 | Rust runtime and standard-library code linked into project binaries. |
-| [AASDK](https://github.com/opencardev/aasdk) | `9bf6adf933665dee26532201719fac14a047ccf1` | GPL-3.0-or-later | Source of Android Auto framing, control-handshake, and TLS behaviour reimplemented in Rust; exact files and notices are recorded in `docs/protocol/aasdk-adoption.md`. |
 | [`openssl`](https://github.com/sfackler/rust-openssl) | 0.10.81 | Apache-2.0 | Safe Rust OpenSSL API used by the replaceable Linux TLS adapter. |
 | [`openssl-sys`](https://github.com/sfackler/rust-openssl) | 0.9.117 | MIT | Rust FFI bindings to the system OpenSSL library. |
 | [OpenSSL](https://www.openssl.org/) | Raspberry Pi OS package version | Apache-2.0 | Dynamically linked TLS implementation. |
@@ -23,6 +22,15 @@ This file records third-party software currently present in the locked dependenc
 | [`foreign-types-shared`](https://github.com/sfackler/foreign-types) | 0.1.1 | MIT OR Apache-2.0 | Shared traits used by `foreign-types`. |
 
 The Cargo configuration enables the `rusb` `vendored` feature, which can build and statically link libusb. Every release must record the actual linkage and include the source, build materials, copyright notices, and licence notices required by GPL-3.0-or-later and the applicable libusb LGPL terms.
+
+## Approved source references
+
+These projects are provenance-tracked sources for selected Rust behaviour; they are not linked runtime dependencies and their repositories, binaries, credentials, and assets are not vendored.
+
+| Component | Pinned revision | Licence | Approved use |
+|---|---|---|---|
+| [AASDK](https://github.com/opencardev/aasdk) | `9bf6adf933665dee26532201719fac14a047ccf1` | GPL-3.0-or-later | Framing, control-handshake, and bounded TLS-engine behaviour listed in `docs/protocol/aasdk-adoption.md`; all shared credentials excluded. |
+| [OpenAuto](https://github.com/f1xpl/openauto) | `aa90412bf93b5a5078495ea85ac9270c6297d369` | GPL-3.0-or-later in relevant source headers; README declares GPLv3 | Approved candidate source for file-attributed session, service, media, input, sensor, Bluetooth, and liveness behaviour listed in `docs/protocol/openauto-adoption.md`; no behaviour adopted yet. Credentials, identities, trademarks, proprietary material, and assets excluded. |
 
 ## Build-only dependencies
 

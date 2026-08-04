@@ -196,8 +196,9 @@ This sequencing does not relax the final four-board support contract. Protocol, 
 3. Use GTK 4 for the native shell and GStreamer for media, subject to a short on-device latency/prototype gate.
 4. Ship the service disabled by default until preflight succeeds, then provide a one-command enable/start path.
 5. Position the software as an experimental aftermarket/R&D project, not a certified automotive product.
-6. Treat onboard Wi-Fi/Bluetooth support as an optional discovered capability, never a mandatory property of CM4/CM5; support tested external USB replacements.
-7. Design the future custom carrier against the documented CM4/CM5 common interface plus explicit per-module differences; the shared physical form factor is not treated as proof of full electrical/functional equivalence.
+6. Permit file-attributed GPL-3.0-or-later behaviour from the pinned AASDK and OpenAuto revisions recorded in `docs/protocol/`, while permanently excluding shared credentials, authentication identities, security bypasses, trademarks, proprietary material, and bundled assets.
+7. Treat onboard Wi-Fi/Bluetooth support as an optional discovered capability, never a mandatory property of CM4/CM5; support tested external USB replacements.
+8. Design the future custom carrier against the documented CM4/CM5 common interface plus explicit per-module differences; the shared physical form factor is not treated as proof of full electrical/functional equivalence.
 
 ## 12. Authoritative references
 

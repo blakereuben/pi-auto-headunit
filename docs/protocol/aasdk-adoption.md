@@ -2,7 +2,7 @@
 
 ## Decision
 
-The project owner approved AASDK as a GPLv3-compatible source for Android Auto Protocol behaviour on 4 August 2026. OpenAuto remains excluded as a code source. Protocol work will use Rust by default and preserve AASDK attribution wherever behaviour or definitions are derived.
+The project owner approved AASDK as a GPLv3-compatible source for Android Auto Protocol behaviour on 4 August 2026. OpenAuto was separately approved under a stricter adoption record on 5 August 2026. Protocol work uses Rust by default and preserves attribution wherever behaviour or definitions are derived.
 
 ## Pinned upstream
 
@@ -55,21 +55,21 @@ The bounded control envelope and fake-transport handshake state machine are deri
 
 Derived facts cover protocol version 1.6, two-byte big-endian control-message identifiers, the version request/response layout, TLS records encapsulated as control message 3, the successful proto2 authentication response, and transition to a received service-discovery request. The negotiated version returned by the phone is retained instead of assuming it matches the offered version.
 
-The control-state test still uses fake TLS bytes. The separate `security-openssl` crate now reproduces AASDK's OpenSSL client/memory-buffer boundary with injected credentials and bounded input/output, but it does not copy AASDK's embedded certificate/private-key material. It has only been tested with runtime-generated test credentials and has not contacted a phone. Service-discovery parsing and live session traffic remain outside this scope.
+The control-state test uses fake TLS bytes. The separate `security-openssl` crate reproduces AASDK's OpenSSL client/memory-buffer boundary with injected credentials and bounded input/output, but it does not copy AASDK's embedded certificate/private-key material. Bounded live probes with runtime-generated credentials reached version/TLS exchange and were rejected with Android Auto error 7; live generated-identity commands are now permanently locked out. Service-discovery parsing remains outside this AASDK scope.
 
-The shared AASDK certificate identifies organisations named Google Automotive Link and JVC Kenwood and is paired with a publicly distributed private key. GPL compatibility alone does not answer whether this project should present or redistribute that identity material. The repository therefore does not contain it; the compatibility, trademark/identity, and distribution decision is recorded separately in `tls-credential-policy.md` and remains open.
+The shared AASDK certificate identifies organisations named Google Automotive Link and JVC Kenwood and is paired with a publicly distributed private key. GPL compatibility does not authorise this independent project to present that identity. The repository does not contain it, and the credential is permanently excluded by `tls-credential-policy.md` and the OpenAuto adoption decision.
 
 ## Adopted USB interoperability-probe scope
 
-The opt-in bench probe's Android Auto accessory identification and claimed bulk-transfer behaviour are derived from:
+The completed bench probe's Android Auto accessory identification and claimed bulk-transfer behaviour were derived from:
 
 - `include/aasdk/USB/AccessoryModeQueryFactory.hpp`
 - `src/USB/AccessoryModeQueryFactory.cpp`
 - `include/aasdk/Transport/USBTransport.hpp`
 - `src/Transport/USBTransport.cpp`
 
-The probe uses AASDK's exact six accessory strings, including its third-party URI and serial value, only when the operator supplies `--allow-live-aap`. It then sends the adopted version and encapsulated-TLS messages over a claimed bulk interface using temporary project-generated credentials. It stops after the TLS engine completes, does not send authentication completion or a service-discovery response, logs no payloads, and rejects a phone already in accessory mode so the applied identity is unambiguous.
+The historical probe used AASDK's exact six accessory strings, including its third-party URI and serial value, with explicit operator opt-in. It sent the adopted version and encapsulated-TLS messages over a claimed bulk interface using temporary project-generated credentials, stopped before authentication completion or service discovery, and logged no payloads. After the recorded error-7 rejection, all live generated-identity paths were permanently disabled.
 
 ## Expansion rule
 
-Before another AASDK behaviour, schema, identifier, certificate, or asset is used, add its exact upstream path and purpose here, verify its file-level licence/copyright notice, and update third-party notices. No OpenAuto file may be used to fill a gap.
+Before another AASDK behaviour, schema, identifier, or non-excluded asset is used, add its exact upstream path and purpose here, verify its file-level licence/copyright notice, and update third-party notices. OpenAuto-derived behaviour follows the separate `openauto-adoption.md` procedure; neither record may be used to introduce credentials, identities, security bypasses, trademarks, or bundled assets.

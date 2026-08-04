@@ -40,7 +40,8 @@ Architecture and automated tests must remain portable throughout development, bu
 
 - [x] Survey official public documentation and open-source receiver/protocol candidates without copying protocol material.
 - [x] Record why AASDK's GPLv3 declaration is licence-compatible but does not alone resolve protocol provenance.
-- [x] Record the project owner's decision to approve GPLv3 AASDK while excluding OpenAuto code.
+- [x] Record the initial project-owner decision to approve GPLv3 AASDK while temporarily excluding OpenAuto code.
+- [x] Record the 5 August 2026 approval of pinned GPLv3 OpenAuto code/behaviour with permanent credential, security-bypass, trademark, identity, and asset exclusions.
 - [x] Pin the approved AASDK revision and record file-level attribution for the first framing scope.
 - [x] Implement bounded Rust frame encoding/decoding without sending protocol messages to a phone.
 - [x] Add bounded per-channel message reassembly with deterministic interleaving and malformed-sequence tests.

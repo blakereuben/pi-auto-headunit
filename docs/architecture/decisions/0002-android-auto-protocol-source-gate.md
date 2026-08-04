@@ -1,11 +1,11 @@
 # ADR-0002: Android Auto Protocol Source Gate
 
-- Status: superseded in part by the owner-approved AASDK adoption on 4 August 2026
+- Status: superseded in part by the owner-approved AASDK adoption on 4 August 2026 and OpenAuto adoption on 5 August 2026
 - Date: 4 August 2026
 
 ## Context
 
-The project must implement only behaviour with traceable provenance and compatible distribution rights. It must not copy Google Desktop Head Unit binaries, OpenAuto code, private captures, or protocol definitions with unclear origin. Android Open Accessory support alone does not specify an Android Auto session.
+The project must implement only behaviour with traceable provenance and compatible distribution rights. It must not copy Google Desktop Head Unit binaries, unapproved OpenAuto/AASDK material, private captures, or protocol definitions with unclear origin. Android Open Accessory support alone does not specify an Android Auto session.
 
 The official sources reviewed establish that:
 
@@ -22,7 +22,7 @@ Those sources do not specify Android Auto accessory identification values, strea
 2. Treat official DHU transport and capability statements as product evidence only; do not infer a wire format from them.
 3. Keep all post-AOA Android Auto session and wireless behaviour at PX until an approved source and licence/provenance review exists.
 4. Do not inspect, disassemble, redistribute, or translate the proprietary DHU binary into project code.
-5. Do not copy OpenAuto/AASDK protocol code or definitions into the repository without an explicit project-owner decision, compatible GPL review, and any required legal advice.
+5. Adopt OpenAuto/AASDK behaviour only after an explicit project-owner decision, compatible GPL review, exact file-level provenance, preserved notices, and any required legal advice.
 6. Continue transport-independent safety work and synthetic media, audio, touch, and UI validation while this gate is unresolved.
 
 ## Consequences
@@ -31,7 +31,7 @@ Those sources do not specify Android Auto accessory identification values, strea
 - The project can still validate bounded I/O, cancellation, media performance, display/touch/audio integration, packaging, and appliance behaviour without protocol constants.
 - A future proposal must list every source, its licence, the exact behaviours derived from it, and the separation or attribution required before session code begins.
 
-The subsequent public/open-source candidate survey is recorded in [the 4 August 2026 source assessment](../../protocol/source-assessment-2026-08-04.md). The project owner then explicitly approved AASDK under GPLv3 while continuing to exclude OpenAuto. The exact source revision, file-level notices, derived scope, and expansion rules are recorded in [the AASDK adoption record](../../protocol/aasdk-adoption.md).
+The subsequent public/open-source candidate survey is recorded in [the 4 August 2026 source assessment](../../protocol/source-assessment-2026-08-04.md). The project owner approved pinned AASDK on 4 August and pinned OpenAuto on 5 August. Exact revisions, file-level notices, derived scope, exclusions, and expansion rules are recorded in the [AASDK](../../protocol/aasdk-adoption.md) and [OpenAuto](../../protocol/openauto-adoption.md) adoption records.
 
 ## Official sources reviewed
 

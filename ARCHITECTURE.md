@@ -73,6 +73,8 @@ The Linux TLS adapter implements the protocol crate's replaceable `TlsClient` bo
 
 Third-party shared head-unit credentials and security bypasses are prohibited. The development composition may use Google's documented Android Auto developer mode and ADB-forwarded head-unit server on TCP port 5277. That transport is an explicit lab profile, not a release runtime dependency. Pi 5 evidence shows that it still rejected the project's generated identity with Android Auto error 7, so it is not an authentication solution; fake peers remain the safe implementation path unless legitimate provisioning becomes available.
 
+OpenAuto revision `aa90412bf93b5a5078495ea85ac9270c6297d369` is an approved GPL source for file-attributed session and service behaviour. It is treated as a reference architecture, not a runtime dependency: Rust ports retain the project's transport, protocol, media, UI, and platform boundaries. OpenAuto/AASDK authentication identities, bundled assets, product identity strings, Pi 3 OpenMAX path, and developer-server-only wireless assumptions are excluded.
+
 ### `media-api` and `media-gstreamer`
 
 `media-api` defines encoded-video input, audio stream roles, microphone source, focus policy, clocks, backpressure, and capability reporting. `media-gstreamer` builds pipelines selected from probed capabilities rather than board-name conditionals.
@@ -200,7 +202,7 @@ sequenceDiagram
     V->>P: Normalized input command
 ```
 
-The sequence deliberately leaves the post-AOA negotiation abstract until its provenance is approved.
+The sequence remains abstract at this level. Concrete post-AOA behaviour is implemented only when its exact AASDK or OpenAuto provenance is recorded in the corresponding adoption document.
 
 ## 6. Concurrency and backpressure
 
