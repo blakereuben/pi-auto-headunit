@@ -252,9 +252,7 @@ fn usb_soak(_: &str, _: usize) -> Result<(), CliError> {
 
 #[cfg(target_os = "linux")]
 fn open_fd_count() -> usize {
-    std::fs::read_dir("/proc/self/fd")
-        .map(Iterator::count)
-        .unwrap_or(0)
+    std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
 }
 
 #[cfg(target_os = "linux")]
