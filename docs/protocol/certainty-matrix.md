@@ -22,3 +22,4 @@ Public sources:
 The generic Milestone 1 identity proves only documented AOA transport behavior. It is not represented as an Android Auto production identity or session.
 
 See [ADR-0002](../architecture/decisions/0002-android-auto-protocol-source-gate.md) for the decision not to infer or copy the missing session protocol.
+The [public/open-source source assessment](source-assessment-2026-08-04.md) records why GPL-licensed AASDK is a candidate but not yet an approved protocol source.

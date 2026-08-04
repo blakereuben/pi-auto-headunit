@@ -38,6 +38,9 @@ Architecture and automated tests must remain portable throughout development, bu
 
 ## M2 — Lawful Android Auto session foundation on Pi 5
 
+- [x] Survey official public documentation and open-source receiver/protocol candidates without copying protocol material.
+- [x] Record why AASDK's GPLv3 declaration is licence-compatible but does not alone resolve protocol provenance.
+- [ ] Obtain written provenance answers from the original AASDK author or obtain an official permitted source.
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [ ] Record the licence and provenance decision in an architecture decision record.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.

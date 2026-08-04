@@ -31,6 +31,8 @@ Those sources do not specify Android Auto accessory identification values, strea
 - The project can still validate bounded I/O, cancellation, media performance, display/touch/audio integration, packaging, and appliance behaviour without protocol constants.
 - A future proposal must list every source, its licence, the exact behaviours derived from it, and the separation or attribution required before session code begins.
 
+The subsequent public/open-source candidate survey is recorded in [the 4 August 2026 source assessment](../../protocol/source-assessment-2026-08-04.md). It found that AASDK declares GPLv3 and is separate from OpenAuto, but no reviewed public material establishes the provenance of its undocumented protocol definitions. AASDK therefore remains unapproved pending written provenance and legal/licence review.
+
 ## Official sources reviewed
 
 - AOSP Android Open Accessory: https://source.android.com/docs/core/interaction/accessories/aoa

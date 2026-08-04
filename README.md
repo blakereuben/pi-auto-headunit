@@ -190,6 +190,7 @@ By contributing, you must have the right to submit the work under GPL-3.0-or-lat
 - [Milestone checklist](MILESTONE_CHECKLIST.md)
 - [Exact first milestone](MILESTONE_01.md)
 - [Risk register](RISK_REGISTER.md)
+- [Android Auto protocol source assessment](docs/protocol/source-assessment-2026-08-04.md)
 - [Packaging and installation plan](PACKAGING.md)
 
 ## License and disclaimer
