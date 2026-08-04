@@ -136,7 +136,7 @@ fn provider_from_sysfs(
         ProviderKind::Other
     };
     let driver = driver_name(&device_link);
-    let (blocked, block_reason) = rfkill_state(&canonical);
+    let (blocked, block_reason) = rfkill_state(interface, &canonical);
     let state = if blocked {
         CapabilityState::Disabled
     } else if driver.is_none() {
@@ -176,32 +176,43 @@ fn driver_name(device_link: &Path) -> Option<String> {
     }
 }
 
-fn rfkill_state(device: &Path) -> (bool, Option<String>) {
+fn rfkill_state(interface: &Path, device: &Path) -> (bool, Option<String>) {
+    for root in [interface.to_path_buf(), interface.join("phy80211")] {
+        if let Some(state) = blocked_rfkill_child(&root) {
+            return state;
+        }
+    }
+
     let mut cursor = Some(device);
     while let Some(path) = cursor {
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !name.starts_with("rfkill") {
-                    continue;
-                }
-                let base = entry.path();
-                let soft = read_trimmed(&base.join("soft")).unwrap_or_default() == "1";
-                let hard = read_trimmed(&base.join("hard")).unwrap_or_default() == "1";
-                if soft || hard {
-                    let reason = match (soft, hard) {
-                        (true, true) => "soft- and hard-blocked by rfkill",
-                        (true, false) => "soft-blocked by rfkill",
-                        (false, true) => "hard-blocked by rfkill",
-                        (false, false) => unreachable!(),
-                    };
-                    return (true, Some(reason.into()));
-                }
-            }
+        if let Some(state) = blocked_rfkill_child(path) {
+            return state;
         }
         cursor = path.parent();
     }
     (false, None)
+}
+
+fn blocked_rfkill_child(root: &Path) -> Option<(bool, Option<String>)> {
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("rfkill") {
+            continue;
+        }
+        let base = entry.path();
+        let soft = read_trimmed(&base.join("soft")).unwrap_or_default() == "1";
+        let hard = read_trimmed(&base.join("hard")).unwrap_or_default() == "1";
+        if soft || hard {
+            let reason = match (soft, hard) {
+                (true, true) => "soft- and hard-blocked by rfkill",
+                (true, false) => "soft-blocked by rfkill",
+                (false, true) => "hard-blocked by rfkill",
+                (false, false) => unreachable!(),
+            };
+            return Some((true, Some(reason.into())));
+        }
+    }
+    None
 }
 
 fn find_usb_id(device: &Path) -> Option<String> {
@@ -259,6 +270,9 @@ fn parse_key_value_file(path: &Path) -> io::Result<BTreeMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn preference_parser_is_case_insensitive() {
@@ -275,5 +289,26 @@ mod tests {
             stable_id(ProviderKind::Usb, &path, Some("1234:5678"), "wlan7"),
             "usb:1234:5678:1-2.3"
         );
+    }
+
+    #[test]
+    fn detects_rfkill_beneath_wifi_phy() {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "aa-headunit-rfkill-{}-{sequence}",
+            std::process::id()
+        ));
+        let interface = root.join("wlan1");
+        let rfkill = interface.join("phy80211/rfkill3");
+        fs::create_dir_all(&rfkill).expect("create rfkill fixture");
+        fs::write(rfkill.join("soft"), "1\n").expect("write soft state");
+        fs::write(rfkill.join("hard"), "0\n").expect("write hard state");
+
+        assert_eq!(
+            rfkill_state(&interface, &root.join("device")),
+            (true, Some("soft-blocked by rfkill".into()))
+        );
+
+        fs::remove_dir_all(root).expect("remove rfkill fixture");
     }
 }

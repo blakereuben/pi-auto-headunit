@@ -29,7 +29,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Reconnect without rebooting the Pi or resetting the service.
 - [x] Pass 100/100 repeated interface claim/release cycles.
 - [x] Show no file-handle or resident-memory growth during the interface soak.
-- [x] Pass native formatting, strict linting, and all 15 tests on the Pi 5.
+- [x] Pass native formatting, strict linting, and all 16 tests on the Pi 5.
 - [x] Build, install, remove, purge, and cleanly reinstall the development `.deb`.
 - [x] Detect a physical unplug while the accessory bulk interface is actively claimed.
 - [x] Inject unplug at every backend-driven AOA state in deterministic automated tests.
