@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/aa-headunit-diagnostics",
+    "crates/media-api",
     "crates/platform-api",
     "crates/platform-linux",
     "crates/transport-api",
