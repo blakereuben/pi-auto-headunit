@@ -1,0 +1,13 @@
+[package]
+name = "transport-tcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+transport-api = { path = "../transport-api" }
+
+[lints]
+workspace = true

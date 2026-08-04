@@ -45,6 +45,7 @@ pi-auto-headunit/
 │       └── performance-methods.md
 ├── crates/
 │   ├── transport-api/
+│   ├── transport-tcp/
 │   ├── transport-usb/
 │   ├── protocol-types/
 │   ├── protocol/
@@ -112,6 +113,7 @@ pi-auto-headunit/
 
 - `protocol-types` is separate so generated or provenance-sensitive definitions have an obvious audit boundary.
 - `transport-usb` knows AOA and USB, but not GTK/GStreamer or board models.
+- `transport-tcp` is a loopback-only adapter for the documented ADB-forwarded developer endpoint; it is not a production transport or authentication mechanism.
 - Planned post-wired crates are `network-api`, `network-networkmanager`, `bluetooth-api`, `bluetooth-bluez`, and `transport-wireless`. The wireless transport depends on those contracts, not directly on NetworkManager, BlueZ, or a carrier model.
 - A planned `carrier-profile` crate owns the schema and profile-matching policy; platform adapters perform the Linux operations.
 - Hardware documentation will include `carrier-profiles.md`, the exact Waveshare reference, custom-carrier requirements, and the CM4/CM5 pin/peripheral compatibility matrix.

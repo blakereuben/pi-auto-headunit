@@ -8,7 +8,7 @@
 | AOA Start Accessory request 53 | P0 | AOSP AOA 1.0 | Yes |
 | Wait for Google accessory VID/PID and locate bulk endpoints | P0 | AOSP AOA 1.0 | Yes |
 | DHU 2.x supports Android Auto over AOA USB | P0 product fact | Official Google DHU documentation | Evidence only |
-| Development DHU can reach the phone head-unit server through ADB-forwarded TCP port 5277 | P0 product fact | Official Google DHU documentation | No; development transport only |
+| Development DHU can reach the phone head-unit server through ADB-forwarded TCP port 5277 | P0 product fact | Official Google DHU documentation | Yes; loopback-only connection adapter/probe, development use only |
 | DHU advertises 800x480, 1280x720, and 1920x1080 configurations plus touch/microphone/sensor capabilities | P0 product fact | Official Google DHU documentation | Evidence only; no wire format inferred |
 | Android Auto accessory identification values used by the opt-in probe | P1 | Owner-approved GPL-3.0-or-later AASDK `AccessoryModeQueryFactory.cpp` | Yes; exact strings, live result pending |
 | Two-byte AAP frame header, flags, short/extended big-endian lengths, and `0x4000` frame limit | P1 | Owner-approved GPL-3.0-or-later AASDK revision `9bf6adf` | Yes; bounded Rust codec and tests |
@@ -17,7 +17,7 @@
 | Replaceable OpenSSL client using bounded memory transport and injected credentials | P1 | Approved AASDK cryptor/SSL wrapper paths plus maintained Rust OpenSSL bindings | Yes; native tests pass; first live probe accepted version 1.6 then TLS timed out |
 | Independently generated TLS identity | P1 negative result | Pi 5 live probe: AAP 1.6 accepted, TLS peer data received, phone displayed Android Auto error 7 security rejection | Rejected; do not repeat |
 | AASDK/OpenAuto shared compatibility credentials or security bypasses | Excluded | Project-owner decision following error-7 research and identity review | No; must not be added or tested |
-| Official developer-mode ADB-forwarded TCP 5277 transport | P0 product fact | Google DHU documentation | Planned for session development only |
+| Official developer-mode ADB-forwarded TCP 5277 transport | P0 product fact | Google DHU documentation | Implemented and Pi-verified for connection only; no protocol data sent yet |
 | Wireless Android Auto bootstrap/session | PX | Not publicly specified in the sources reviewed | No |
 
 Public sources:

@@ -13,6 +13,7 @@ dependencies = [
  "protocol-aap",
  "security-openssl",
  "transport-api",
+ "transport-tcp",
  "transport-usb",
 ]
 
@@ -657,6 +658,13 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 [[package]]
 name = "transport-api"
 version = "0.1.0"
+
+[[package]]
+name = "transport-tcp"
+version = "0.1.0"
+dependencies = [
+ "transport-api",
+]
 
 [[package]]
 name = "transport-usb"

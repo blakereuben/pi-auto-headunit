@@ -22,6 +22,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         [command, rest @ ..] if command == "wireless" => wireless(rest),
         [group, command] if group == "media" && command == "probe" => media_probe(),
         [group, command] if group == "usb" && command == "list" => usb_list(),
+        [group, command] if group == "developer" && command == "tcp-probe" => developer_tcp_probe(),
         [group, command, flag, selector]
             if group == "usb" && command == "aoa" && flag == "--device" =>
         {
@@ -79,6 +80,7 @@ fn print_help() {
            preflight\n\
            wireless [--wifi auto|onboard|STABLE_ID] [--bluetooth auto|onboard|STABLE_ID]\n\
            media probe\n\
+           developer tcp-probe\n\
            usb list\n\
            usb aoa --device BUS:ADDRESS\n\
            usb soak --device BUS:ADDRESS --cycles COUNT\n\
@@ -89,6 +91,21 @@ fn print_help() {
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn developer_tcp_probe() -> Result<(), CliError> {
+    use std::time::Duration;
+
+    let transport = transport_tcp::DeveloperTcpTransport::connect(
+        transport_tcp::DEFAULT_DEVELOPER_ADDRESS,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .map_err(CliError::Transport)?;
+    println!("developer_transport=tcp");
+    println!("developer_endpoint={}", transport.peer());
+    println!("developer_connection=ready");
+    Ok(())
 }
 
 fn preflight() -> Result<(), CliError> {
@@ -664,6 +681,7 @@ enum CliError {
     Media(String),
     Aoa(transport_api::AoaError),
     Protocol(String),
+    Transport(transport_api::TransportError),
 }
 
 impl CliError {
@@ -680,6 +698,7 @@ impl CliError {
             Self::Aoa(transport_api::AoaError::Unplugged) => 16,
             Self::Aoa(_) => 17,
             Self::Protocol(_) => 19,
+            Self::Transport(_) => 20,
         }
     }
 }
@@ -697,6 +716,7 @@ impl std::fmt::Display for CliError {
             Self::Media(error) => write!(f, "media: {error}"),
             Self::Aoa(error) => error.fmt(f),
             Self::Protocol(error) => write!(f, "protocol probe: {error}"),
+            Self::Transport(error) => error.fmt(f),
         }
     }
 }

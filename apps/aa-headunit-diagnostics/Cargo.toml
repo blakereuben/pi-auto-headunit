@@ -12,6 +12,7 @@ media-gstreamer = { path = "../../crates/media-gstreamer" }
 platform-api = { path = "../../crates/platform-api" }
 platform-linux = { path = "../../crates/platform-linux" }
 transport-api = { path = "../../crates/transport-api" }
+transport-tcp = { path = "../../crates/transport-tcp" }
 transport-usb = { path = "../../crates/transport-usb" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -75,6 +75,7 @@ Wireless Android Auto is deliberately scheduled after a stable wired release. Ad
 - A USB host port and data-capable USB cable for wired phone testing.
 - Rust 1.85 or newer, Cargo, a C build toolchain, `pkg-config`, and the libusb, OpenSSL, and GStreamer development packages when building from source.
 - An Android phone for hardware tests; no phone is required for ordinary unit tests.
+- The Raspberry Pi OS `adb` package only for the optional official developer-mode head-unit-server workflow; it is not a release runtime dependency.
 
 Current direct Rust and native dependencies and their licences are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Future display, audio, Bluetooth, and networking dependencies will be documented when they are actually added.
 
@@ -100,6 +101,7 @@ This is for development on a 64-bit Raspberry Pi OS system. Rust and the native 
 cargo run -p aa-headunit-diagnostics -- preflight
 cargo run -p aa-headunit-diagnostics -- wireless
 cargo run -p aa-headunit-diagnostics -- media probe
+cargo run -p aa-headunit-diagnostics -- developer tcp-probe
 cargo run -p aa-headunit-diagnostics -- usb list
 cargo run -p aa-headunit-diagnostics -- usb aoa --device BUS:ADDRESS
 ```
@@ -114,6 +116,8 @@ cargo run -p aa-headunit-diagnostics -- usb hold --device BUS:ADDRESS --seconds 
 The AOA command requires an explicit USB bus/address. It does not send vendor control requests indiscriminately to every attached USB device. After an AOA transition, `usb hold` keeps the selected accessory interface open for a controlled physical-unplug test.
 
 The repository retains an explicitly guarded TLS bench diagnostic as reproducible evidence of the Android Auto error-7 security rejection. That generated-identity experiment is complete and must not be repeated or repurposed with credentials from another head-unit implementation. Continued session development will use fake peers and Google's documented developer-mode head-unit server path.
+
+`developer tcp-probe` only checks the loopback endpoint `127.0.0.1:5277`. It is intended for a user-enabled Android Auto head-unit server forwarded with ADB, and it neither sends Android Auto messages nor provides production authentication.
 
 ## Architecture
 

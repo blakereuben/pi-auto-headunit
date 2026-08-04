@@ -3,6 +3,32 @@
 use std::fmt;
 use std::time::Duration;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransportError {
+    InvalidEndpoint(String),
+    TimedOut,
+    Closed,
+    Io(String),
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEndpoint(message) => write!(formatter, "invalid endpoint: {message}"),
+            Self::TimedOut => formatter.write_str("transport operation timed out"),
+            Self::Closed => formatter.write_str("transport closed"),
+            Self::Io(message) => write!(formatter, "transport I/O: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for TransportError {}
+
+pub trait SessionTransport {
+    fn receive(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError>;
+    fn send_all(&mut self, bytes: &[u8]) -> Result<(), TransportError>;
+}
+
 /// Stable-enough identity for one USB enumeration lifetime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UsbDeviceId {

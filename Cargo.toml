@@ -9,6 +9,7 @@ members = [
     "crates/protocol-aap",
     "crates/security-openssl",
     "crates/transport-api",
+    "crates/transport-tcp",
     "crates/transport-usb",
 ]
 
