@@ -10,6 +10,8 @@ dependencies = [
  "media-gstreamer",
  "platform-api",
  "platform-linux",
+ "protocol-aap",
+ "security-openssl",
  "transport-api",
  "transport-usb",
 ]

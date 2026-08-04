@@ -2,6 +2,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use openssl::pkey::{PKey, Private};
+use openssl::rsa::Rsa;
 use openssl::ssl::{ErrorCode, Ssl, SslContextBuilder, SslMethod, SslStream, SslVerifyMode};
 use openssl::x509::X509;
 use protocol_aap::{TlsClient, TlsProgress};
@@ -92,6 +93,70 @@ pub struct OpenSslTlsClient {
     maximum_chunk_size: usize,
     started: bool,
     complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EphemeralCredentials {
+    pub certificate_pem: Vec<u8>,
+    pub private_key_pem: Vec<u8>,
+}
+
+pub fn generate_ephemeral_credentials() -> Result<EphemeralCredentials, OpenSslTlsError> {
+    use openssl::asn1::Asn1Time;
+    use openssl::bn::{BigNum, MsbOption};
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::x509::X509NameBuilder;
+
+    let key = PKey::from_rsa(
+        Rsa::generate(2048).map_err(|error| OpenSslTlsError::Setup(error.to_string()))?,
+    )
+    .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    let mut name =
+        X509NameBuilder::new().map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    name.append_entry_by_nid(Nid::COMMONNAME, "Pi Auto Head Unit Bench Probe")
+        .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    let name = name.build();
+
+    let mut certificate =
+        X509::builder().map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    certificate
+        .set_version(2)
+        .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    let mut serial = BigNum::new().map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    serial
+        .rand(64, MsbOption::MAYBE_ZERO, false)
+        .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    let serial = serial
+        .to_asn1_integer()
+        .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    certificate
+        .set_serial_number(&serial)
+        .and_then(|()| certificate.set_subject_name(&name))
+        .and_then(|()| certificate.set_issuer_name(&name))
+        .and_then(|()| certificate.set_pubkey(&key))
+        .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    let not_before =
+        Asn1Time::days_from_now(0).map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    let not_after =
+        Asn1Time::days_from_now(1).map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    certificate
+        .set_not_before(&not_before)
+        .and_then(|()| certificate.set_not_after(&not_after))
+        .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    certificate
+        .sign(&key, MessageDigest::sha256())
+        .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    let certificate = certificate.build();
+
+    Ok(EphemeralCredentials {
+        certificate_pem: certificate
+            .to_pem()
+            .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?,
+        private_key_pem: key
+            .private_key_to_pem_pkcs8()
+            .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?,
+    })
 }
 
 impl OpenSslTlsClient {
@@ -245,6 +310,15 @@ mod tests {
         assert!(!progress.complete);
         assert!(!progress.outbound.is_empty());
         assert_eq!(progress.outbound[0], 0x16);
+    }
+
+    #[test]
+    fn generated_credentials_are_ephemeral_and_usable() {
+        let first = generate_ephemeral_credentials().expect("first credentials");
+        let second = generate_ephemeral_credentials().expect("second credentials");
+        assert_ne!(first.private_key_pem, second.private_key_pem);
+        OpenSslTlsClient::from_pem(&first.certificate_pem, &first.private_key_pem, 64 * 1024)
+            .expect("generated credentials should load");
     }
 
     #[test]

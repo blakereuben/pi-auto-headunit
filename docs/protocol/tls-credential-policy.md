@@ -14,6 +14,8 @@ The certificate subject names JVC Kenwood and its issuer names Google Automotive
 
 `security-openssl` accepts certificate and private-key PEM bytes at runtime, checks that they match, and drives OpenSSL through bounded in-memory transport. Tests generate temporary credentials at runtime. The repository contains no compatibility credential, and the backend is not yet connected to a phone session.
 
+The diagnostic now contains an explicit `usb tls-probe` path that generates a fresh keypair in memory for each invocation. It cannot run without `--allow-live-aap`, rejects an already-accessory-mode phone, and stops before authentication completion and service discovery. Passing native tests does not count as a live interoperability result.
+
 ## Gate for product integration
 
 Before normal phone-session integration or redistribution of compatibility credentials, record:

@@ -113,6 +113,12 @@ cargo run -p aa-headunit-diagnostics -- usb hold --device BUS:ADDRESS --seconds 
 
 The AOA command requires an explicit USB bus/address. It does not send vendor control requests indiscriminately to every attached USB device. After an AOA transition, `usb hold` keeps the selected accessory interface open for a controlled physical-unplug test.
 
+An advanced, explicitly opted-in bench command tests only Android Auto version negotiation and a temporary generated-identity TLS handshake. It requires a freshly connected phone, uses the owner-approved AASDK accessory identity, logs no payloads, and stops before authentication completion or service discovery:
+
+```bash
+cargo run -p aa-headunit-diagnostics -- usb tls-probe --device BUS:ADDRESS --allow-live-aap
+```
+
 ## Architecture
 
 The project keeps responsibilities separate so board changes do not leak into protocol or UI code:

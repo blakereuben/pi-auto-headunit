@@ -46,7 +46,8 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Add bounded per-channel message reassembly with deterministic interleaving and malformed-sequence tests.
 - [x] Implement the bounded version/TLS/authentication/service-discovery control state sequence against fake TLS data.
 - [x] Add a replaceable, bounded OpenSSL TLS client with injected credentials and no embedded shared key.
-- [x] Pass native formatting, strict linting, and all 49 workspace tests after adding the TLS backend.
+- [x] Add an explicit live TLS bench probe using fresh in-memory credentials and a hard stop before authentication/service discovery.
+- [x] Pass native formatting, strict linting, and all 52 workspace tests after adding the opt-in probe.
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.
@@ -55,6 +56,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Add the first deterministic fake-phone handshake test without sending new session messages to a real phone.
 - [ ] Add parser fuzz/property tests for untrusted phone input.
 - [ ] Reach and name the first repeatable Android Auto session state on the Pi 5.
+- [ ] Run the opt-in generated-credential probe and record its first sanitized Pi 5 result.
 - [ ] Prove clean timeout, malformed-message, unplug, and reconnect recovery.
 
 ## M3 — Pi 5 display, media, audio, microphone, and touch

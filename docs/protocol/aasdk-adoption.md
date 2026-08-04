@@ -59,6 +59,17 @@ The control-state test still uses fake TLS bytes. The separate `security-openssl
 
 The shared AASDK certificate identifies organisations named Google Automotive Link and JVC Kenwood and is paired with a publicly distributed private key. GPL compatibility alone does not answer whether this project should present or redistribute that identity material. The repository therefore does not contain it; the compatibility, trademark/identity, and distribution decision is recorded separately in `tls-credential-policy.md` and remains open.
 
+## Adopted USB interoperability-probe scope
+
+The opt-in bench probe's Android Auto accessory identification and claimed bulk-transfer behaviour are derived from:
+
+- `include/aasdk/USB/AccessoryModeQueryFactory.hpp`
+- `src/USB/AccessoryModeQueryFactory.cpp`
+- `include/aasdk/Transport/USBTransport.hpp`
+- `src/Transport/USBTransport.cpp`
+
+The probe uses AASDK's exact six accessory strings, including its third-party URI and serial value, only when the operator supplies `--allow-live-aap`. It then sends the adopted version and encapsulated-TLS messages over a claimed bulk interface using temporary project-generated credentials. It stops after the TLS engine completes, does not send authentication completion or a service-discovery response, logs no payloads, and rejects a phone already in accessory mode so the applied identity is unambiguous.
+
 ## Expansion rule
 
 Before another AASDK behaviour, schema, identifier, certificate, or asset is used, add its exact upstream path and purpose here, verify its file-level licence/copyright notice, and update third-party notices. No OpenAuto file may be used to fill a gap.

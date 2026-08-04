@@ -59,6 +59,20 @@ impl AoaIdentification {
         }
     }
 
+    /// Compatibility identity from the owner-approved AASDK revision. This is
+    /// reserved for an explicit Android Auto interoperability probe.
+    #[must_use]
+    pub fn aasdk_compatibility_probe() -> Self {
+        Self {
+            manufacturer: "Android".into(),
+            model: "Android Auto".into(),
+            description: "Android Auto".into(),
+            version: "2.0.1".into(),
+            uri: "https://f1xstudio.com".into(),
+            serial: "HU-AAAAAA001".into(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), AoaError> {
         for (name, value, required) in [
             ("manufacturer", self.manufacturer.as_str(), true),
@@ -361,5 +375,16 @@ mod tests {
             machine.run(device(), &identification),
             Err(AoaError::InvalidIdentification(_))
         ));
+    }
+
+    #[test]
+    fn aasdk_probe_identity_is_pinned() {
+        let identity = AoaIdentification::aasdk_compatibility_probe();
+        assert_eq!(identity.manufacturer, "Android");
+        assert_eq!(identity.model, "Android Auto");
+        assert_eq!(identity.description, "Android Auto");
+        assert_eq!(identity.version, "2.0.1");
+        assert_eq!(identity.uri, "https://f1xstudio.com");
+        assert_eq!(identity.serial, "HU-AAAAAA001");
     }
 }

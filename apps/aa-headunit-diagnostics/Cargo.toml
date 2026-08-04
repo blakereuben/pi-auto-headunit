@@ -14,5 +14,9 @@ platform-linux = { path = "../../crates/platform-linux" }
 transport-api = { path = "../../crates/transport-api" }
 transport-usb = { path = "../../crates/transport-usb" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+protocol-aap = { path = "../../crates/protocol-aap" }
+security-openssl = { path = "../../crates/security-openssl" }
+
 [lints]
 workspace = true

@@ -43,6 +43,14 @@ fn run(args: &[String]) -> Result<(), CliError> {
         {
             usb_hold(selector, parse_hold_seconds(seconds)?)
         }
+        [group, command, device_flag, selector, allow]
+            if group == "usb"
+                && command == "tls-probe"
+                && device_flag == "--device"
+                && allow == "--allow-live-aap" =>
+        {
+            usb_tls_probe(selector)
+        }
         [] | [..] if args.iter().any(|arg| arg == "--help" || arg == "-h") => {
             print_help();
             Ok(())
@@ -66,6 +74,7 @@ fn print_help() {
            usb aoa --device BUS:ADDRESS\n\
            usb soak --device BUS:ADDRESS --cycles COUNT\n\
            usb hold --device BUS:ADDRESS --seconds COUNT\n\
+           usb tls-probe --device BUS:ADDRESS --allow-live-aap\n\
          \n\
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
         env!("CARGO_PKG_VERSION")
@@ -338,6 +347,12 @@ fn usb_hold(selector: &str, seconds: u64) -> Result<(), CliError> {
         .into_iter()
         .find(|device| device.bus == bus && device.address == address)
         .ok_or(CliError::Aoa(transport_api::AoaError::Unplugged))?;
+    if transport_usb::is_accessory_id(candidate.vendor_id, candidate.product_id) {
+        return Err(CliError::Usage(
+            "tls-probe requires a freshly connected phone before accessory mode; unplug and reconnect it first"
+                .into(),
+        ));
+    }
     if !transport_usb::is_accessory_id(candidate.vendor_id, candidate.product_id) {
         return Err(CliError::Usage(
             "hold requires a device already in AOA accessory mode; run usb aoa first".into(),
@@ -363,6 +378,234 @@ fn usb_hold(selector: &str, seconds: u64) -> Result<(), CliError> {
 
 #[cfg(not(target_os = "linux"))]
 fn usb_hold(_: &str, _: u64) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
+fn usb_tls_probe(selector: &str) -> Result<(), CliError> {
+    use protocol_aap::{
+        AASDK_MAX_FRAME_PAYLOAD_SIZE, ControlMessage, Encryption, FrameError, FrameHeader,
+        FrameType, HandshakeAction, HandshakeEvent, HandshakeStateMachine, MessageAssembler,
+        MessageType, ProtocolLimits, TlsClient, decode_frame, encode_frame,
+    };
+    use security_openssl::{OpenSslTlsClient, generate_ephemeral_credentials};
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+    use transport_api::{AoaIdentification, AoaMachine};
+
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+    const IO_TIMEOUT: Duration = Duration::from_millis(500);
+    const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
+
+    let (bus, address) = transport_usb::parse_bus_address(selector).map_err(CliError::Aoa)?;
+    let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
+    let candidate = backend
+        .list_devices()
+        .map_err(CliError::Aoa)?
+        .into_iter()
+        .find(|device| device.bus == bus && device.address == address)
+        .ok_or(CliError::Aoa(transport_api::AoaError::Unplugged))?;
+
+    println!("probe_scope=version_and_tls_only");
+    println!("probe_credentials=temporary_project_generated");
+    println!("probe_payload_logging=disabled");
+    println!("probe_state=preparing_accessory_transport");
+
+    let mut aoa = AoaMachine::new(backend, PROBE_TIMEOUT);
+    let outcome = aoa
+        .run(candidate, &AoaIdentification::aasdk_compatibility_probe())
+        .map_err(CliError::Aoa)?;
+    let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
+    let mut transport = backend
+        .open_claimed_session_transport(&outcome.transport.device)
+        .map_err(CliError::Aoa)?;
+
+    let credentials =
+        generate_ephemeral_credentials().map_err(|error| CliError::Protocol(error.to_string()))?;
+    let mut tls = OpenSslTlsClient::from_pem(
+        &credentials.certificate_pem,
+        &credentials.private_key_pem,
+        64 * 1024,
+    )
+    .map_err(|error| CliError::Protocol(error.to_string()))?;
+    drop(credentials);
+
+    let limits = ProtocolLimits::default();
+    let mut handshake = HandshakeStateMachine::default();
+    let mut actions: VecDeque<_> = handshake
+        .advance(HandshakeEvent::Start)
+        .map_err(|error| CliError::Protocol(error.to_string()))?
+        .into();
+    process_probe_actions(
+        &mut actions,
+        &mut handshake,
+        &mut tls,
+        &mut transport,
+        limits,
+    )?;
+    println!("probe_state=version_request_sent");
+
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut received = Vec::new();
+    let mut read_buffer = vec![0_u8; AASDK_MAX_FRAME_PAYLOAD_SIZE + 8];
+    let mut assembler =
+        MessageAssembler::new(1).map_err(|error| CliError::Protocol(error.to_string()))?;
+
+    while Instant::now() < deadline {
+        let size = transport
+            .read(&mut read_buffer, IO_TIMEOUT)
+            .map_err(CliError::Aoa)?;
+        if size == 0 {
+            continue;
+        }
+        if received.len() + size > MAX_ACCUMULATED_BYTES {
+            return Err(CliError::Protocol(
+                "incoming frame buffer exceeded the probe limit".into(),
+            ));
+        }
+        received.extend_from_slice(&read_buffer[..size]);
+
+        loop {
+            let frame = match decode_frame(&received, limits) {
+                Ok(frame) => frame,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(error) => return Err(CliError::Protocol(error.to_string())),
+            };
+            let consumed = frame.consumed;
+            let message = assembler
+                .push(frame)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            received.drain(..consumed);
+            let Some(message) = message else {
+                continue;
+            };
+            if message.channel_id != 0
+                || message.encryption != Encryption::Plain
+                || message.message_type != MessageType::Specific
+            {
+                return Err(CliError::Protocol(
+                    "unexpected message metadata during TLS probe".into(),
+                ));
+            }
+
+            let mut actions: VecDeque<_> = handshake
+                .advance(HandshakeEvent::InboundControl(&message.payload))
+                .map_err(|error| CliError::Protocol(error.to_string()))?
+                .into();
+            if process_probe_actions(
+                &mut actions,
+                &mut handshake,
+                &mut tls,
+                &mut transport,
+                limits,
+            )? {
+                println!("probe_result=tls_handshake_complete");
+                println!("probe_stop=before_authentication_and_service_discovery");
+                return Ok(());
+            }
+        }
+    }
+
+    return Err(CliError::Protocol(
+        "TLS probe timed out before handshake completion".into(),
+    ));
+
+    fn process_probe_actions(
+        actions: &mut VecDeque<HandshakeAction>,
+        handshake: &mut HandshakeStateMachine,
+        tls: &mut OpenSslTlsClient,
+        transport: &mut transport_usb::LibUsbBulkTransport,
+        limits: ProtocolLimits,
+    ) -> Result<bool, CliError> {
+        while let Some(action) = actions.pop_front() {
+            match action {
+                HandshakeAction::SendControl(message) => {
+                    send_probe_control(transport, &message, limits)?;
+                }
+                HandshakeAction::StartTlsClient => {
+                    println!("probe_state=version_accepted");
+                    let progress = tls
+                        .start()
+                        .map_err(|error| CliError::Protocol(error.to_string()))?;
+                    if finish_or_queue_tls(&progress, actions, handshake, transport, limits)? {
+                        return Ok(true);
+                    }
+                }
+                HandshakeAction::FeedTls(inbound) => {
+                    let progress = tls
+                        .feed(&inbound)
+                        .map_err(|error| CliError::Protocol(error.to_string()))?;
+                    if finish_or_queue_tls(&progress, actions, handshake, transport, limits)? {
+                        return Ok(true);
+                    }
+                }
+                HandshakeAction::ServiceDiscoveryRequest(_) => {
+                    return Err(CliError::Protocol(
+                        "probe crossed its service-discovery stop boundary".into(),
+                    ));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn finish_or_queue_tls(
+        progress: &protocol_aap::TlsProgress,
+        actions: &mut VecDeque<HandshakeAction>,
+        handshake: &mut HandshakeStateMachine,
+        transport: &mut transport_usb::LibUsbBulkTransport,
+        limits: ProtocolLimits,
+    ) -> Result<bool, CliError> {
+        if progress.complete {
+            if !progress.outbound.is_empty() {
+                send_probe_control(
+                    transport,
+                    &ControlMessage::encapsulated_tls(&progress.outbound),
+                    limits,
+                )?;
+            }
+            return Ok(true);
+        }
+        actions.extend(
+            handshake
+                .advance(HandshakeEvent::TlsProgress {
+                    outbound: &progress.outbound,
+                    complete: false,
+                })
+                .map_err(|error| CliError::Protocol(error.to_string()))?,
+        );
+        Ok(false)
+    }
+
+    fn send_probe_control(
+        transport: &mut transport_usb::LibUsbBulkTransport,
+        message: &ControlMessage,
+        limits: ProtocolLimits,
+    ) -> Result<(), CliError> {
+        let payload = message
+            .encode(protocol_aap::DEFAULT_MAX_CONTROL_BODY_SIZE)
+            .map_err(|error| CliError::Protocol(error.to_string()))?;
+        let frame = encode_frame(
+            FrameHeader {
+                channel_id: 0,
+                frame_type: FrameType::Bulk,
+                encryption: Encryption::Plain,
+                message_type: MessageType::Specific,
+            },
+            None,
+            &payload,
+            limits,
+        )
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+        transport
+            .write_all(&frame, Duration::from_secs(2))
+            .map_err(CliError::Aoa)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn usb_tls_probe(_: &str) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
@@ -395,6 +638,7 @@ enum CliError {
     #[cfg(target_os = "linux")]
     Media(String),
     Aoa(transport_api::AoaError),
+    Protocol(String),
 }
 
 impl CliError {
@@ -410,6 +654,7 @@ impl CliError {
             Self::Aoa(transport_api::AoaError::TimedOut(_)) => 15,
             Self::Aoa(transport_api::AoaError::Unplugged) => 16,
             Self::Aoa(_) => 17,
+            Self::Protocol(_) => 19,
         }
     }
 }
@@ -426,6 +671,7 @@ impl std::fmt::Display for CliError {
             #[cfg(target_os = "linux")]
             Self::Media(error) => write!(f, "media: {error}"),
             Self::Aoa(error) => error.fmt(f),
+            Self::Protocol(error) => write!(f, "protocol probe: {error}"),
         }
     }
 }
@@ -469,5 +715,16 @@ mod tests {
         assert!(parse_hold_seconds("0").is_err());
         assert!(parse_hold_seconds("301").is_err());
         assert!(parse_hold_seconds("long").is_err());
+    }
+
+    #[test]
+    fn live_tls_probe_requires_explicit_opt_in() {
+        let args = vec![
+            "usb".into(),
+            "tls-probe".into(),
+            "--device".into(),
+            "1:2".into(),
+        ];
+        assert!(matches!(run(&args), Err(CliError::Usage(_))));
     }
 }

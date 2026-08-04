@@ -15,6 +15,11 @@ pub struct LibUsbAoaBackend {
     context: Context,
 }
 
+pub struct LibUsbBulkTransport {
+    handle: DeviceHandle<Context>,
+    info: BulkTransportInfo,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldResult {
     Unplugged,
@@ -125,6 +130,53 @@ impl LibUsbAoaBackend {
             .release_interface(transport.interface_number)
             .map_err(map_usb_error)?;
         Ok(HoldResult::TimedOut)
+    }
+
+    pub fn open_claimed_session_transport(
+        &self,
+        device: &UsbDeviceId,
+    ) -> Result<LibUsbBulkTransport, AoaError> {
+        let (handle, info) = self.open_claimed_bulk_transport(device)?;
+        Ok(LibUsbBulkTransport { handle, info })
+    }
+}
+
+impl LibUsbBulkTransport {
+    #[must_use]
+    pub const fn info(&self) -> &BulkTransportInfo {
+        &self.info
+    }
+
+    pub fn write_all(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), AoaError> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let written = self
+                .handle
+                .write_bulk(self.info.bulk_out_endpoint, &bytes[offset..], timeout)
+                .map_err(map_usb_error)?;
+            if written == 0 {
+                return Err(AoaError::Usb("bulk transfer wrote zero bytes".into()));
+            }
+            offset += written;
+        }
+        Ok(())
+    }
+
+    pub fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<usize, AoaError> {
+        match self
+            .handle
+            .read_bulk(self.info.bulk_in_endpoint, buffer, timeout)
+        {
+            Ok(size) => Ok(size),
+            Err(rusb::Error::Timeout) => Ok(0),
+            Err(error) => Err(map_usb_error(error)),
+        }
+    }
+}
+
+impl Drop for LibUsbBulkTransport {
+    fn drop(&mut self) {
+        let _ = self.handle.release_interface(self.info.interface_number);
     }
 }
 
