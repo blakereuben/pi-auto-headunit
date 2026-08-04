@@ -81,7 +81,9 @@ Preferred video pipeline characteristics:
 
 No particular GStreamer element name is part of the architecture contract. The capability probe records decoder, formats, buffer modes, sink, measured latency, and failure reason.
 
-Pi 4/CM4 officially advertise H.264 hardware decode. Pi 5/CM5 officially advertise HEVC hardware decode, not H.264 hardware decode. If the phone supplies H.264 on Pi 5/CM5, the planned safe fallback is software H.264 decode plus GPU composition unless testing demonstrates a maintained hardware path or approved protocol negotiation permits HEVC.
+Pi 4/CM4 officially advertise H.264 hardware decode. Pi 5/CM5 officially advertise HEVC hardware decode, not H.264 hardware decode. If the phone supplies H.264 on Pi 5/CM5, the safe fallback is software H.264 decode plus Wayland/GPU composition unless testing demonstrates a maintained hardware path or approved protocol negotiation permits HEVC.
+
+The Pi 5 reference baseline validates GStreamer's `avdec_h264` software decoder and `waylandsink` presentation at 800x480/30 fps. A 60-second synthetic stream decoded at approximately 42 times real-time and full-screen presentation passed. This selects the fallback architecture, not a permanently fixed element chain: the application must still own the Wayland surface correctly, measure end-to-end latency under live pacing, and preserve the capability-driven replacement boundary.
 
 Audio uses separate logical roles (media, navigation/system, speech, microphone), a common monotonic clock, bounded jitter buffers, and explicit focus/ducking policy. ALSA is the initial appliance backend because it has a predictable boot/runtime model. PipeWire is a later adapter for coexistence with the Raspberry Pi desktop. Deprecated AOA 2.0 USB audio mode is not used as the Android Auto audio implementation.
 

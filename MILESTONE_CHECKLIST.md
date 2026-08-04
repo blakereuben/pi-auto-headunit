@@ -53,8 +53,8 @@ Architecture and automated tests must remain portable throughout development, bu
 - [ ] Bring up a native full-screen development UI without relying on VNC.
 - [x] Verify native touch press, move, release, coordinates, and two-finger multi-touch.
 - [ ] Verify touch rotation and calibration in every supported screen orientation.
-- [ ] Render synthetic H.264 video and measure Pi 5 decode/presentation performance.
-- [ ] Select and document the Pi 5 hardware-accelerated or software fallback video path.
+- [x] Render synthetic H.264 video and measure Pi 5 decode/presentation performance.
+- [x] Select and document the Pi 5 software H.264 decode plus Wayland/GPU composition fallback path.
 - [ ] Detect and test available onboard/HDMI audio outputs.
 - [x] Test the USB sound card as an audio-output fallback.
 - [ ] Select and test a microphone input.
