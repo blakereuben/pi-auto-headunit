@@ -106,7 +106,8 @@ Cross-compilation is useful for fast feedback but does not replace a native/clea
 
 ## Dependency approach
 
-- Prefer dynamic linking to Raspberry Pi OS/Debian libraries for libusb, GTK, GStreamer, ALSA, udev, and crypto so security updates arrive through `apt`.
+- Prefer dynamic linking to Raspberry Pi OS/Debian libraries for libusb, GTK, GStreamer, ALSA, udev, and OpenSSL so security updates arrive through `apt`.
+- Build dependencies include `libssl-dev`; the final binary package declares the automatically determined OpenSSL runtime package and must not vendor a private OpenSSL build.
 - Package Rust code into the application binary; do not require Rust/Cargo on the target.
 - Avoid bundling system multimedia plugins in `/opt` or private library paths.
 - Declare required GStreamer plugins explicitly once the validated pipeline is known; do not install broad “everything” bundles without need.

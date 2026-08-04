@@ -67,6 +67,10 @@ An explicit state machine for discovery, version/security negotiation, service d
 
 The state machine is transport-independent and tested against scripted peers. Cryptographic handshakes are implemented only from an approved source and use a maintained TLS library.
 
+### `security-openssl`
+
+The Linux TLS adapter implements the protocol crate's replaceable `TlsClient` boundary using Raspberry Pi OS OpenSSL and bounded in-memory transport buffers. Certificate/private-key material is injected by the composition or packaging layer; the adapter does not own or embed credentials. This keeps protocol state, cryptographic implementation, and the separate compatibility-credential policy independently reviewable and testable.
+
 ### `media-api` and `media-gstreamer`
 
 `media-api` defines encoded-video input, audio stream roles, microphone source, focus policy, clocks, backpressure, and capability reporting. `media-gstreamer` builds pipelines selected from probed capabilities rather than board-name conditionals.

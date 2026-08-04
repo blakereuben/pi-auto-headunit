@@ -13,6 +13,7 @@ use std::fmt;
 
 mod assembly;
 mod control;
+mod tls;
 
 pub use assembly::{AssemblyError, Message, MessageAssembler};
 pub use control::{
@@ -20,6 +21,7 @@ pub use control::{
     DEFAULT_MAX_CONTROL_BODY_SIZE, DEFAULT_MAX_TLS_CHUNK_SIZE, HandshakeAction, HandshakeEvent,
     HandshakeState, HandshakeStateMachine, ProtocolVersion,
 };
+pub use tls::{TlsClient, TlsProgress};
 
 pub const AASDK_MAX_FRAME_PAYLOAD_SIZE: usize = 0x4000;
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;

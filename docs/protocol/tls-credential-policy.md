@@ -1,0 +1,27 @@
+# TLS Credential Policy
+
+## Current decision
+
+The project may implement AASDK-derived TLS behaviour, but it will not embed, present, or redistribute AASDK's shared certificate/private-key pair until its compatibility and identity implications have been reviewed and explicitly approved.
+
+## Verified source behaviour
+
+At pinned AASDK revision `9bf6adf933665dee26532201719fac14a047ccf1`, `Cryptor.cpp` loads a fixed certificate and matching RSA private key into an OpenSSL client context. `SSLWrapper.cpp` uses a client connection over memory BIOs and disables peer-certificate verification. Both files carry GPL-3.0-or-later notices and are listed in the adoption record.
+
+The certificate subject names JVC Kenwood and its issuer names Google Automotive Link. Its paired private key is already public in AASDK, so it must not be treated as a repository secret. Public availability and GPL licensing do not by themselves establish that presenting or redistributing the named identity is appropriate for this independent project.
+
+## Implemented boundary
+
+`security-openssl` accepts certificate and private-key PEM bytes at runtime, checks that they match, and drives OpenSSL through bounded in-memory transport. Tests generate temporary credentials at runtime. The repository contains no compatibility credential, and the backend is not yet connected to a phone session.
+
+## Gate for live testing
+
+Before the first live TLS handshake, record:
+
+1. whether the AASDK pair is technically required or an independently generated identity is accepted, based on an approved source or controlled interoperability test;
+2. the legal/trademark rationale for any third-party-named certificate that would be presented or distributed;
+3. the package location, permissions, replacement mechanism, and disclosure that the key is a public compatibility credential rather than a secret;
+4. the security consequence of disabled peer verification and any safer compatible alternative;
+5. exact provenance and notices for whichever credential material is selected.
+
+No credential experiments may log PEM material, decrypted traffic, phone identifiers, or user content.

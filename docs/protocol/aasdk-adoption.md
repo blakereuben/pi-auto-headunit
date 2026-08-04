@@ -55,7 +55,9 @@ The bounded control envelope and fake-transport handshake state machine are deri
 
 Derived facts cover protocol version 1.6, two-byte big-endian control-message identifiers, the version request/response layout, TLS records encapsulated as control message 3, the successful proto2 authentication response, and transition to a received service-discovery request. The negotiated version returned by the phone is retained instead of assuming it matches the offered version.
 
-This implementation uses fake TLS bytes only. It does not yet contain a TLS engine, copy AASDK's embedded certificate/private-key material, parse service discovery, or send any new Android Auto control message to a phone. Those items require a separate recorded adoption and security decision.
+The control-state test still uses fake TLS bytes. The separate `security-openssl` crate now reproduces AASDK's OpenSSL client/memory-buffer boundary with injected credentials and bounded input/output, but it does not copy AASDK's embedded certificate/private-key material. It has only been tested with runtime-generated test credentials and has not contacted a phone. Service-discovery parsing and live session traffic remain outside this scope.
+
+The shared AASDK certificate identifies organisations named Google Automotive Link and JVC Kenwood and is paired with a publicly distributed private key. GPL compatibility alone does not answer whether this project should present or redistribute that identity material. The repository therefore does not contain it; the compatibility, trademark/identity, and distribution decision is recorded separately in `tls-credential-policy.md` and remains open.
 
 ## Expansion rule
 

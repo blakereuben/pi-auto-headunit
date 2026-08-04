@@ -27,6 +27,7 @@ Working today:
 - phone re-enumeration detection and accessory bulk-endpoint discovery;
 - clean unplug/reconnect handling;
 - board-independent video-decoder selection and a native GStreamer capability probe;
+- bounded AAP framing, reassembly, control-handshake logic, and a replaceable OpenSSL TLS client;
 - an `arm64` development `.deb` with unprivileged USB access rules.
 
 Verified on the Pi 5 reference system:
@@ -72,7 +73,7 @@ Wireless Android Auto is deliberately scheduled after a stable wired release. Ad
 - Raspberry Pi 5, Pi 4, CM5, or CM4; development and physical validation currently use the Pi 5 only.
 - 64-bit Raspberry Pi OS based on Debian 13 (Trixie).
 - A USB host port and data-capable USB cable for wired phone testing.
-- Rust 1.85 or newer, Cargo, a C build toolchain, `pkg-config`, and the libusb and GStreamer development packages when building from source.
+- Rust 1.85 or newer, Cargo, a C build toolchain, `pkg-config`, and the libusb, OpenSSL, and GStreamer development packages when building from source.
 - An Android phone for hardware tests; no phone is required for ordinary unit tests.
 
 Current direct Rust and native dependencies and their licences are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Future display, audio, Bluetooth, and networking dependencies will be documented when they are actually added.
@@ -83,7 +84,7 @@ There is not yet an end-user release. The current diagnostic can be built on a 6
 
 ```bash
 sudo apt update
-sudo apt install build-essential cargo libgstreamer1.0-dev libusb-1.0-0-dev pkg-config rustc
+sudo apt install build-essential cargo libgstreamer1.0-dev libssl-dev libusb-1.0-0-dev pkg-config rustc
 git clone https://github.com/blakereuben/pi-auto-headunit.git
 cd pi-auto-headunit
 cargo build --workspace --locked
@@ -160,6 +161,7 @@ See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for
 - [`crates/media-api`](crates/media-api) — board-independent decoder requirements and selection
 - [`crates/media-gstreamer`](crates/media-gstreamer) — Linux GStreamer capability adapter
 - [`crates/protocol-aap`](crates/protocol-aap) — bounded GPL-derived Android Auto frame codec
+- [`crates/security-openssl`](crates/security-openssl) — Linux OpenSSL adapter with injected credentials
 - [`packaging/debian`](packaging/debian) — development Debian package metadata
 - [`docs`](docs) — design decisions, protocol evidence, and hardware reports
 

@@ -45,10 +45,12 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Implement bounded Rust frame encoding/decoding without sending protocol messages to a phone.
 - [x] Add bounded per-channel message reassembly with deterministic interleaving and malformed-sequence tests.
 - [x] Implement the bounded version/TLS/authentication/service-discovery control state sequence against fake TLS data.
-- [x] Pass native formatting, strict linting, and all 46 workspace tests after adding the fake handshake state machine.
+- [x] Add a replaceable, bounded OpenSSL TLS client with injected credentials and no embedded shared key.
+- [x] Pass native formatting, strict linting, and all 49 workspace tests after adding the TLS backend.
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.
+- [ ] Approve the compatibility certificate/private-key distribution and identity policy before a live TLS handshake.
 - [ ] Build all required protocol parsing and framing behind transport interfaces.
 - [x] Add the first deterministic fake-phone handshake test without sending new session messages to a real phone.
 - [ ] Add parser fuzz/property tests for untrusted phone input.

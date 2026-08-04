@@ -1,0 +1,14 @@
+[package]
+name = "security-openssl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = "0.10.76"
+protocol-aap = { path = "../protocol-aap" }
+
+[lints]
+workspace = true
