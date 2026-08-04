@@ -31,7 +31,7 @@ The Rust `protocol-aap` framing implementation is derived from these files:
 - `src/Messenger/MessageInStream.cpp`
 - `src/Messenger/MessageOutStream.cpp`
 
-Derived facts are limited initially to the two-byte frame header, flag layout, big-endian short/extended sizes, first-frame total size, and the `0x4000` frame payload limit. The Rust implementation adds stricter reserved-bit validation and an independent bounded total-message limit.
+Derived facts currently cover the two-byte frame header, flag layout, big-endian short/extended sizes, first-frame total size, the `0x4000` frame payload limit, and per-channel fragment reassembly. The Rust implementation adds stricter reserved-bit validation, independent bounded total-message/concurrent-channel limits, and rejects restarted, incomplete, inconsistent, or metadata-changing fragment sequences.
 
 ## Expansion rule
 

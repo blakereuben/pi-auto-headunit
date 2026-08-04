@@ -43,7 +43,8 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Record the project owner's decision to approve GPLv3 AASDK while excluding OpenAuto code.
 - [x] Pin the approved AASDK revision and record file-level attribution for the first framing scope.
 - [x] Implement bounded Rust frame encoding/decoding without sending protocol messages to a phone.
-- [x] Pass native formatting, strict linting, and all 30 workspace tests after adding the frame codec.
+- [x] Add bounded per-channel message reassembly with deterministic interleaving and malformed-sequence tests.
+- [x] Pass native formatting, strict linting, and all 38 workspace tests after adding framing and reassembly.
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.

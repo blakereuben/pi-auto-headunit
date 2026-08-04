@@ -12,6 +12,7 @@
 | DHU advertises 800x480, 1280x720, and 1920x1080 configurations plus touch/microphone/sensor capabilities | P0 product fact | Official Google DHU documentation | Evidence only; no wire format inferred |
 | Android Auto accessory identification values | PX | Not publicly specified in the sources reviewed | No |
 | Two-byte AAP frame header, flags, short/extended big-endian lengths, and `0x4000` frame limit | P1 | Owner-approved GPL-3.0-or-later AASDK revision `9bf6adf` | Yes; bounded Rust codec and tests |
+| Per-channel first/middle/last/bulk message reassembly | P1 | Same approved AASDK revision and recorded `MessageInStream` source | Yes; bounded Rust assembler and tests |
 | Android Auto security negotiation, services, or channels beyond the adopted framing scope | PX | AASDK paths not yet individually reviewed/adopted | No |
 | Wireless Android Auto bootstrap/session | PX | Not publicly specified in the sources reviewed | No |
 

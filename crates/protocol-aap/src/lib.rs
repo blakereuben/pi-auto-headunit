@@ -11,6 +11,10 @@
 
 use std::fmt;
 
+mod assembly;
+
+pub use assembly::{AssemblyError, Message, MessageAssembler};
+
 pub const AASDK_MAX_FRAME_PAYLOAD_SIZE: usize = 0x4000;
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 const FRAME_HEADER_SIZE: usize = 2;
