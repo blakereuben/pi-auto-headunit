@@ -236,6 +236,11 @@ impl OpenSslTlsClient {
         self.version_policy
     }
 
+    #[must_use]
+    pub fn handshake_state(&self) -> String {
+        self.stream.ssl().state_string_long().to_owned()
+    }
+
     fn progress(&mut self) -> Result<TlsProgress, OpenSslTlsError> {
         match self.stream.connect() {
             Ok(()) => self.complete = true,
@@ -369,6 +374,7 @@ mod tests {
         .expect("TLS 1.2 client");
         assert_eq!(client.version_policy(), TlsVersionPolicy::Tls12Only);
         assert!(!client.start().expect("client hello").outbound.is_empty());
+        assert!(!client.handshake_state().is_empty());
     }
 
     #[test]

@@ -530,6 +530,7 @@ fn usb_tls_probe(selector: &str, tls12_compatibility: bool) -> Result<(), CliErr
         }
     }
 
+    println!("probe_tls_state={}", tls.handshake_state());
     return Err(CliError::Protocol(
         "TLS probe timed out before handshake completion".into(),
     ));

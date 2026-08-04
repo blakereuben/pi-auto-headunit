@@ -35,3 +35,5 @@ A narrowly controlled bench handshake with temporary project-generated credentia
 On 4 August 2026, the Pi 5 probe reached an accepted AAP 1.6 version response and then timed out before TLS completed. No authentication-complete or service-discovery response was sent. This is not evidence that the generated identity was accepted or rejected; further diagnosis must distinguish TLS transport/configuration from credential handling without logging handshake payloads or weakening the stop boundary.
 
 A separate `--tls12-compat` mode is now available because the pinned AASDK source explicitly selects `TLSv1_2_client_method()` when built against OpenSSL older than 1.1. The ordinary probe retains AASDK's newer `TLS_client_method()` behaviour. Comparing these modes is source-backed diagnosis, not an inferred protocol requirement.
+
+The first TLS-1.2 comparison received peer TLS data but still timed out before completion. The next diagnostic revision exposes only OpenSSL's generic handshake state label on timeout; it does not expose records, lengths, cryptographic values, or payload contents.
