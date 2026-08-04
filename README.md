@@ -1,5 +1,7 @@
 # Pi Auto Head Unit
 
+**Project name:** Pi Auto Head Unit (working-name placeholder)
+
 A native, open-source Android Auto head-unit project for Raspberry Pi Compute Module 4, Compute Module 5, Pi 4, and Pi 5, running 64-bit Raspberry Pi OS.
 
 The aim is an appliance-style system that starts with the car, connects to an Android phone, displays Android Auto on a touchscreen, and uses Raspberry Pi hardware acceleration where available. The primary runtime is a normal Raspberry Pi OS application—not Docker—and the finished installer will be a Debian (`.deb`) package managed by systemd.
@@ -10,7 +12,7 @@ The aim is an appliance-style system that starts with the car, connects to an An
 > [!IMPORTANT]
 > This project is at an early hardware-diagnostics stage. It does **not** yet display Android Auto, play its audio, return touch input, or support wireless Android Auto. It is experimental, uncertified software for bench development and must not control safety-critical vehicle functions.
 
-## Current status
+## Features and current status
 
 Milestone 1 is building and testing the safe USB foundation needed before the Android Auto session itself.
 
@@ -43,7 +45,7 @@ Detailed results are recorded in [the Pi 5 evidence report](docs/hardware/eviden
 | Hardware | Intended support | Current validation |
 |---|---|---|
 | Raspberry Pi 5 | Yes | Primary development/reference board |
-| Raspberry Pi 4 | Yes | Physical testing follows the complete Pi 5 wired path |
+| Raspberry Pi 4 | Yes | Physical testing follows the complete Pi 5 wired/wireless completion gate |
 | Compute Module 5 | Yes | Carrier-board testing planned |
 | Compute Module 4 | Yes | Waveshare Mini Base Board (B) Rev 3.1 planned |
 
@@ -63,7 +65,31 @@ The software checks what Linux can actually use; it does not assume every Comput
 
 Wireless Android Auto is deliberately scheduled after a stable wired release. Adapter support will be published by tested chipset and USB ID rather than claimed for every dongle.
 
-## Try the current diagnostics
+## Requirements and dependencies
+
+- Raspberry Pi 5, Pi 4, CM5, or CM4; development and physical validation currently use the Pi 5 only.
+- 64-bit Raspberry Pi OS based on Debian 13 (Trixie).
+- A USB host port and data-capable USB cable for wired phone testing.
+- Rust 1.85 or newer, Cargo, a C build toolchain, `pkg-config`, and the `libusb-1.0` development package when building from source.
+- An Android phone for hardware tests; no phone is required for ordinary unit tests.
+
+Current direct Rust dependencies and their licences are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Future display, media, audio, Bluetooth, and networking dependencies will be documented when they are actually added.
+
+## Installation
+
+There is not yet an end-user release. The current diagnostic can be built on a 64-bit Raspberry Pi OS development system:
+
+```bash
+sudo apt update
+sudo apt install build-essential cargo libusb-1.0-0-dev pkg-config rustc
+git clone https://github.com/blakereuben/pi-auto-headunit.git
+cd pi-auto-headunit
+cargo build --workspace --locked
+```
+
+The finished release installation will use an `arm64` Debian package installed through `apt`, followed by preflight/setup and explicit systemd service activation. It will not require Docker or a Rust toolchain. See [PACKAGING.md](PACKAGING.md) for the release packaging plan.
+
+## Usage
 
 This is for development on a 64-bit Raspberry Pi OS system. Rust and the native build dependencies are currently required; end users should wait for a published `.deb` release.
 
@@ -81,18 +107,6 @@ cargo run -p aa-headunit-diagnostics -- usb soak --device BUS:ADDRESS --cycles 1
 ```
 
 The AOA command requires an explicit USB bus/address. It does not send vendor control requests indiscriminately to every attached USB device.
-
-## Planned finished installation
-
-The release installation will be native to Raspberry Pi OS:
-
-1. Install the signed `arm64` `.deb` with `apt`.
-2. Run the preflight/setup tool.
-3. Choose display, touch, audio, microphone, and radio providers.
-4. Enable the systemd service explicitly.
-5. Reboot into the full-screen appliance experience.
-
-No Docker runtime and no Rust toolchain will be required on the finished head unit. See [PACKAGING.md](PACKAGING.md) for the complete packaging policy.
 
 ## Architecture
 
@@ -128,7 +142,7 @@ Track progress in [MILESTONE_CHECKLIST.md](MILESTONE_CHECKLIST.md). See [MILESTO
 
 The public Android Open Accessory requests are implemented from AOSP documentation. Google does not publicly document the complete production Android Auto head-unit protocol.
 
-Undocumented behavior is not guessed. Each protocol feature must be backed by a public specification, an authorized source, or a documented and legally reviewed interoperability process. Unknown behavior stays unimplemented. The project is independent and is not Google-certified.
+Undocumented behavior is not guessed. Each protocol feature must be backed by a public specification, an authorized source, or a documented and legally reviewed interoperability process. Unknown behavior stays unimplemented. Google or OpenAuto source code must not be copied into the project.
 
 See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for the full policy.
 
@@ -142,17 +156,24 @@ See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for
 - [`packaging/debian`](packaging/debian) — development Debian package metadata
 - [`docs`](docs) — design decisions, protocol evidence, and hardware reports
 
+## Development and build checks
+
+The repository is a Rust workspace. Protocol, transport, platform, media, and UI responsibilities remain separated so hardware-specific work cannot silently enter protocol code. Hardware tests must be selected explicitly; ordinary contributor checks do not probe connected USB devices.
+
+Run before submitting changes:
+
+```bash
+cargo fmt --all --check
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
 ## Contributing
 
 Contributions and hardware test reports will be welcome as the project matures. Please start by reading [ARCHITECTURE.md](ARCHITECTURE.md), [MILESTONE_01.md](MILESTONE_01.md), and the protocol certainty rules in [PRD.md](PRD.md). Do not submit copied protocol definitions, private captures, secrets, phone content, or code with unclear licensing.
 
-Before submitting Rust changes, run:
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
+By contributing, you must have the right to submit the work under GPL-3.0-or-later and must preserve applicable third-party copyright and licence notices. The contribution process may gain a Developer Certificate of Origin sign-off before outside contributions are accepted.
 
 ## Documentation
 
@@ -165,6 +186,10 @@ cargo test --workspace
 - [Risk register](RISK_REGISTER.md)
 - [Packaging and installation plan](PACKAGING.md)
 
-## License and naming
+## License and disclaimer
 
-`Pi Auto Head Unit` is a working name. Trademark and final licensing decisions remain subject to the protocol-source and legal review described in the project documents.
+Copyright (C) 2026 Blake Reuben and contributors.
+
+This project is free software licensed under the GNU General Public License, version 3 or (at your option) any later version (`GPL-3.0-or-later`). See [LICENSE](LICENSE), [COPYING](COPYING), and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Pi Auto Head Unit is a working name. This is an independent project and is not affiliated with, endorsed by, sponsored by, or certified by Google LLC. Android and Android Auto are trademarks of Google LLC. No Google logos or brand assets are distributed by this repository.

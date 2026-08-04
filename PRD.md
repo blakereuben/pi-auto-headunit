@@ -189,7 +189,7 @@ This sequencing does not relax the final four-board support contract. Protocol, 
 
 ## 11. Product decisions requiring approval
 
-1. Use GPL-3.0-or-later as the likely project license if compatible GPL protocol work is incorporated; otherwise perform a deliberate license selection after the clean-room/protocol decision.
+1. License the project under GPL-3.0-or-later. Preserve compatible third-party notices and corresponding source obligations in every distributed release.
 2. Treat Raspberry Pi OS Trixie 64-bit as the only initial OS baseline.
 3. Use GTK 4 for the native shell and GStreamer for media, subject to a short on-device latency/prototype gate.
 4. Ship the service disabled by default until preflight succeeds, then provide a one-command enable/start path.

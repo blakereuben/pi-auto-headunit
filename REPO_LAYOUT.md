@@ -7,6 +7,8 @@ pi-auto-headunit/
 ├── README.md
 ├── LICENSES/
 ├── LICENSE
+├── COPYING
+├── THIRD_PARTY_NOTICES.md
 ├── CONTRIBUTING.md
 ├── CODE_OF_CONDUCT.md
 ├── SECURITY.md

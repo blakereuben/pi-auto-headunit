@@ -15,7 +15,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Record the AI-authorship/project-orchestration disclosure.
 - [x] Prepare the Pi 5 8 GB/NVMe reference system for native Rust development.
 - [x] Confirm 64-bit Raspberry Pi OS/Debian Trixie baseline and unprivileged hardware groups.
-- [ ] Select and add the final open-source licence.
+- [x] Select GPL-3.0-or-later and add the complete licence and third-party notices.
 - [ ] Complete the protocol-source, trademark, and clean-room policy review needed for implementation.
 
 ## M1 — Pi 5 documented USB/AOA foundation

@@ -1,9 +1,9 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: pi-auto-headunit
-Source: https://github.com/OWNER/pi-auto-headunit
+Source: https://github.com/blakereuben/pi-auto-headunit
 
 Files: *
-Copyright: 2026 Pi Auto Head Unit Contributors
+Copyright: 2026 Blake Reuben and contributors
 License: GPL-3+
  This program is free software: you can redistribute it and/or modify it
  under the terms of the GNU General Public License as published by the Free
@@ -12,4 +12,3 @@ License: GPL-3+
  .
  On Debian systems, the complete text of the GNU General Public License
  version 3 can be found in /usr/share/common-licenses/GPL-3.
-
