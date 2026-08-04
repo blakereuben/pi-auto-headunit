@@ -29,3 +29,7 @@ Before normal phone-session integration or redistribution of compatibility crede
 No credential experiments may log PEM material, decrypted traffic, phone identifiers, or user content.
 
 A narrowly controlled bench handshake with temporary project-generated credentials may be used to determine whether an independent identity is accepted. It must remain opt-in, stop at the first named handshake result, send no service-discovery response or media/channel traffic, and record only a sanitized success/failure state.
+
+## First bench result
+
+On 4 August 2026, the Pi 5 probe reached an accepted AAP 1.6 version response and then timed out before TLS completed. No authentication-complete or service-discovery response was sent. This is not evidence that the generated identity was accepted or rejected; further diagnosis must distinguish TLS transport/configuration from credential handling without logging handshake payloads or weakening the stop boundary.

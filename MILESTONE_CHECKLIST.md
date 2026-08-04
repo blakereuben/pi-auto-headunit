@@ -56,7 +56,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Add the first deterministic fake-phone handshake test without sending new session messages to a real phone.
 - [ ] Add parser fuzz/property tests for untrusted phone input.
 - [ ] Reach and name the first repeatable Android Auto session state on the Pi 5.
-- [ ] Run the opt-in generated-credential probe and record its first sanitized Pi 5 result.
+- [x] Run the opt-in generated-credential probe and record its first sanitized Pi 5 result: version 1.6 accepted, TLS timed out cleanly.
 - [ ] Prove clean timeout, malformed-message, unplug, and reconnect recovery.
 
 ## M3 — Pi 5 display, media, audio, microphone, and touch
