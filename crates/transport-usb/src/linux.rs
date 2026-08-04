@@ -15,6 +15,12 @@ pub struct LibUsbAoaBackend {
     context: Context,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldResult {
+    Unplugged,
+    TimedOut,
+}
+
 impl LibUsbAoaBackend {
     pub fn new() -> Result<Self, AoaError> {
         Context::new()
@@ -46,6 +52,79 @@ impl LibUsbAoaBackend {
 
     fn open_device(&self, id: &UsbDeviceId) -> Result<DeviceHandle<Context>, AoaError> {
         self.find_device(id)?.open().map_err(map_usb_error)
+    }
+
+    fn open_claimed_bulk_transport(
+        &self,
+        device: &UsbDeviceId,
+    ) -> Result<(DeviceHandle<Context>, BulkTransportInfo), AoaError> {
+        let usb_device = self.find_device(device)?;
+        let config = usb_device
+            .active_config_descriptor()
+            .map_err(map_usb_error)?;
+        let handle = usb_device.open().map_err(map_usb_error)?;
+
+        for interface in config.interfaces() {
+            for descriptor in interface.descriptors() {
+                let mut bulk_in = None;
+                let mut bulk_out = None;
+                for endpoint in descriptor.endpoint_descriptors() {
+                    if endpoint.transfer_type() != TransferType::Bulk {
+                        continue;
+                    }
+                    match endpoint.direction() {
+                        Direction::In => bulk_in.get_or_insert(endpoint.address()),
+                        Direction::Out => bulk_out.get_or_insert(endpoint.address()),
+                    };
+                }
+                let (Some(bulk_in_endpoint), Some(bulk_out_endpoint)) = (bulk_in, bulk_out) else {
+                    continue;
+                };
+
+                let interface_number = descriptor.interface_number();
+                let _ = handle.set_auto_detach_kernel_driver(true);
+                handle
+                    .claim_interface(interface_number)
+                    .map_err(map_usb_error)?;
+                return Ok((
+                    handle,
+                    BulkTransportInfo {
+                        device: device.clone(),
+                        interface_number,
+                        bulk_in_endpoint,
+                        bulk_out_endpoint,
+                    },
+                ));
+            }
+        }
+        Err(AoaError::Unsupported(
+            "accessory device exposes no interface with bulk IN and OUT endpoints".into(),
+        ))
+    }
+
+    pub fn hold_bulk_interface(
+        &mut self,
+        device: &UsbDeviceId,
+        duration: Duration,
+    ) -> Result<HoldResult, AoaError> {
+        let (handle, transport) = self.open_claimed_bulk_transport(device)?;
+        let started = Instant::now();
+        while started.elapsed() < duration {
+            let present = self.list_devices()?.iter().any(|candidate| {
+                candidate.bus == device.bus
+                    && candidate.address == device.address
+                    && candidate.vendor_id == device.vendor_id
+                    && candidate.product_id == device.product_id
+            });
+            if !present {
+                return Ok(HoldResult::Unplugged);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        handle
+            .release_interface(transport.interface_number)
+            .map_err(map_usb_error)?;
+        Ok(HoldResult::TimedOut)
     }
 }
 
@@ -146,48 +225,11 @@ impl AoaBackend for LibUsbAoaBackend {
     }
 
     fn open_bulk_transport(&mut self, device: &UsbDeviceId) -> Result<BulkTransportInfo, AoaError> {
-        let usb_device = self.find_device(device)?;
-        let config = usb_device
-            .active_config_descriptor()
+        let (handle, transport) = self.open_claimed_bulk_transport(device)?;
+        handle
+            .release_interface(transport.interface_number)
             .map_err(map_usb_error)?;
-        let handle = usb_device.open().map_err(map_usb_error)?;
-
-        for interface in config.interfaces() {
-            for descriptor in interface.descriptors() {
-                let mut bulk_in = None;
-                let mut bulk_out = None;
-                for endpoint in descriptor.endpoint_descriptors() {
-                    if endpoint.transfer_type() != TransferType::Bulk {
-                        continue;
-                    }
-                    match endpoint.direction() {
-                        Direction::In => bulk_in.get_or_insert(endpoint.address()),
-                        Direction::Out => bulk_out.get_or_insert(endpoint.address()),
-                    };
-                }
-                let (Some(bulk_in_endpoint), Some(bulk_out_endpoint)) = (bulk_in, bulk_out) else {
-                    continue;
-                };
-
-                let interface_number = descriptor.interface_number();
-                let _ = handle.set_auto_detach_kernel_driver(true);
-                handle
-                    .claim_interface(interface_number)
-                    .map_err(map_usb_error)?;
-                handle
-                    .release_interface(interface_number)
-                    .map_err(map_usb_error)?;
-                return Ok(BulkTransportInfo {
-                    device: device.clone(),
-                    interface_number,
-                    bulk_in_endpoint,
-                    bulk_out_endpoint,
-                });
-            }
-        }
-        Err(AoaError::Unsupported(
-            "accessory device exposes no interface with bulk IN and OUT endpoints".into(),
-        ))
+        Ok(transport)
     }
 
     fn is_accessory_mode(&self, device: &UsbDeviceId) -> bool {

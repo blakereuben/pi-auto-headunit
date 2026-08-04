@@ -4,7 +4,7 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub use linux::LibUsbAoaBackend;
+pub use linux::{HoldResult, LibUsbAoaBackend};
 
 use transport_api::AoaError;
 #[cfg(not(target_os = "linux"))]

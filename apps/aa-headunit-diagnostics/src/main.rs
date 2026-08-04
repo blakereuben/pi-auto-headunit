@@ -34,6 +34,14 @@ fn run(args: &[String]) -> Result<(), CliError> {
         {
             usb_soak(selector, parse_cycles(cycles)? as usize)
         }
+        [group, command, device_flag, selector, seconds_flag, seconds]
+            if group == "usb"
+                && command == "hold"
+                && device_flag == "--device"
+                && seconds_flag == "--seconds" =>
+        {
+            usb_hold(selector, parse_hold_seconds(seconds)?)
+        }
         [] | [..] if args.iter().any(|arg| arg == "--help" || arg == "-h") => {
             print_help();
             Ok(())
@@ -55,6 +63,7 @@ fn print_help() {
            usb list\n\
            usb aoa --device BUS:ADDRESS\n\
            usb soak --device BUS:ADDRESS --cycles COUNT\n\
+           usb hold --device BUS:ADDRESS --seconds COUNT\n\
          \n\
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
         env!("CARGO_PKG_VERSION")
@@ -166,6 +175,18 @@ fn parse_cycles(value: &str) -> Result<u32, CliError> {
     Ok(cycles)
 }
 
+fn parse_hold_seconds(value: &str) -> Result<u64, CliError> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| CliError::Usage(format!("invalid hold duration: {value}")))?;
+    if !(1..=300).contains(&seconds) {
+        return Err(CliError::Usage(
+            "hold duration must be between 1 and 300 seconds".into(),
+        ));
+    }
+    Ok(seconds)
+}
+
 #[cfg(target_os = "linux")]
 fn usb_aoa(selector: &str) -> Result<(), CliError> {
     use std::time::Duration;
@@ -247,6 +268,46 @@ fn usb_soak(selector: &str, cycles: usize) -> Result<(), CliError> {
 
 #[cfg(not(target_os = "linux"))]
 fn usb_soak(_: &str, _: usize) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+fn usb_hold(selector: &str, seconds: u64) -> Result<(), CliError> {
+    use std::time::Duration;
+
+    let (bus, address) = transport_usb::parse_bus_address(selector).map_err(CliError::Aoa)?;
+    let mut backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
+    let candidate = backend
+        .list_devices()
+        .map_err(CliError::Aoa)?
+        .into_iter()
+        .find(|device| device.bus == bus && device.address == address)
+        .ok_or(CliError::Aoa(transport_api::AoaError::Unplugged))?;
+    if !transport_usb::is_accessory_id(candidate.vendor_id, candidate.product_id) {
+        return Err(CliError::Usage(
+            "hold requires a device already in AOA accessory mode; run usb aoa first".into(),
+        ));
+    }
+
+    println!("hold_device={candidate}");
+    println!("hold_seconds={seconds}");
+    println!("hold_state=interface_claimed unplug_phone_now=true");
+    match backend
+        .hold_bulk_interface(&candidate, Duration::from_secs(seconds))
+        .map_err(CliError::Aoa)?
+    {
+        transport_usb::HoldResult::Unplugged => {
+            println!("hold_result=unplug_detected");
+        }
+        transport_usb::HoldResult::TimedOut => {
+            println!("hold_result=timeout_phone_still_present");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn usb_hold(_: &str, _: u64) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
@@ -339,5 +400,13 @@ mod tests {
         assert!(parse_cycles("0").is_err());
         assert!(parse_cycles("10001").is_err());
         assert!(parse_cycles("many").is_err());
+    }
+
+    #[test]
+    fn validates_hold_duration_bounds() {
+        assert_eq!(parse_hold_seconds("30").expect("valid duration"), 30);
+        assert!(parse_hold_seconds("0").is_err());
+        assert!(parse_hold_seconds("301").is_err());
+        assert!(parse_hold_seconds("long").is_err());
     }
 }

@@ -12,18 +12,18 @@ Implemented in the workspace:
 - Command-line preflight, wireless, USB listing, and AOA diagnostic entry points.
 - Development Debian metadata, narrow udev rules, protocol certainty matrix, hardware evidence template, Linux CI workflow, formatting, strict linting, and portable unit tests.
 
-Validated locally:
+Validated locally and on the Pi 5 reference system:
 
 - `cargo check --workspace --all-targets --locked` passes.
 - strict workspace Clippy passes with warnings denied.
-- 13 portable tests pass through the WASI test runner.
+- 15 native tests pass on the Pi 5, including deterministic unplug injection at every backend-driven AOA state.
 
 Pending Pi 5 reference evidence:
 
-- finish the Pi 5 soak, controlled unplug, USB-radio fallback, and package lifecycle tests;
+- finish the repeated physical cable soak, USB-radio fallback, and older-version package upgrade test;
 - run the documented AOA transition against additional phones when available (first Samsung/Pi 5 transition and reconnect passed);
-- complete physical mid-state unplug injection and the 100-cycle soak (ordinary unplug/reconnect passed);
-- complete USB-radio fallback tests and the full install/upgrade/remove/purge matrix (native `.deb` build/install passed);
+- retain the passing controlled physical unplug test while the bulk interface is actively claimed; faster control-stage unplug paths are covered deterministically with the fake backend;
+- complete USB-radio fallback tests (the native `.deb` build/install/remove/purge/reinstall lifecycle passes);
 - defer Pi 4, CM4/Waveshare, and CM5 physical evidence to the later cross-board validation phase.
 
 Milestone 1 is therefore **Pi 5 reference in progress** and **product in progress**. Pi 4, CM4/Waveshare, and CM5 physical checks are intentionally deferred to the later cross-board validation phase by product-owner decision.

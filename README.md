@@ -104,9 +104,10 @@ After a phone is already in accessory mode, developers can repeat the safe inter
 
 ```bash
 cargo run -p aa-headunit-diagnostics -- usb soak --device BUS:ADDRESS --cycles 100
+cargo run -p aa-headunit-diagnostics -- usb hold --device BUS:ADDRESS --seconds 30
 ```
 
-The AOA command requires an explicit USB bus/address. It does not send vendor control requests indiscriminately to every attached USB device.
+The AOA command requires an explicit USB bus/address. It does not send vendor control requests indiscriminately to every attached USB device. After an AOA transition, `usb hold` keeps the selected accessory interface open for a controlled physical-unplug test.
 
 ## Architecture
 
