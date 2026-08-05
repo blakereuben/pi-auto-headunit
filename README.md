@@ -115,7 +115,7 @@ cargo run -p aa-headunit-diagnostics -- usb hold --device BUS:ADDRESS --seconds 
 
 The AOA command requires an explicit USB bus/address. It does not send vendor control requests indiscriminately to every attached USB device. After an AOA transition, `usb hold` keeps the selected accessory interface open for a controlled physical-unplug test.
 
-The repository retains explicitly guarded TLS bench diagnostics as reproducible evidence of the Android Auto error-7 security rejection. The rejection occurred over both normal USB/AOA and Google's developer-mode ADB tunnel. The generated-identity experiment is complete and must not be repeated or repurposed with credentials from another head-unit implementation. Continued session development uses fake peers while an official provisioning route is investigated.
+The repository retains explicitly guarded TLS bench diagnostics as reproducible evidence of the Android Auto error-7 security rejection. The rejection occurred over both normal USB/AOA and Google's developer-mode ADB tunnel. The generated-identity experiment is complete and must not be repeated or repurposed with credentials from another head-unit implementation. Continued session development uses fake peers while the documented [receiver-provisioning options](docs/protocol/receiver-provisioning-options.md) are evaluated.
 
 `developer tcp-probe` only checks the loopback endpoint `127.0.0.1:5277`. It is intended for a user-enabled Android Auto head-unit server forwarded with ADB, and it neither sends Android Auto messages nor provides authentication. Developer mode did not make a project-generated identity acceptable to the phone.
 
