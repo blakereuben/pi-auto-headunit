@@ -303,6 +303,7 @@ mod tests {
     use openssl::hash::MessageDigest;
     use openssl::nid::Nid;
     use openssl::rsa::Rsa;
+    use openssl::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
     use openssl::x509::{X509, X509NameBuilder};
 
     use super::*;
@@ -337,6 +338,44 @@ mod tests {
         (certificate.build(), key)
     }
 
+    fn accepting_server(
+        server_certificate: &X509,
+        server_key: &PKey<Private>,
+        trusted_client_certificate: &X509,
+    ) -> SslStream<MemoryTransport> {
+        let mut context = SslContextBuilder::new(SslMethod::tls_server()).expect("server context");
+        context
+            .set_certificate(server_certificate)
+            .expect("server certificate");
+        context
+            .set_private_key(server_key)
+            .expect("server private key");
+        context.check_private_key().expect("matching server key");
+        context
+            .cert_store_mut()
+            .add_cert(trusted_client_certificate.clone())
+            .expect("trusted client certificate");
+        context.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+
+        let mut ssl = Ssl::new(&context.build()).expect("server SSL");
+        ssl.set_accept_state();
+        SslStream::new(ssl, MemoryTransport::default()).expect("server stream")
+    }
+
+    fn progress_server(stream: &mut SslStream<MemoryTransport>) -> (bool, Vec<u8>) {
+        let complete = match stream.accept() {
+            Ok(()) => true,
+            Err(error)
+                if error.code() == ErrorCode::WANT_READ
+                    || error.code() == ErrorCode::WANT_WRITE =>
+            {
+                false
+            }
+            Err(error) => panic!("server handshake failed: {error}"),
+        };
+        (complete, stream.get_mut().take_outbound())
+    }
+
     #[test]
     fn starts_a_bounded_client_hello_with_injected_credentials() {
         let (certificate, key) = credentials();
@@ -360,6 +399,46 @@ mod tests {
         assert_ne!(first.private_key_pem, second.private_key_pem);
         OpenSslTlsClient::from_pem(&first.certificate_pem, &first.private_key_pem, 64 * 1024)
             .expect("generated credentials should load");
+    }
+
+    #[test]
+    fn completes_mutual_tls_when_the_client_identity_is_trusted() {
+        let (client_certificate, client_key) = credentials();
+        let (server_certificate, server_key) = credentials();
+        let mut client = OpenSslTlsClient::from_pem(
+            &client_certificate.to_pem().expect("client certificate PEM"),
+            &client_key
+                .private_key_to_pem_pkcs8()
+                .expect("client private key PEM"),
+            64 * 1024,
+        )
+        .expect("client");
+        let mut server = accepting_server(&server_certificate, &server_key, &client_certificate);
+
+        let mut client_progress = client.start().expect("start client");
+        let mut server_complete = false;
+        for _ in 0..16 {
+            if !client_progress.outbound.is_empty() {
+                server.get_mut().feed(&client_progress.outbound);
+            }
+            let (complete, server_outbound) = progress_server(&mut server);
+            server_complete = complete;
+            if !server_outbound.is_empty() && !client_progress.complete {
+                client_progress = client.feed(&server_outbound).expect("progress client");
+            } else {
+                client_progress.outbound.clear();
+            }
+            if client_progress.complete && server_complete {
+                break;
+            }
+        }
+
+        assert!(
+            client_progress.complete,
+            "client handshake did not complete"
+        );
+        assert!(server_complete, "server handshake did not complete");
+        assert!(server.ssl().peer_certificate().is_some());
     }
 
     #[test]

@@ -64,6 +64,8 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Reach and name `VersionAccepted` as the first repeatable live Android Auto session state on the Pi 5; authentication remains blocked.
 - [x] Run the opt-in generated-credential probe and record its first sanitized Pi 5 result: version 1.6 accepted, TLS timed out cleanly.
 - [x] Record the phone's Android Auto error 7 security rejection over both USB/AOA and the official developer tunnel; stop all generated/shared-identity experiments.
+- [x] Prove the OpenSSL adapter presents its configured client certificate and completes mutual TLS when a synthetic verifier trusts that identity.
+- [ ] Obtain a legitimate Android Auto receiver provisioning route before resuming live phone interoperability work.
 - [ ] Prove clean timeout, malformed-message, unplug, and reconnect recovery.
 
 ## M3 — Pi 5 display, media, audio, microphone, and touch

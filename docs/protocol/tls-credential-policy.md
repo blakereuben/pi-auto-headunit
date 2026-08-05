@@ -14,6 +14,8 @@ The certificate subject names JVC Kenwood and its issuer names Google Automotive
 
 `security-openssl` accepts certificate and private-key PEM bytes at runtime, checks that they match, and drives OpenSSL through bounded in-memory transport. Tests generate temporary credentials at runtime. The repository contains no compatibility credential. Bounded phone probes reached TLS over both USB/AOA and the official developer tunnel, with the negative results below.
 
+A deterministic mutual-TLS test now uses separate, synthetic client and server identities. The server requires and verifies the generated client certificate, and both sides complete the handshake. This confirms that the adapter presents its configured certificate and correctly completes the memory-buffer handshake when the peer trusts that identity. It does not provide or emulate Android Auto trust and does not weaken the live-probe lockout.
+
 The diagnostic now contains an explicit `usb tls-probe` path that generates a fresh keypair in memory for each invocation. It cannot run without `--allow-live-aap`, rejects an already-accessory-mode phone, and stops before authentication completion and service discovery. Passing native tests does not count as a live interoperability result.
 
 ## Product integration rule
@@ -43,5 +45,15 @@ The repository will not repeat the generated-identity experiment and will not te
 The user enabled Android Auto developer mode and started the documented head-unit server on a Samsung Galaxy S23 Ultra. The Pi used ADB forwarding on loopback TCP port 5277. The project sent the same bounded version/TLS probe with fresh credentials: Android Auto accepted protocol version 1.6, returned TLS peer data, closed the connection, and displayed error 7 on the phone. No authentication-complete message, service discovery, channel setup, media, identifiers, or user content was sent or logged.
 
 This proves the developer transport works through the first protocol/TLS exchange, but it also proves that developer mode is not an identity bypass for this client. The temporary ADB forward was removed after the result, and the restarted phone server was not probed again.
+
+## Connection feasibility decision
+
+The evidence separates protocol transport from receiver authorisation:
+
+- USB/AOA and the documented developer tunnel both reach AAP 1.6 and receive peer TLS data.
+- The synthetic verifier test proves that the TLS adapter can present a client identity and complete mutual TLS when that identity is trusted.
+- Android Auto rejects the independently generated identity on both live transports before TLS completion.
+
+No remaining pre-service protocol or OpenSSL state-machine difference has been identified in the approved AASDK paths. The release connection gate therefore requires legitimate receiver provisioning accepted by Android Auto. Until an official route supplies that authorisation, wired and wireless Android Auto interoperability remain blocked; service, media, and UI work cannot turn an unrecognised identity into an accepted receiver.
 
 Both live generated-identity CLI paths now fail before opening USB or TCP transport, even when their former explicit opt-in flag is supplied. Automated coverage enforces this permanent lockout.
