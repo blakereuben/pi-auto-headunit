@@ -25,6 +25,14 @@ Consequently, ordinary Android app developer registration is not evidence that a
 
 Marketing statements are not proof that a licence, credential, or certification transfers to this project. Only written supplier terms and successful evaluation on the target hardware can close the gate.
 
+## Open-source receiver assessment
+
+LIVI revision `b7435e8db1fcc9b5280c45fb71d020d943577ef7` is a GPL-3.0-or-later Linux head unit that explicitly claims wired and wireless Android Auto plus Raspberry Pi 4, Pi 5, CM4, and CM5 support. It is therefore potentially valuable prior art for non-credential protocol, wireless, media, platform, and appliance behaviour.
+
+It is not a provisioning solution. Its Android Auto crypto source explicitly embeds the canonical OpenAuto head-unit certificate and matching private key and states that phones accept that shared identity. Those values were not displayed, copied, or retained during this assessment. The entire credential-bearing file and the identity it presents remain prohibited by this project's credential policy.
+
+No LIVI code or behaviour is approved for adoption yet. A later owner decision may approve specific, file-attributed GPLv3 behaviour from the pinned revision while permanently excluding credentials, private keys, authentication material, shared identities, security bypasses, trademarks, and bundled assets. Even after such approval, LIVI cannot close the live connection gate without a separate legitimate project identity.
+
 ## Required inquiry
 
 The first inquiry should describe the project honestly as a free, AI-created and owner-orchestrated GPLv3 hobby project targeting Raspberry Pi CM4, CM5, Pi 4, and Pi 5. It should ask:
@@ -63,4 +71,4 @@ If no candidate meets these criteria, Android Auto remains blocked. The project 
 - ART, Software Development Kit: <https://www.artgroup-spa.com/product/software-development-kit-sdk/>
 - ECORE KOREA: <https://ecore-korea.com/>
 - NXP, Android Auto Projection: <https://www.nxp.com/design/software/embedded-software/android-auto-projection%3AANDROID-AUTO-PROJECTION>
-
+- LIVI pinned assessment source: <https://github.com/f-io/LIVI/tree/b7435e8db1fcc9b5280c45fb71d020d943577ef7>
