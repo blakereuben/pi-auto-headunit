@@ -42,6 +42,7 @@ pub enum CredentialError {
     InvalidFile(String),
     InvalidCredentials(String),
     InsecurePrivateKeyPermissions(u32),
+    Missing(PathBuf),
     AlreadyInstalled(PathBuf),
 }
 
@@ -55,6 +56,11 @@ impl fmt::Display for CredentialError {
             Self::InsecurePrivateKeyPermissions(mode) => write!(
                 formatter,
                 "private key permissions {mode:04o} allow group or other access; require 0600"
+            ),
+            Self::Missing(path) => write!(
+                formatter,
+                "credentials are not configured: missing {}",
+                path.display()
             ),
             Self::AlreadyInstalled(path) => write!(
                 formatter,
@@ -151,7 +157,13 @@ pub fn install_credentials(
 }
 
 fn read_regular_bounded_file(path: &Path, label: &str) -> Result<Vec<u8>, CredentialError> {
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(CredentialError::Missing(path.to_path_buf()));
+        }
+        Err(error) => return Err(CredentialError::Io(error)),
+    };
     if !metadata.file_type().is_file() {
         return Err(CredentialError::InvalidFile(format!(
             "{label} must be a regular file"
@@ -268,6 +280,17 @@ mod tests {
             validate_credentials(&paths, true),
             Err(CredentialError::InsecurePrivateKeyPermissions(0o640))
         ));
+    }
+
+    #[test]
+    fn reports_missing_credentials_as_not_configured() {
+        let directory = tempdir().expect("temporary directory");
+        let paths = CredentialPaths {
+            certificate: directory.path().join("missing.crt"),
+            private_key: directory.path().join("missing.key"),
+        };
+        let error = validate_credentials(&paths, true).expect_err("credentials must be absent");
+        assert!(error.to_string().contains("not configured"));
     }
 
     #[test]
