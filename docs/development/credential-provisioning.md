@@ -52,7 +52,7 @@ sudo aa-headunit-diagnostics usb credential-probe \
   --allow-live-aap
 ```
 
-The command uses project-owned AOA identification strings, logs only named protocol states, and stops at TLS completion before authentication completion or service discovery. It never prints certificate or private-key contents. The existing generated-identity probe remains permanently disabled.
+The command uses Android Auto compatibility identification with this project's own URI and development serial, logs only named protocol states, and stops at TLS completion before authentication completion or service discovery. It never prints certificate or private-key contents. The existing generated-identity probe remains permanently disabled.
 
 ## Safety boundary
 

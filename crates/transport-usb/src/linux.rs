@@ -328,7 +328,7 @@ fn map_usb_error(error: rusb::Error) -> AoaError {
             "check the aa-headunit udev rule and reconnect the phone".into(),
         ),
         rusb::Error::NoDevice => AoaError::Unplugged,
-        rusb::Error::Timeout => AoaError::Usb("control transfer timed out".into()),
+        rusb::Error::Timeout => AoaError::Usb("USB transfer timed out".into()),
         other => AoaError::Usb(other.to_string()),
     }
 }

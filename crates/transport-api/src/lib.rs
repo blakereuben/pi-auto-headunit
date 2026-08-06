@@ -85,14 +85,14 @@ impl AoaIdentification {
         }
     }
 
-    /// Project-owned AOA strings for an explicitly authorised receiver probe.
+    /// Android Auto compatibility strings with project-specific provenance.
     #[must_use]
     pub fn receiver_probe() -> Self {
         Self {
-            manufacturer: "Pi Auto Head Unit Project".into(),
-            model: "Pi Auto Head Unit".into(),
-            description: "Independent projection receiver".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            manufacturer: "Android".into(),
+            model: "Android Auto".into(),
+            description: "Android Auto".into(),
+            version: "2.0.1".into(),
             uri: "https://github.com/blakereuben/pi-auto-headunit".into(),
             serial: "pi-auto-headunit-development".into(),
         }
@@ -428,10 +428,11 @@ mod tests {
     }
 
     #[test]
-    fn receiver_probe_uses_project_owned_identification() {
+    fn receiver_probe_keeps_project_specific_provenance() {
         let identity = AoaIdentification::receiver_probe();
         identity.validate().expect("valid AOA identification");
-        assert_eq!(identity.manufacturer, "Pi Auto Head Unit Project");
+        assert_eq!(identity.model, "Android Auto");
         assert!(identity.uri.contains("blakereuben/pi-auto-headunit"));
+        assert_eq!(identity.serial, "pi-auto-headunit-development");
     }
 }
