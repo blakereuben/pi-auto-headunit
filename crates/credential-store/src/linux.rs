@@ -35,6 +35,40 @@ pub struct CredentialStatus {
     pub private_key_mode: u32,
 }
 
+/// Validated credential bytes loaded from protected local files.
+///
+/// This type deliberately does not implement `Debug` or `Clone`, and its
+/// buffers are cleared when dropped so callers cannot accidentally include
+/// credential contents in structured diagnostics.
+pub struct CredentialMaterial {
+    certificate_pem: Vec<u8>,
+    private_key_pem: Vec<u8>,
+}
+
+impl CredentialMaterial {
+    #[must_use]
+    pub fn certificate_pem(&self) -> &[u8] {
+        &self.certificate_pem
+    }
+
+    #[must_use]
+    pub fn private_key_pem(&self) -> &[u8] {
+        &self.private_key_pem
+    }
+}
+
+impl Drop for CredentialMaterial {
+    fn drop(&mut self) {
+        self.certificate_pem.fill(0);
+        self.private_key_pem.fill(0);
+    }
+}
+
+pub struct LoadedCredentials {
+    pub material: CredentialMaterial,
+    pub status: CredentialStatus,
+}
+
 #[derive(Debug)]
 pub enum CredentialError {
     Io(io::Error),
@@ -101,6 +135,13 @@ pub fn validate_credentials(
     paths: &CredentialPaths,
     require_secure_permissions: bool,
 ) -> Result<CredentialStatus, CredentialError> {
+    Ok(load_credentials(paths, require_secure_permissions)?.status)
+}
+
+pub fn load_credentials(
+    paths: &CredentialPaths,
+    require_secure_permissions: bool,
+) -> Result<LoadedCredentials, CredentialError> {
     let certificate = read_regular_bounded_file(&paths.certificate, "certificate")?;
     let private_key = read_regular_bounded_file(&paths.private_key, "private key")?;
     let mode = fs::metadata(&paths.private_key)?.permissions().mode() & 0o777;
@@ -109,10 +150,15 @@ pub fn validate_credentials(
     }
     let summary = validate_credential_pair(&certificate, &private_key)
         .map_err(|error| CredentialError::InvalidCredentials(error.to_string()))?;
-    drop(private_key);
-    Ok(CredentialStatus {
-        summary,
-        private_key_mode: mode,
+    Ok(LoadedCredentials {
+        material: CredentialMaterial {
+            certificate_pem: certificate,
+            private_key_pem: private_key,
+        },
+        status: CredentialStatus {
+            summary,
+            private_key_mode: mode,
+        },
     })
 }
 
@@ -268,6 +314,16 @@ mod tests {
         let paths = write_source(directory.path());
         let status = validate_credentials(&paths, true).expect("valid credentials");
         assert_eq!(status.private_key_mode, 0o600);
+    }
+
+    #[test]
+    fn loads_validated_material_for_runtime_use() {
+        let directory = tempdir().expect("temporary directory");
+        let paths = write_source(directory.path());
+        let loaded = load_credentials(&paths, true).expect("valid credentials");
+        assert!(loaded.material.certificate_pem().starts_with(b"-----BEGIN"));
+        assert!(loaded.material.private_key_pem().starts_with(b"-----BEGIN"));
+        assert_eq!(loaded.status.private_key_mode, 0o600);
     }
 
     #[test]

@@ -42,6 +42,18 @@ sudo aa-headunit-diagnostics credentials status
 
 The default paths are declared in `/etc/aa-headunit/config.toml`. The `.deb` creates the empty credential directory with mode `0700`; it never installs credential contents.
 
+## Bounded interoperability probe
+
+After an authorised pair is installed, the diagnostics application can load it at runtime for an explicitly selected, bounded USB interoperability probe:
+
+```text
+sudo aa-headunit-diagnostics usb credential-probe \
+  --device BUS:ADDRESS \
+  --allow-live-aap
+```
+
+The command uses project-owned AOA identification strings, logs only named protocol states, and stops at TLS completion before authentication completion or service discovery. It never prints certificate or private-key contents. The existing generated-identity probe remains permanently disabled.
+
 ## Safety boundary
 
 These commands validate structure, dates, matching public/private material, and local file permissions only. They do not prove ownership, permission to present an identity, certification, or acceptance by a phone. Production use remains limited to credentials legitimately issued or authorised for the user and receiver.

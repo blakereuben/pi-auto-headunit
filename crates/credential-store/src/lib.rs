@@ -8,6 +8,6 @@ mod linux;
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    CredentialConfig, CredentialError, CredentialPaths, CredentialStatus, install_credentials,
-    load_config, validate_credentials,
+    CredentialConfig, CredentialError, CredentialMaterial, CredentialPaths, CredentialStatus,
+    LoadedCredentials, install_credentials, load_config, load_credentials, validate_credentials,
 };

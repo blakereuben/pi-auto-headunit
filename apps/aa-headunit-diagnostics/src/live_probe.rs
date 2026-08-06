@@ -1,9 +1,10 @@
+use credential_store::CredentialMaterial;
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, ControlMessage, Encryption, FrameError, FrameHeader, FrameType,
     HandshakeAction, HandshakeEvent, HandshakeStateMachine, MessageAssembler, MessageType,
     ProtocolLimits, TlsClient, decode_frame, encode_frame,
 };
-use security_openssl::{OpenSslTlsClient, TlsVersionPolicy, generate_ephemeral_credentials};
+use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use transport_api::{SessionTransport, TransportError};
@@ -16,9 +17,10 @@ const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
 pub fn run<T: SessionTransport>(
     transport: &mut T,
     tls12_compatibility: bool,
+    credentials: CredentialMaterial,
 ) -> Result<(), CliError> {
     println!("probe_scope=version_and_tls_only");
-    println!("probe_credentials=temporary_project_generated");
+    println!("probe_credentials=user_supplied_runtime");
     println!(
         "probe_tls_policy={}",
         if tls12_compatibility {
@@ -29,11 +31,9 @@ pub fn run<T: SessionTransport>(
     );
     println!("probe_payload_logging=disabled");
 
-    let credentials =
-        generate_ephemeral_credentials().map_err(|error| CliError::Protocol(error.to_string()))?;
     let mut tls = OpenSslTlsClient::from_pem_with_policy(
-        &credentials.certificate_pem,
-        &credentials.private_key_pem,
+        credentials.certificate_pem(),
+        credentials.private_key_pem(),
         64 * 1024,
         if tls12_compatibility {
             TlsVersionPolicy::Tls12Only

@@ -43,6 +43,21 @@ fn run(args: &[String]) -> Result<(), CliError> {
         {
             developer_tls_probe(true)
         }
+        [group, command, allow]
+            if group == "developer"
+                && command == "credential-probe"
+                && allow == "--allow-live-aap" =>
+        {
+            developer_credential_probe(false)
+        }
+        [group, command, allow, compatibility]
+            if group == "developer"
+                && command == "credential-probe"
+                && allow == "--allow-live-aap"
+                && compatibility == "--tls12-compat" =>
+        {
+            developer_credential_probe(true)
+        }
         [group, command, flag, selector]
             if group == "usb" && command == "aoa" && flag == "--device" =>
         {
@@ -81,6 +96,23 @@ fn run(args: &[String]) -> Result<(), CliError> {
         {
             usb_tls_probe(selector, true)
         }
+        [group, command, device_flag, selector, allow]
+            if group == "usb"
+                && command == "credential-probe"
+                && device_flag == "--device"
+                && allow == "--allow-live-aap" =>
+        {
+            usb_credential_probe(selector, false)
+        }
+        [group, command, device_flag, selector, allow, compatibility]
+            if group == "usb"
+                && command == "credential-probe"
+                && device_flag == "--device"
+                && allow == "--allow-live-aap"
+                && compatibility == "--tls12-compat" =>
+        {
+            usb_credential_probe(selector, true)
+        }
         [] | [..] if args.iter().any(|arg| arg == "--help" || arg == "-h") => {
             print_help();
             Ok(())
@@ -105,12 +137,14 @@ fn print_help() {
            credentials status [--config PATH]\n\
            developer tcp-probe\n\
            developer tls-probe --allow-live-aap [--tls12-compat]\n\
+           developer credential-probe --allow-live-aap [--tls12-compat]\n\
            usb list\n\
            usb aoa --device BUS:ADDRESS\n\
            usb soak --device BUS:ADDRESS --cycles COUNT\n\
            usb hold --device BUS:ADDRESS --seconds COUNT\n\
            usb tls-probe --device BUS:ADDRESS --allow-live-aap\n\
            usb tls-probe --device BUS:ADDRESS --allow-live-aap --tls12-compat\n\
+           usb credential-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
          \n\
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
         env!("CARGO_PKG_VERSION")
@@ -147,9 +181,22 @@ fn developer_tcp_probe() -> Result<(), CliError> {
 
 #[cfg(target_os = "linux")]
 fn developer_tls_probe(tls12_compatibility: bool) -> Result<(), CliError> {
+    let _ = tls12_compatibility;
+    reject_completed_generated_identity_probe()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn developer_credential_probe(tls12_compatibility: bool) -> Result<(), CliError> {
+    use std::path::Path;
     use std::time::Duration;
 
-    reject_completed_generated_identity_probe()?;
+    let paths = credential_store::CredentialPaths::from(
+        credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
+            .map_err(|error| CliError::Credentials(error.to_string()))?,
+    );
+    let credentials = credential_store::load_credentials(&paths, true)
+        .map_err(|error| CliError::Credentials(error.to_string()))?;
     let mut transport = transport_tcp::DeveloperTcpTransport::connect(
         transport_tcp::DEFAULT_DEVELOPER_ADDRESS,
         Duration::from_secs(2),
@@ -158,11 +205,16 @@ fn developer_tls_probe(tls12_compatibility: bool) -> Result<(), CliError> {
     .map_err(CliError::Transport)?;
     println!("developer_transport=tcp");
     println!("developer_endpoint={}", transport.peer());
-    live_probe::run(&mut transport, tls12_compatibility)
+    live_probe::run(&mut transport, tls12_compatibility, credentials.material)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn developer_tls_probe(_: bool) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn developer_credential_probe(_: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
@@ -710,6 +762,49 @@ fn usb_tls_probe(_: &str, _: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
+#[cfg(target_os = "linux")]
+fn usb_credential_probe(selector: &str, tls12_compatibility: bool) -> Result<(), CliError> {
+    use std::path::Path;
+    use std::time::Duration;
+    use transport_api::{AoaIdentification, AoaMachine};
+
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let paths = credential_store::CredentialPaths::from(
+        credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
+            .map_err(|error| CliError::Credentials(error.to_string()))?,
+    );
+    let credentials = credential_store::load_credentials(&paths, true)
+        .map_err(|error| CliError::Credentials(error.to_string()))?;
+
+    let (bus, address) = transport_usb::parse_bus_address(selector).map_err(CliError::Aoa)?;
+    let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
+    let candidate = backend
+        .list_devices()
+        .map_err(CliError::Aoa)?
+        .into_iter()
+        .find(|device| device.bus == bus && device.address == address)
+        .ok_or(CliError::Aoa(transport_api::AoaError::Unplugged))?;
+
+    println!("probe_authorization=operator_confirmed");
+    println!("probe_payload_logging=disabled");
+    println!("probe_state=preparing_accessory_transport");
+    let mut aoa = AoaMachine::new(backend, PROBE_TIMEOUT);
+    let outcome = aoa
+        .run(candidate, &AoaIdentification::receiver_probe())
+        .map_err(CliError::Aoa)?;
+    let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
+    let mut transport = backend
+        .open_claimed_session_transport(&outcome.transport.device)
+        .map_err(CliError::Aoa)?;
+    live_probe::run(&mut transport, tls12_compatibility, credentials.material)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn usb_credential_probe(_: &str, _: bool) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
+}
+
 fn reject_completed_generated_identity_probe() -> Result<(), CliError> {
     Err(CliError::Usage(
         "generated-identity phone probes are permanently disabled after the recorded Android Auto error-7 rejection"
@@ -839,6 +934,17 @@ mod tests {
         let args = vec![
             "usb".into(),
             "tls-probe".into(),
+            "--device".into(),
+            "1:2".into(),
+        ];
+        assert!(matches!(run(&args), Err(CliError::Usage(_))));
+    }
+
+    #[test]
+    fn credential_probe_requires_explicit_opt_in() {
+        let args = vec![
+            "usb".into(),
+            "credential-probe".into(),
             "--device".into(),
             "1:2".into(),
         ];
