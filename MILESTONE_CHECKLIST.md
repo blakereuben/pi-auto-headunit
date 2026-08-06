@@ -50,7 +50,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Add offline validation and non-overwriting installation for authorised user-supplied credential files.
 - [x] Build and install the credential-aware ARM64 `.deb` on Pi 5; verify empty-package, missing, mismatched, valid synthetic, configured status, and non-overwrite states.
 - [x] Add an explicit live TLS bench probe using fresh in-memory credentials and a hard stop before authentication/service discovery.
-- [x] Pass native formatting, strict linting, and all 66 workspace tests after adding the privacy-preserving service-discovery request parser and bounded service catalogue.
+- [x] Pass native formatting, strict linting, and all 78 workspace tests after adding runtime credential loading and the bounded authorised-identity probe.
 - [ ] Identify an approved source for every required session/protocol behaviour.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
 - [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.
@@ -68,7 +68,8 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Record the phone's Android Auto error 7 security rejection over both USB/AOA and the official developer tunnel; stop all generated/shared-identity experiments.
 - [x] Prove the OpenSSL adapter presents its configured client certificate and completes mutual TLS when a synthetic verifier trusts that identity.
 - [x] Research and document legitimate receiver-provisioning suppliers and their unresolved Raspberry Pi, licence, cost, and certification gates.
-- [ ] Obtain a legitimate Android Auto receiver provisioning route before resuming live phone interoperability work.
+- [x] Record operator confirmation of an authorised external receiver identity while keeping all credential material and confidential provisioning details outside the repository.
+- [x] Load the protected external identity at runtime and complete version negotiation plus TLS with a real phone; stop before authentication completion and service discovery.
 - [ ] Prove clean timeout, malformed-message, unplug, and reconnect recovery.
 
 ## M3 — Pi 5 display, media, audio, microphone, and touch
