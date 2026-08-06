@@ -48,6 +48,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Implement the bounded version/TLS/authentication/service-discovery control state sequence against fake TLS data.
 - [x] Add a replaceable, bounded OpenSSL TLS client with injected credentials and no embedded shared key.
 - [x] Add offline validation and non-overwriting installation for authorised user-supplied credential files.
+- [x] Build and install the credential-aware ARM64 `.deb` on Pi 5; verify empty-package, missing, mismatched, valid synthetic, configured status, and non-overwrite states.
 - [x] Add an explicit live TLS bench probe using fresh in-memory credentials and a hard stop before authentication/service discovery.
 - [x] Pass native formatting, strict linting, and all 66 workspace tests after adding the privacy-preserving service-discovery request parser and bounded service catalogue.
 - [ ] Identify an approved source for every required session/protocol behaviour.
