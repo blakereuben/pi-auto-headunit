@@ -119,6 +119,7 @@ pi-auto-headunit/
 - Hardware documentation will include `carrier-profiles.md`, the exact Waveshare reference, custom-carrier requirements, and the CM4/CM5 pin/peripheral compatibility matrix.
 - `session` knows protocol states, but not concrete USB or media implementations.
 - `security-openssl` implements the replaceable TLS boundary and receives credentials from configuration/packaging; it does not define protocol states or embed compatibility credentials.
+- `credential-store` validates and installs authorised user-supplied files without exposing their contents to protocol code or packaging.
 - `media-gstreamer`, `ui-gtk`, `platform-linux`, and `platform-rpi` are replaceable adapters.
 - `app` is composition and lifecycle logic, not a dumping ground for protocol or hardware code.
 - `apps` contains thin executable entry points only.

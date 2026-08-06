@@ -168,6 +168,7 @@ See the [product requirements](PRD.md) and [risk register](RISK_REGISTER.md) for
 - [`crates/media-gstreamer`](crates/media-gstreamer) — Linux GStreamer capability adapter
 - [`crates/protocol-aap`](crates/protocol-aap) — bounded GPL-derived framing, discovery parsing, and wire-neutral service catalogue
 - [`crates/security-openssl`](crates/security-openssl) — Linux OpenSSL adapter with injected credentials
+- [`crates/credential-store`](crates/credential-store) — bounded local validation and installation of user-supplied credentials
 - [`packaging/debian`](packaging/debian) — development Debian package metadata
 - [`docs`](docs) — design decisions, protocol evidence, and hardware reports
 

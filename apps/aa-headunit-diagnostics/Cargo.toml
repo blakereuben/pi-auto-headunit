@@ -16,6 +16,7 @@ transport-tcp = { path = "../../crates/transport-tcp" }
 transport-usb = { path = "../../crates/transport-usb" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+credential-store = { path = "../../crates/credential-store" }
 protocol-aap = { path = "../../crates/protocol-aap" }
 security-openssl = { path = "../../crates/security-openssl" }
 

@@ -6,6 +6,9 @@ use std::env;
 #[cfg(target_os = "linux")]
 mod live_probe;
 
+#[cfg(target_os = "linux")]
+mod credentials;
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match run(&args) {
@@ -24,6 +27,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         [command] if command == "wireless" => wireless(&[]),
         [command, rest @ ..] if command == "wireless" => wireless(rest),
         [group, command] if group == "media" && command == "probe" => media_probe(),
+        [group, command, rest @ ..] if group == "credentials" => credentials_command(command, rest),
         [group, command] if group == "usb" && command == "list" => usb_list(),
         [group, command] if group == "developer" && command == "tcp-probe" => developer_tcp_probe(),
         [group, command, allow]
@@ -96,6 +100,9 @@ fn print_help() {
            preflight\n\
            wireless [--wifi auto|onboard|STABLE_ID] [--bluetooth auto|onboard|STABLE_ID]\n\
            media probe\n\
+           credentials check --certificate PATH --private-key PATH\n\
+           credentials install --certificate PATH --private-key PATH\n\
+           credentials status [--config PATH]\n\
            developer tcp-probe\n\
            developer tls-probe --allow-live-aap [--tls12-compat]\n\
            usb list\n\
@@ -108,6 +115,16 @@ fn print_help() {
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(target_os = "linux")]
+fn credentials_command(command: &str, args: &[String]) -> Result<(), CliError> {
+    credentials::run(command, args).map_err(|error| CliError::Credentials(error.to_string()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn credentials_command(_: &str, _: &[String]) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
 }
 
 fn developer_tcp_probe() -> Result<(), CliError> {
@@ -730,6 +747,8 @@ enum CliError {
     Media(String),
     Aoa(transport_api::AoaError),
     Protocol(String),
+    #[cfg(target_os = "linux")]
+    Credentials(String),
     Transport(transport_api::TransportError),
 }
 
@@ -747,6 +766,8 @@ impl CliError {
             Self::Aoa(transport_api::AoaError::Unplugged) => 16,
             Self::Aoa(_) => 17,
             Self::Protocol(_) => 19,
+            #[cfg(target_os = "linux")]
+            Self::Credentials(_) => 21,
             Self::Transport(_) => 20,
         }
     }
@@ -765,6 +786,8 @@ impl std::fmt::Display for CliError {
             Self::Media(error) => write!(f, "media: {error}"),
             Self::Aoa(error) => error.fmt(f),
             Self::Protocol(error) => write!(f, "protocol probe: {error}"),
+            #[cfg(target_os = "linux")]
+            Self::Credentials(error) => write!(f, "credentials: {error}"),
             Self::Transport(error) => error.fmt(f),
         }
     }

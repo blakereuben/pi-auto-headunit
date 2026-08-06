@@ -3,3 +3,8 @@
 wifi_provider = "auto"
 bluetooth_provider = "auto"
 
+# User-supplied receiver credentials are provisioned after package installation.
+# The package and repository never contain credential material.
+[credentials]
+certificate_path = "/etc/aa-headunit/credentials/headunit.crt"
+private_key_path = "/etc/aa-headunit/credentials/headunit.key"

@@ -111,6 +111,68 @@ pub struct EphemeralCredentials {
     pub private_key_pem: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialSummary {
+    pub not_before: String,
+    pub not_after: String,
+}
+
+pub fn validate_credential_pair(
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<CredentialSummary, OpenSslTlsError> {
+    use openssl::asn1::Asn1Time;
+    use std::cmp::Ordering;
+
+    let (certificate, private_key) = parse_credential_pair(certificate_pem, private_key_pem)?;
+    let now =
+        Asn1Time::days_from_now(0).map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+    if certificate
+        .not_before()
+        .compare(&now)
+        .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?
+        == Ordering::Greater
+    {
+        return Err(OpenSslTlsError::Credentials(
+            "certificate is not valid yet".into(),
+        ));
+    }
+    if certificate
+        .not_after()
+        .compare(&now)
+        .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?
+        == Ordering::Less
+    {
+        return Err(OpenSslTlsError::Credentials(
+            "certificate has expired".into(),
+        ));
+    }
+    drop(private_key);
+    Ok(CredentialSummary {
+        not_before: certificate.not_before().to_string(),
+        not_after: certificate.not_after().to_string(),
+    })
+}
+
+fn parse_credential_pair(
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<(X509, PKey<Private>), OpenSslTlsError> {
+    let certificate = X509::from_pem(certificate_pem)
+        .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
+    let private_key = PKey::<Private>::private_key_from_pem(private_key_pem)
+        .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
+    let public_key = certificate
+        .public_key()
+        .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
+    if !private_key.public_eq(&public_key) {
+        return Err(OpenSslTlsError::Credentials(
+            "certificate and private key do not match".into(),
+        ));
+    }
+    Ok((certificate, private_key))
+}
+
 pub fn generate_ephemeral_credentials() -> Result<EphemeralCredentials, OpenSslTlsError> {
     use openssl::asn1::Asn1Time;
     use openssl::bn::{BigNum, MsbOption};
@@ -193,10 +255,7 @@ impl OpenSslTlsClient {
             return Err(OpenSslTlsError::InvalidLimit);
         }
 
-        let certificate = X509::from_pem(certificate_pem)
-            .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
-        let private_key = PKey::<Private>::private_key_from_pem(private_key_pem)
-            .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
+        let (certificate, private_key) = parse_credential_pair(certificate_pem, private_key_pem)?;
         let mut context = SslContextBuilder::new(SslMethod::tls_client())
             .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
         context

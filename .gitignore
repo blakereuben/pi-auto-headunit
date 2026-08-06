@@ -1,6 +1,8 @@
 /target/
 /.rustup-toolchain/
 /.ssh-dev/
+/secrets/*
+!/secrets/README.md
 *.deb
 *.build
 *.buildinfo

@@ -14,6 +14,6 @@ mod linux;
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    EphemeralCredentials, OpenSslTlsClient, OpenSslTlsError, TlsVersionPolicy,
-    generate_ephemeral_credentials,
+    CredentialSummary, EphemeralCredentials, OpenSslTlsClient, OpenSslTlsError, TlsVersionPolicy,
+    generate_ephemeral_credentials, validate_credential_pair,
 };
