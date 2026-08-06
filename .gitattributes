@@ -1,0 +1,2 @@
+# Raspberry Pi OS, Debian, shell, Rust, and configuration files require LF.
+* text=auto eol=lf
