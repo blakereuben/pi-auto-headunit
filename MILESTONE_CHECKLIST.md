@@ -61,6 +61,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Add the first deterministic fake-phone handshake test without sending new session messages to a real phone.
 - [x] Parse the first service-discovery request into a bounded summary without retaining phone names, labels, icons, nested phone details, or raw payloads.
 - [x] Model the service catalogue with bounded candidates, hardware-readiness filtering, unique roles, and non-conflicting channel identifiers.
+- [x] Prove the frame codec, message assembler, and handshake state machine reach `ServiceDiscoveryReceived` with only a bounded summary and no response, driven over a real `SessionTransport` against a scripted fake phone, without changing the frozen `credential-probe`.
 - [ ] Map the newer AASDK `Service` response schema field by field; do not reuse OpenAuto's older `ChannelDescriptor` wire shape.
 - [ ] Add parser fuzz/property tests for untrusted phone input.
 - [x] Reach and name `VersionAccepted` as the first repeatable live Android Auto session state on the Pi 5; authentication remains blocked.
@@ -70,6 +71,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Research and document legitimate receiver-provisioning suppliers and their unresolved Raspberry Pi, licence, cost, and certification gates.
 - [x] Record operator confirmation of an authorised external receiver identity while keeping all credential material and confidential provisioning details outside the repository.
 - [x] Load the protected external identity at runtime and complete version negotiation plus TLS with a real phone; stop before authentication completion and service discovery.
+- [ ] Add the gated `auth-discovery-probe` CLI subcommand (`developer auth-discovery-probe` / `usb auth-discovery-probe`, behind `--allow-live-aap`), reusing the frozen `credential-probe` TLS path to reach a bounded, byte-count-only service-discovery summary and stop before any response or media setup; implemented and Pi-verified on synthetic/unit-level checks, not yet run against a real phone.
 - [ ] Prove clean timeout, malformed-message, unplug, and reconnect recovery.
 
 ## M3 — Pi 5 display, media, audio, microphone, and touch
