@@ -29,6 +29,13 @@ pub trait SessionTransport {
     fn send_all(&mut self, bytes: &[u8]) -> Result<(), TransportError>;
 }
 
+/// Bounded in-memory transport pair for deterministic scripted-peer tests.
+///
+/// Gated behind the `test-support` feature so it is only ever reachable from
+/// test targets, never a release binary.
+#[cfg(feature = "test-support")]
+pub mod fake;
+
 /// Stable-enough identity for one USB enumeration lifetime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UsbDeviceId {

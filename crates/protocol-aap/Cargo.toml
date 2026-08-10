@@ -6,5 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dev-dependencies]
+# Bounded in-memory fake SessionTransport, for deterministic scripted-peer
+# tests only (see crates/transport-api/src/fake.rs). Never a runtime
+# dependency of this crate.
+transport-api = { path = "../transport-api", features = ["test-support"] }
+
 [lints]
 workspace = true

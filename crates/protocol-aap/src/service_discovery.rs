@@ -39,8 +39,8 @@ pub struct ServiceDiscoveryRequestSummary {
     pub small_icon_bytes: Option<usize>,
     pub medium_icon_bytes: Option<usize>,
     pub large_icon_bytes: Option<usize>,
-    pub label_text_bytes: Option<usize>,
     pub device_name_bytes: Option<usize>,
+    pub device_brand_bytes: Option<usize>,
     pub phone_info_bytes: Option<usize>,
     pub unknown_fields: usize,
 }
@@ -164,8 +164,12 @@ pub fn summarize_service_discovery_request(
                 1 => summary.small_icon_bytes = Some(value.len()),
                 2 => summary.medium_icon_bytes = Some(value.len()),
                 3 => summary.large_icon_bytes = Some(value.len()),
-                4 => summary.label_text_bytes = Some(value.len()),
-                5 => summary.device_name_bytes = Some(value.len()),
+                // Field 4 is device_name and field 5 is device_brand per the
+                // aap_protobuf ServiceDiscoveryRequest schema (cross-checked
+                // against f-io/LIVI commit b7435e8, GPL-3.0-or-later, for
+                // field-layout confirmation only; no code adopted).
+                4 => summary.device_name_bytes = Some(value.len()),
+                5 => summary.device_brand_bytes = Some(value.len()),
                 6 => summary.phone_info_bytes = Some(value.len()),
                 _ => unreachable!(),
             }
@@ -269,8 +273,8 @@ mod tests {
                 .expect("summarize");
 
         assert_eq!(summary.small_icon_bytes, Some(2));
-        assert_eq!(summary.label_text_bytes, Some(12));
         assert_eq!(summary.device_name_bytes, Some(12));
+        assert_eq!(summary.device_brand_bytes, Some(12));
         assert_eq!(summary.phone_info_bytes, Some(2));
         let debug = format!("{summary:?}");
         assert!(!debug.contains("secret-label"));

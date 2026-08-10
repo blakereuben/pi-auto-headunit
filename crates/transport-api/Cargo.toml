@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Bounded in-memory fake SessionTransport for deterministic scripted-peer
+# tests. Never enabled by a non-test dependency edge.
+test-support = []
+
 [lints]
 workspace = true
 
