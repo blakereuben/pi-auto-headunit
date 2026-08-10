@@ -13,9 +13,9 @@
 
 use protocol_aap::{
     ControlMessage, ControlMessageId, DEFAULT_MAX_CONTROL_BODY_SIZE, Encryption, FrameError,
-    FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
-    HandshakeStateMachine, Message, MessageAssembler, MessageType, ProtocolLimits,
-    ServiceDiscoveryRequestSummary, decode_frame, encode_frame,
+    FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState, HandshakeStateMachine,
+    Message, MessageAssembler, MessageType, ProtocolLimits, ServiceDiscoveryRequestSummary,
+    decode_frame, encode_frame,
 };
 use transport_api::{SessionTransport, TransportError, fake};
 
@@ -101,9 +101,9 @@ fn read_one_message(
                 Err(error) => panic!("frame decode error: {error}"),
             };
             let consumed = frame.consumed;
-            let assembled = assembler.push(frame).expect("assemble frame");
+            let pushed = assembler.push(frame).expect("assemble frame");
             received.drain(..consumed);
-            if let Some(message) = assembled {
+            if let Some(message) = pushed {
                 return message;
             }
         }
@@ -167,7 +167,11 @@ fn reaches_service_discovery_summary_over_fake_transport_and_stops() {
             complete: true,
         })
         .expect("tls complete");
-    assert_eq!(actions.len(), 2, "expect the final TLS chunk and AuthComplete");
+    assert_eq!(
+        actions.len(),
+        2,
+        "expect the final TLS chunk and AuthComplete"
+    );
     send_and_observe(&mut transport, &phone, &actions);
     assert_eq!(handshake.state(), HandshakeState::AwaitingServiceDiscovery);
 
