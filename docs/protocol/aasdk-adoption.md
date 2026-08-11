@@ -88,10 +88,18 @@ Field numbers, labels, and types below are read directly from the same pinned AA
 - `protobuf/aap_protobuf/service/inputsource/InputSourceService.proto` (including its nested `TouchScreen`/`TouchPad` messages)
 - `protobuf/aap_protobuf/service/media/source/MediaSourceService.proto`
 - `protobuf/aap_protobuf/service/bluetooth/BluetoothService.proto`
+- `protobuf/aap_protobuf/service/radio/RadioService.proto` (including its referenced `RadioProperties.proto`)
+- `protobuf/aap_protobuf/service/navigationstatus/NavigationStatusService.proto`
+- `protobuf/aap_protobuf/service/mediaplayback/MediaPlaybackStatusService.proto`
+- `protobuf/aap_protobuf/service/phonestatus/PhoneStatusService.proto`
+- `protobuf/aap_protobuf/service/mediabrowser/MediaBrowserService.proto`
+- `protobuf/aap_protobuf/service/vendorextension/VendorExtensionService.proto`
+- `protobuf/aap_protobuf/service/genericnotification/GenericNotificationService.proto`
+- `protobuf/aap_protobuf/service/wifiprojection/WifiProjectionService.proto`
 
-These five nested per-kind messages were selected because they are the only ones with a corresponding `ServiceKind` in `crates/protocol-aap/src/service_catalogue.rs` today (`Sensors`, `Video`/`MediaAudio`/`SpeechAudio`/`SystemAudio`, `Input`, `Microphone`, `Bluetooth`). None of these proto files carry a per-file licence/copyright header at the pinned revision — the same posture already recorded above for `ServiceDiscoveryRequest.proto` and the other already-adopted proto files in this document, which rely on the repository-wide GPL-3.0-or-later notices found in the adopted `.hpp`/`.cpp` files rather than a per-proto notice.
+The first five nested per-kind messages were selected because they are the only ones with a corresponding `ServiceKind` in `crates/protocol-aap/src/service_catalogue.rs` today (`Sensors`, `Video`/`MediaAudio`/`SpeechAudio`/`SystemAudio`, `Input`, `Microphone`, `Bluetooth`). The remaining eight — `radio_service`, `navigation_status_service`, `media_playback_service`, `phone_status_service`, `media_browser_service`, `vendor_extension_service`, `generic_notification_service`, `wifi_projection_service` — have no corresponding `ServiceKind` yet; they are mapped below purely as a provenance record, ahead of any catalogue or encoder work that would consume them. None of these proto files carry a per-file licence/copyright header at the pinned revision — the same posture already recorded above for `ServiceDiscoveryRequest.proto` and the other already-adopted proto files in this document, which rely on the repository-wide GPL-3.0-or-later notices found in the adopted `.hpp`/`.cpp` files rather than a per-proto notice.
 
-**Not yet mapped** (out of scope for this pass because the catalogue does not model them): the eight remaining `Service` nested types — `radio_service`, `navigation_status_service`, `media_playback_service`, `phone_status_service`, `media_browser_service`, `vendor_extension_service`, `generic_notification_service`, `wifi_projection_service` — and every leaf enum/config message referenced below (`MediaCodecType`, `AudioStreamType`, `AudioConfiguration`, `VideoConfiguration`, `DisplayType`, `KeyCode`, `Sensor`, `FuelType`, `EvConnectorType`, `BluetoothPairingMethod`, `TouchScreenType`, `FeedbackEvent`), plus `ServiceDiscoveryResponse`'s non-deprecated `DriverPosition`, `ConnectionConfiguration`, and `HeadUnitInfo` messages. These must each be mapped and recorded here before any encoder reads or writes them.
+**Not yet mapped**: every leaf enum/config message referenced below (`MediaCodecType`, `AudioStreamType`, `AudioConfiguration`, `VideoConfiguration`, `DisplayType`, `KeyCode`, `Sensor`, `FuelType`, `EvConnectorType`, `BluetoothPairingMethod`, `TouchScreenType`, `FeedbackEvent`, `RadioType`, `Range`, `RdsType`, `TrafficServiceType`, `ItuRegion`), plus `ServiceDiscoveryResponse`'s non-deprecated `DriverPosition`, `ConnectionConfiguration`, and `HeadUnitInfo` messages. These must each be mapped and recorded here before any encoder reads or writes them.
 
 ### `Service` (`aap_protobuf.service.Service`, proto2)
 
@@ -103,14 +111,14 @@ These five nested per-kind messages were selected because they are the only ones
 | 4 | `input_source_service` | optional | `inputsource.InputSourceService` | mapped below |
 | 5 | `media_source_service` | optional | `media.source.MediaSourceService` | mapped below |
 | 6 | `bluetooth_service` | optional | `bluetooth.BluetoothService` | mapped below |
-| 7 | `radio_service` | optional | `radio.RadioService` | not yet mapped |
-| 8 | `navigation_status_service` | optional | `navigationstatus.NavigationStatusService` | not yet mapped |
-| 9 | `media_playback_service` | optional | `mediaplayback.MediaPlaybackStatusService` | not yet mapped |
-| 10 | `phone_status_service` | optional | `phonestatus.PhoneStatusService` | not yet mapped |
-| 11 | `media_browser_service` | optional | `mediabrowser.MediaBrowserService` | not yet mapped |
-| 12 | `vendor_extension_service` | optional | `vendorextension.VendorExtensionService` | not yet mapped |
-| 13 | `generic_notification_service` | optional | `genericnotification.GenericNotificationService` | not yet mapped |
-| 14 | `wifi_projection_service` | optional | `wifiprojection.WifiProjectionService` | not yet mapped |
+| 7 | `radio_service` | optional | `radio.RadioService` | mapped below |
+| 8 | `navigation_status_service` | optional | `navigationstatus.NavigationStatusService` | mapped below |
+| 9 | `media_playback_service` | optional | `mediaplayback.MediaPlaybackStatusService` | mapped below |
+| 10 | `phone_status_service` | optional | `phonestatus.PhoneStatusService` | mapped below |
+| 11 | `media_browser_service` | optional | `mediabrowser.MediaBrowserService` | mapped below |
+| 12 | `vendor_extension_service` | optional | `vendorextension.VendorExtensionService` | mapped below |
+| 13 | `generic_notification_service` | optional | `genericnotification.GenericNotificationService` | mapped below |
+| 14 | `wifi_projection_service` | optional | `wifiprojection.WifiProjectionService` | mapped below |
 
 Every field after `id` is wire type 2 (length-delimited/embedded message); `id` is wire type 0 (varint). At most one service-type field is expected populated per `Service` instance in observed upstream usage, but the schema does not itself enforce that as a `oneof`.
 
@@ -205,6 +213,81 @@ Nested `InputSourceService.TouchPad`:
 |---|---|---|---|
 | 1 | `car_address` | required | `string` |
 | 2 | `supported_pairing_methods` | repeated, packed | `message.BluetoothPairingMethod` enum (not yet mapped) |
+
+### `RadioService` (`aap_protobuf.service.radio.RadioService`, proto2)
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `radio_properties` | repeated | `message.RadioProperties` (mapped below) |
+
+Nested `RadioProperties` (`aap_protobuf.service.radio.message.RadioProperties`, proto2, its own file — `protobuf/aap_protobuf/service/radio/message/RadioProperties.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `radio_id` | required | `int32` |
+| 2 | `type` | required | `message.RadioType` enum (not yet mapped) |
+| 3 | `channel_range` | repeated | `message.Range` (not yet mapped) |
+| 4 | `channel_spacings` | repeated | `int32` |
+| 5 | `channel_spacing` | required | `int32` |
+| 6 | `background_tuner` | optional | `bool` |
+| 7 | `region` | optional | `message.ItuRegion` enum (not yet mapped) |
+| 8 | `rds` | optional | `message.RdsType` enum (not yet mapped) |
+| 9 | `af_switch` | optional | `bool` |
+| 10 | `ta` | optional | `bool` |
+| 11 | `traffic_service` | optional | `message.TrafficServiceType` enum (not yet mapped) |
+| 12 | `audio_loopback` | optional | `bool` |
+| 13 | `mute_capability` | optional | `bool` |
+| 14 | `station_presets_access` | optional | `int32` |
+
+`RadioService` itself carries no per-request/response messages (tuning, scanning, presets, HD radio data, traffic incidents) in this mapping pass — only the discovery-time capability advertisement (`RadioProperties`). The `radio` package has ~25 further message files (`TuneToStationRequest`, `ScanStationsRequest`, HD radio data, etc.) that are runtime request/response traffic, not part of `Service`/`ServiceDiscoveryResponse`, and are out of scope for this response-schema mapping.
+
+### `NavigationStatusService` (`aap_protobuf.service.navigationstatus.NavigationStatusService`, proto2)
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `minimum_interval_ms` | required | `int32` |
+| 2 | `type` | required | nested `InstrumentClusterType` enum: `IMAGE = 1`, `ENUM = 2` |
+| 3 | `image_options` | optional | nested `ImageOptions` message (below) |
+
+Nested `NavigationStatusService.ImageOptions`:
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `height` | required | `int32` |
+| 2 | `width` | required | `int32` |
+| 3 | `colour_depth_bits` | required | `int32` |
+
+Both `InstrumentClusterType` and `ImageOptions` are declared inline inside `NavigationStatusService.proto` itself (no separate file), unlike every other nested enum/message referenced in this document, which each have their own proto file.
+
+### `MediaPlaybackStatusService` (`aap_protobuf.service.mediaplayback.MediaPlaybackStatusService`, proto2)
+
+Empty message — no fields. Declared as a bare marker type (`message MediaPlaybackStatusService {}`) used purely to advertise the service's presence in `Service`; the actual playback status/metadata payloads (`MediaPlaybackStatus`, `MediaPlaybackMetadata`) are separate runtime messages under `service/mediaplayback/message/`, not part of this discovery-time type.
+
+### `PhoneStatusService` (`aap_protobuf.service.phonestatus.PhoneStatusService`, proto2)
+
+Empty message — no fields, same bare-marker shape as `MediaPlaybackStatusService` above. Runtime payloads (`PhoneStatus`, `PhoneStatusInput`) live under `service/phonestatus/message/`, outside this discovery-time type.
+
+### `MediaBrowserService` (`aap_protobuf.service.mediabrowser.MediaBrowserService`, proto2)
+
+Empty message — no fields, same bare-marker shape. Runtime payloads (`MediaList`, `MediaSong`, `MediaSource`, etc.) live under `service/mediabrowser/message/`, outside this discovery-time type.
+
+### `VendorExtensionService` (`aap_protobuf.service.vendorextension.VendorExtensionService`, proto2)
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `name` | required | `string` |
+| 2 | `package_white_list` | repeated | `string` |
+| 3 | `data` | optional | `bytes` |
+
+### `GenericNotificationService` (`aap_protobuf.service.genericnotification.GenericNotificationService`, proto2)
+
+Empty message — no fields, same bare-marker shape. Runtime payloads (`GenericNotificationMessage`, `GenericNotificationAck`, subscribe/unsubscribe) live under `service/genericnotification/message/`, outside this discovery-time type.
+
+### `WifiProjectionService` (`aap_protobuf.service.wifiprojection.WifiProjectionService`, proto2)
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `car_wifi_bssid` | optional | `string` |
 
 ### Contrast against OpenAuto's older schema
 
