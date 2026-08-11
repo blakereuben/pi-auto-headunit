@@ -96,10 +96,15 @@ Field numbers, labels, and types below are read directly from the same pinned AA
 - `protobuf/aap_protobuf/service/vendorextension/VendorExtensionService.proto`
 - `protobuf/aap_protobuf/service/genericnotification/GenericNotificationService.proto`
 - `protobuf/aap_protobuf/service/wifiprojection/WifiProjectionService.proto`
+- `protobuf/aap_protobuf/service/control/message/DriverPosition.proto`
+- `protobuf/aap_protobuf/service/control/message/ConnectionConfiguration.proto`
+- `protobuf/aap_protobuf/service/control/message/HeadUnitInfo.proto`
+- `protobuf/aap_protobuf/service/control/message/PingConfiguration.proto`
+- `protobuf/aap_protobuf/service/control/message/WirelessTcpConfiguration.proto`
 
 The first five nested per-kind messages were selected because they are the only ones with a corresponding `ServiceKind` in `crates/protocol-aap/src/service_catalogue.rs` today (`Sensors`, `Video`/`MediaAudio`/`SpeechAudio`/`SystemAudio`, `Input`, `Microphone`, `Bluetooth`). The remaining eight — `radio_service`, `navigation_status_service`, `media_playback_service`, `phone_status_service`, `media_browser_service`, `vendor_extension_service`, `generic_notification_service`, `wifi_projection_service` — have no corresponding `ServiceKind` yet; they are mapped below purely as a provenance record, ahead of any catalogue or encoder work that would consume them. None of these proto files carry a per-file licence/copyright header at the pinned revision — the same posture already recorded above for `ServiceDiscoveryRequest.proto` and the other already-adopted proto files in this document, which rely on the repository-wide GPL-3.0-or-later notices found in the adopted `.hpp`/`.cpp` files rather than a per-proto notice.
 
-**Not yet mapped**: `ServiceDiscoveryResponse`'s non-deprecated `DriverPosition`, `ConnectionConfiguration`, and `HeadUnitInfo` messages, plus a further tier of leaf types discovered while mapping the leaf enum/config messages below but not themselves requested by any already-mapped type's immediate field list — `SensorType` is now mapped (it was the sole field of `Sensor`, so mapping `Sensor` meaningfully required it), as are `VideoFrameRateType` and `VideoCodecResolutionType` (both trivial one-hop enums needed to make `VideoConfiguration` meaningful); `UiConfig` (referenced by `VideoConfiguration`, itself referencing `UiTheme` and `Insets`) is deliberately left unmapped as the next recursion boundary. These must each be mapped and recorded here before any encoder reads or writes them.
+**Not yet mapped**: `UiConfig` (referenced by `VideoConfiguration`, itself referencing `UiTheme` and `Insets`), deliberately left unmapped as the next recursion boundary — the same one-hop-of-context policy already applied elsewhere in this section (e.g. mapping `SensorType` because it was `Sensor`'s sole field, or `PingConfiguration`/`WirelessTcpConfiguration` below because they are `ConnectionConfiguration`'s only two fields, without chasing what those in turn reference). These must each be mapped and recorded here before any encoder reads or writes them.
 
 ### `Service` (`aap_protobuf.service.Service`, proto2)
 
@@ -131,7 +136,7 @@ Every field after `id` is wire type 2 (length-delimited/embedded message); `id` 
 | 3 | `model` | optional | `string` | `[deprecated = true]` upstream; excluded |
 | 4 | `year` | optional | `string` | `[deprecated = true]` upstream; excluded |
 | 5 | `vehicle_id` | optional | `string` | `[deprecated = true]` upstream; excluded |
-| 6 | `driver_position` | optional | `DriverPosition` | not yet mapped |
+| 6 | `driver_position` | optional | `DriverPosition` | mapped below |
 | 7 | `head_unit_make` | optional | `string` | `[deprecated = true]` upstream; excluded |
 | 8 | `head_unit_model` | optional | `string` | `[deprecated = true]` upstream; excluded |
 | 9 | `head_unit_software_build` | optional | `string` | `[deprecated = true]` upstream; excluded |
@@ -140,8 +145,8 @@ Every field after `id` is wire type 2 (length-delimited/embedded message); `id` 
 | 13 | `session_configuration` | optional | `int32` | not yet mapped; field 12 does not exist upstream |
 | 14 | `display_name` | optional | `string` | not yet mapped |
 | 15 | `probe_for_support` | optional | `bool` | not yet mapped |
-| 16 | `connection_configuration` | optional | `ConnectionConfiguration` | not yet mapped |
-| 17 | `headunit_info` | optional | `HeadUnitInfo` | not yet mapped |
+| 16 | `connection_configuration` | optional | `ConnectionConfiguration` | mapped below |
+| 17 | `headunit_info` | optional | `HeadUnitInfo` | mapped below |
 
 Field 12 is genuinely absent upstream (the sequence skips from 11 to 13); this is not an omission in this record.
 
@@ -511,6 +516,60 @@ The only negative enum value seen anywhere in this document's mappings so far �
 | 5 | `RADIO_REGION_KOREA` |
 
 Note the package deviation: `ItuRegion.proto` declares `package aap_protobuf.service.radio;` (one level shallower than every sibling file in the same `service/radio/message/` directory, which all declare `aap_protobuf.service.radio.message`) — its own file location and every other file's package agree with each other, only this one file's package statement is shallower than its directory would suggest. `RadioProperties.proto` refers to it as unqualified `ItuRegion`, which resolves correctly under proto2 scoping rules regardless of the package mismatch, but a Rust codegen path that derives module paths from directory structure rather than each file's own `package` statement would place this type incorrectly.
+
+### `ServiceDiscoveryResponse`'s remaining non-deprecated messages
+
+`DriverPosition` (`aap_protobuf.service.control.message.DriverPosition`, enum, `service/control/message/DriverPosition.proto`):
+
+| Value | Name |
+|---|---|
+| 0 | `DRIVER_POSITION_LEFT` |
+| 1 | `DRIVER_POSITION_RIGHT` |
+| 2 | `DRIVER_POSITION_CENTER` |
+| 3 | `DRIVER_POSITION_UNKNOWN` |
+
+`ConnectionConfiguration` (`aap_protobuf.service.control.message.ConnectionConfiguration`, proto2, `service/control/message/ConnectionConfiguration.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `ping_configuration` | optional | `PingConfiguration` (mapped below) |
+| 2 | `wireless_tcp_configuration` | optional | `WirelessTcpConfiguration` (mapped below) |
+
+`PingConfiguration` (`aap_protobuf.service.control.message.PingConfiguration`, proto2, `service/control/message/PingConfiguration.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `timeout_ms` | optional | `uint32` |
+| 2 | `interval_ms` | optional | `uint32` |
+| 3 | `high_latency_threshold_ms` | optional | `uint32` |
+| 4 | `tracked_ping_count` | optional | `uint32` |
+
+`WirelessTcpConfiguration` (`aap_protobuf.service.control.message.WirelessTcpConfiguration`, proto2, `service/control/message/WirelessTcpConfiguration.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `socket_receive_buffer_size_kb` | optional | `uint32` |
+| 2 | `socket_send_buffer_size_kb` | optional | `uint32` |
+| 3 | `socket_read_timeout_ms` | optional | `uint32` |
+
+`HeadUnitInfo` (`aap_protobuf.service.control.message.HeadUnitInfo`, proto2, `service/control/message/HeadUnitInfo.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `make` | optional | `string` |
+| 2 | `model` | optional | `string` |
+| 3 | `year` | optional | `string` |
+| 4 | `vehicle_id` | optional | `string` |
+| 5 | `head_unit_make` | optional | `string` |
+| 6 | `head_unit_model` | optional | `string` |
+| 7 | `head_unit_software_build` | optional | `string` |
+| 8 | `head_unit_software_version` | optional | `string` |
+
+`HeadUnitInfo` is a direct non-deprecated replacement for `ServiceDiscoveryResponse`'s own deprecated flat fields 2–5 and 7–10 (`make`, `model`, `year`, `vehicle_id`, `head_unit_make`, `head_unit_model`, `head_unit_software_build`, `head_unit_software_version`) — same field names and types, moved into a nested message rather than left flat on the response. This is a real upstream migration, not a naming coincidence introduced by this record.
+
+Every field in this section is `proto2`, and none of the five files carries a per-file licence/copyright header, consistent with every other proto file cited in this document.
+
+With this section, all three of `ServiceDiscoveryResponse`'s previously "not yet mapped" fields (`driver_position`, `connection_configuration`, `headunit_info`) are now mapped; `UiConfig` (and its own further references `UiTheme`/`Insets`) remains the only open leaf in the "not yet mapped" list above.
 
 ### Contrast against OpenAuto's older schema
 
