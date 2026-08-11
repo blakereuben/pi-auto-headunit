@@ -128,9 +128,17 @@ TLS-encrypted `ServiceDiscoveryRequest` was decrypted and reassembled
 (`probe_state=encrypted_frame_received`) into a bounded, byte-count-only
 summary. The probe stopped cleanly before any response or media setup, and
 the USB interface was released cleanly. The installed `/usr/bin/aa-headunit-diagnostics`
-package binary was stale (missing `auth-discovery-probe` entirely); the
-freshly built `target/release/aa-headunit-diagnostics` was used instead —
-worth re-installing the package before the next real-phone run.
+package binary was stale at the time (missing `auth-discovery-probe`
+entirely), so the freshly built `target/release/aa-headunit-diagnostics`
+was used instead. The `.deb` has since been rebuilt from current source and
+reinstalled (`packaging/debian`, via a temporary `debian` symlink at the
+repo root removed after the build); `/usr/bin/aa-headunit-diagnostics` now
+includes `auth-discovery-probe` under both `usb` and `developer`, confirmed
+by re-running `usb auth-discovery-probe --device <bus:address>
+--allow-live-aap` from the installed binary directly against the real
+phone — same clean result (`probe_result=service_discovery_summary_received`,
+stopped before response/media setup). The package binary is no longer
+stale.
 
 Clean timeout, malformed-message, unplug, and reconnect recovery are now
 proven, all on Pi 5 against the real phone (see `MILESTONE_CHECKLIST.md`
@@ -149,9 +157,10 @@ accessory-mode checks made the command fail unconditionally regardless of
 device state; reconnect recovery was proven by physically replugging after
 that unplug and immediately re-running `auth-discovery-probe`
 successfully. `usb auth-discovery-probe --device <bus:address>
---allow-live-aap` needs `sudo` (credentials are root-only `0700`) and the
-freshly built `target/release/aa-headunit-diagnostics`, not the stale
-installed `/usr/bin/aa-headunit-diagnostics` package.
+--allow-live-aap` needs `sudo` (credentials are root-only `0700`); the
+installed `/usr/bin/aa-headunit-diagnostics` package is current and
+includes `auth-discovery-probe`, so either it or a freshly built
+`target/release/aa-headunit-diagnostics` works.
 
 **This is a natural stopping point.** Every M2 checklist item tied to the
 gated `auth-discovery-probe` — implementation, real-phone service-discovery
@@ -169,5 +178,4 @@ code — it's the point where the probe stops being read-only and this
 project starts building the parts of a real Android Auto session (channel
 setup, then eventually media). **First step in a new session: run the
 verification commands above and report the actual results before writing
-any more code**, then re-install the `.deb` package (the installed binary
-is stale) before any further real-phone work.
+any more code.**
