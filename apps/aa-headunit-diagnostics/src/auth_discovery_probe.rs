@@ -106,6 +106,10 @@ pub fn run<T: SessionTransport>(
                 || message.encryption != Encryption::Plain
                 || message.message_type != MessageType::Specific
             {
+                println!("unexpected_message_channel_id={}", message.channel_id);
+                println!("unexpected_message_encryption={:?}", message.encryption);
+                println!("unexpected_message_type={:?}", message.message_type);
+                println!("unexpected_message_payload_bytes={}", message.payload.len());
                 return Err(CliError::Protocol(
                     "unexpected message metadata during auth/service-discovery probe".into(),
                 ));

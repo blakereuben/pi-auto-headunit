@@ -63,7 +63,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Model the service catalogue with bounded candidates, hardware-readiness filtering, unique roles, and non-conflicting channel identifiers.
 - [x] Prove the frame codec, message assembler, and handshake state machine reach `ServiceDiscoveryReceived` with only a bounded summary and no response, driven over a real `SessionTransport` against a scripted fake phone, without changing the frozen `credential-probe`.
 - [ ] Map the newer AASDK `Service` response schema field by field; do not reuse OpenAuto's older `ChannelDescriptor` wire shape.
-- [ ] Add parser fuzz/property tests for untrusted phone input.
+- [x] Add parser fuzz/property tests for untrusted phone input: frame decode, control-message decode, and service-discovery summarization never panic on arbitrary bytes, frame encode/decode round-trips for arbitrary valid payloads, and the service-discovery summary never leaks generated device text.
 - [x] Reach and name `VersionAccepted` as the first repeatable live Android Auto session state on the Pi 5; authentication remains blocked.
 - [x] Run the opt-in generated-credential probe and record its first sanitized Pi 5 result: version 1.6 accepted, TLS timed out cleanly.
 - [x] Record the phone's Android Auto error 7 security rejection over both USB/AOA and the official developer tunnel; stop all generated/shared-identity experiments.

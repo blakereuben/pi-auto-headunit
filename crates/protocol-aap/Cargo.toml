@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dev-dependencies]
+# Property/fuzz testing for the untrusted-input parsers (frame decode,
+# control message decode, service-discovery summary). Dev-only.
+proptest = "1.11.0"
 # Bounded in-memory fake SessionTransport, for deterministic scripted-peer
 # tests only (see crates/transport-api/src/fake.rs). Never a runtime
 # dependency of this crate.
