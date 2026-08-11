@@ -710,7 +710,7 @@ mod tests {
         loop {
             match client.stream.ssl_read(&mut sink) {
                 Ok(0) => break,
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(error) if error.code() == ErrorCode::WANT_READ => break,
                 Err(error) => panic!("failed to drain post-handshake server data: {error}"),
             }
