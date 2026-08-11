@@ -549,12 +549,6 @@ fn usb_hold(selector: &str, seconds: u64) -> Result<(), CliError> {
         .into_iter()
         .find(|device| device.bus == bus && device.address == address)
         .ok_or(CliError::Aoa(transport_api::AoaError::Unplugged))?;
-    if transport_usb::is_accessory_id(candidate.vendor_id, candidate.product_id) {
-        return Err(CliError::Usage(
-            "tls-probe requires a freshly connected phone before accessory mode; unplug and reconnect it first"
-                .into(),
-        ));
-    }
     if !transport_usb::is_accessory_id(candidate.vendor_id, candidate.product_id) {
         return Err(CliError::Usage(
             "hold requires a device already in AOA accessory mode; run usb aoa first".into(),

@@ -132,7 +132,42 @@ package binary was stale (missing `auth-discovery-probe` entirely); the
 freshly built `target/release/aa-headunit-diagnostics` was used instead —
 worth re-installing the package before the next real-phone run.
 
-**First step in a new session: run the verification commands above and
-report the actual results before writing any more code.** The next M2
-milestone step is proving clean timeout, malformed-message, unplug, and
-reconnect recovery against a real phone — not yet attempted.
+Clean timeout, malformed-message, unplug, and reconnect recovery are now
+proven, all on Pi 5 against the real phone (see `MILESTONE_CHECKLIST.md`
+M2 for full detail): a timeout was captured naturally (a stale-app-state
+phone left `auth-discovery-probe` waiting past its 10s `PROBE_TIMEOUT`,
+failing closed with no hang); malformed-message recovery is proven at the
+parser boundary the real probe actually calls, via
+`property_fuzz.rs`/`encrypted_service_discovery.rs` (a real phone sending
+genuinely malformed bytes isn't reproducible from the head-unit side, so
+fuzzing the exact same parser code path is the correct proof, not a
+compromise); `usb hold --device <bus:address> --seconds N` proved unplug
+detection with a real physical unplug (`hold_result=unplug_detected`, no
+hang) — this also surfaced and fixed a pre-existing bug in `usb hold`
+(`apps/aa-headunit-diagnostics/src/main.rs`) where two mutually-exclusive
+accessory-mode checks made the command fail unconditionally regardless of
+device state; reconnect recovery was proven by physically replugging after
+that unplug and immediately re-running `auth-discovery-probe`
+successfully. `usb auth-discovery-probe --device <bus:address>
+--allow-live-aap` needs `sudo` (credentials are root-only `0700`) and the
+freshly built `target/release/aa-headunit-diagnostics`, not the stale
+installed `/usr/bin/aa-headunit-diagnostics` package.
+
+**This is a natural stopping point.** Every M2 checklist item tied to the
+gated `auth-discovery-probe` — implementation, real-phone service-discovery
+summary, encrypted post-handshake traffic, and clean
+timeout/malformed/unplug/reconnect recovery — is now `[x]` and Pi-verified
+against a real phone. What remains open in M2 is a materially different
+and larger scope, not a continuation of this probe work: mapping the
+remaining eight `Service` nested types and their leaf enum/config messages
+in `docs/protocol/aasdk-adoption.md`, then adding the actual
+`ServiceDiscoveryResponse` Rust wire encoder (currently gated/absent
+entirely), plus defining cooperative tree-wide cancellation (today only a
+wall-clock deadline plus `Drop`-based release, per `ARCHITECTURE.md` §6).
+That response-encoding work needs its own scoped design pass before any
+code — it's the point where the probe stops being read-only and this
+project starts building the parts of a real Android Auto session (channel
+setup, then eventually media). **First step in a new session: run the
+verification commands above and report the actual results before writing
+any more code**, then re-install the `.deb` package (the installed binary
+is stale) before any further real-phone work.
