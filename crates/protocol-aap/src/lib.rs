@@ -193,6 +193,12 @@ pub fn decode_frame(input: &[u8], limits: ProtocolLimits) -> Result<DecodedFrame
         });
     }
 
+    let encryption = if flags & 0x08 == 0 {
+        Encryption::Plain
+    } else {
+        Encryption::Encrypted
+    };
+
     let total_message_size = if frame_type == FrameType::First {
         let total = u32::from_be_bytes([input[4], input[5], input[6], input[7]]) as usize;
         if total > limits.maximum_message_size {
@@ -201,7 +207,14 @@ pub fn decode_frame(input: &[u8], limits: ProtocolLimits) -> Result<DecodedFrame
                 maximum: limits.maximum_message_size,
             });
         }
-        if total < frame_size {
+        // `total` is the declared plaintext message size; `frame_size` is
+        // this frame's on-wire length, which for an encrypted frame is
+        // ciphertext (see docs/protocol/aasdk-adoption.md, "Encrypted-
+        // message framing"). TLS per-record overhead means ciphertext can
+        // exceed the plaintext total for small trailing chunks, so this
+        // invariant only holds for plain frames, where frame_size is a
+        // literal subset of the plaintext total.
+        if encryption == Encryption::Plain && total < frame_size {
             return Err(FrameError::TotalSmallerThanFrame {
                 total,
                 frame: frame_size,
@@ -221,11 +234,7 @@ pub fn decode_frame(input: &[u8], limits: ProtocolLimits) -> Result<DecodedFrame
         header: FrameHeader {
             channel_id: input[0],
             frame_type,
-            encryption: if flags & 0x08 == 0 {
-                Encryption::Plain
-            } else {
-                Encryption::Encrypted
-            },
+            encryption,
             message_type: if flags & 0x04 == 0 {
                 MessageType::Specific
             } else {
@@ -282,7 +291,12 @@ pub fn encode_frame(
                 maximum: limits.maximum_message_size,
             });
         }
-        if total < payload.len() {
+        // See the matching comment in `decode_frame`: this invariant only
+        // holds when `payload` is plaintext. For an encrypted frame,
+        // `payload` is already ciphertext (the caller encrypts before
+        // calling `encode_frame`), which can exceed the plaintext `total`
+        // for small trailing chunks.
+        if header.encryption == Encryption::Plain && total < payload.len() {
             return Err(FrameError::TotalSmallerThanFrame {
                 total,
                 frame: payload.len(),
@@ -426,6 +440,33 @@ mod tests {
             decode_frame(&[1, 1, 0, 2, 0, 0, 0, 1, 0, 0], LIMITS),
             Err(FrameError::TotalSmallerThanFrame { total: 1, frame: 2 })
         );
+    }
+
+    #[test]
+    fn allows_ciphertext_larger_than_declared_plaintext_total_only_when_encrypted() {
+        // `total` is the declared plaintext message size; an encrypted
+        // frame's on-wire length is ciphertext, which can exceed a small
+        // plaintext total by TLS per-record overhead (see
+        // docs/protocol/aasdk-adoption.md, "Encrypted-message framing").
+        // The same byte shape stays rejected when Plain (proven above by
+        // `rejects_impossible_first_frame_total`), since there frame_size
+        // is a literal subset of the plaintext total.
+        let encrypted_bytes = [1, 9, 0, 2, 0, 0, 0, 1, 0xaa, 0xbb];
+        let decoded = decode_frame(&encrypted_bytes, LIMITS)
+            .expect("encrypted frame with a small declared total must decode");
+        assert_eq!(decoded.header.encryption, Encryption::Encrypted);
+        assert_eq!(decoded.total_message_size, Some(1));
+        assert_eq!(decoded.payload, [0xaa, 0xbb]);
+
+        let header = FrameHeader {
+            channel_id: 1,
+            frame_type: FrameType::First,
+            encryption: Encryption::Encrypted,
+            message_type: MessageType::Specific,
+        };
+        let encoded = encode_frame(header, Some(1), &[0xaa, 0xbb], LIMITS)
+            .expect("encoding an encrypted frame with a small declared total must succeed");
+        assert_eq!(encoded, encrypted_bytes);
     }
 
     #[test]

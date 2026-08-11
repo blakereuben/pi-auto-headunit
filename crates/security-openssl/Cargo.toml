@@ -10,5 +10,11 @@ repository.workspace = true
 openssl = "0.10.76"
 protocol-aap = { path = "../protocol-aap" }
 
+[features]
+# Server-role TLS test peer for deterministic scripted-peer tests (e.g. a
+# fake phone completing a real TLS session with the client adapter). Never
+# enabled by a non-test dependency edge.
+test-support = []
+
 [lints]
 workspace = true

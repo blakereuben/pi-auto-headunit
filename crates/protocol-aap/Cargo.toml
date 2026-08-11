@@ -14,6 +14,12 @@ proptest = "1.11.0"
 # tests only (see crates/transport-api/src/fake.rs). Never a runtime
 # dependency of this crate.
 transport-api = { path = "../transport-api", features = ["test-support"] }
+# Real OpenSSL client/server TLS for the encrypted-application-data
+# integration test only (see crates/security-openssl/src/linux.rs's
+# `TestServerTls`, gated behind test-support). `security-openssl` already
+# has a normal (non-dev) dependency on this crate; this is the reverse edge,
+# valid for dev-dependencies, and never a runtime dependency of this crate.
+security-openssl = { path = "../security-openssl", features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -12,13 +12,23 @@
 //! `protocol_aap::service_discovery`). It stops immediately after that: no
 //! `ServiceDiscoveryResponse` is built or sent, and no media setup is
 //! attempted, matching `crates/protocol-aap/tests/fake_phone_transport.rs`.
+//!
+//! Once TLS completes, a real phone sends `AuthComplete`/
+//! `ServiceDiscoveryRequest` as TLS-encrypted application data at the AAP
+//! frame level (the `Encrypted` flag), not as more `EncapsulatedTls`
+//! control messages. Each encrypted frame's payload is decrypted with
+//! `TlsClient::decrypt_application_data` before it reaches bounded message
+//! reassembly, matching AASDK's proven per-frame decrypt-before-dispatch
+//! behaviour (`docs/protocol/aasdk-adoption.md`); an encrypted frame
+//! arriving before TLS completes is rejected outright, since decryption
+//! isn't yet possible.
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{
-    AASDK_MAX_FRAME_PAYLOAD_SIZE, ControlMessage, Encryption, FrameError, FrameHeader, FrameType,
-    HandshakeAction, HandshakeEvent, HandshakeStateMachine, MessageAssembler, MessageType,
-    ProtocolLimits, ServiceDiscoveryRequestSummary, TlsClient, TlsProgress, decode_frame,
-    encode_frame,
+    AASDK_MAX_FRAME_PAYLOAD_SIZE, ControlMessage, DecodedFrame, Encryption, FrameError,
+    FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState, HandshakeStateMachine,
+    Message, MessageAssembler, MessageType, ProtocolLimits, ServiceDiscoveryRequestSummary,
+    TlsClient, TlsProgress, decode_frame, encode_frame,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::VecDeque;
@@ -95,32 +105,14 @@ pub fn run<T: SessionTransport>(
                 Err(error) => return Err(CliError::Protocol(error.to_string())),
             };
             let consumed = frame.consumed;
-            let message = assembler
-                .push(frame)
-                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            let message = push_decoded_frame(frame, &mut assembler, &mut tls, handshake.state())?;
             received.drain(..consumed);
             let Some(message) = message else {
                 continue;
             };
-            if message.channel_id != 0
-                || message.encryption != Encryption::Plain
-                || message.message_type != MessageType::Specific
-            {
-                println!("unexpected_message_channel_id={}", message.channel_id);
-                println!("unexpected_message_encryption={:?}", message.encryption);
-                println!("unexpected_message_type={:?}", message.message_type);
-                println!("unexpected_message_payload_bytes={}", message.payload.len());
-                return Err(CliError::Protocol(
-                    "unexpected message metadata during auth/service-discovery probe".into(),
-                ));
-            }
 
-            let mut actions: VecDeque<_> = handshake
-                .advance(HandshakeEvent::InboundControl(&message.payload))
-                .map_err(|error| CliError::Protocol(error.to_string()))?
-                .into();
             if let Some(summary) =
-                process_actions(&mut actions, &mut handshake, &mut tls, transport, limits)?
+                handle_assembled_message(&message, &mut handshake, &mut tls, transport, limits)?
             {
                 print_summary(&summary);
                 println!("probe_result=service_discovery_summary_received");
@@ -134,6 +126,71 @@ pub fn run<T: SessionTransport>(
     Err(CliError::Protocol(
         "auth/service-discovery probe timed out before a service-discovery summary".into(),
     ))
+}
+
+/// Pushes one decoded wire frame into `assembler`, decrypting it first if
+/// `Encrypted`. Encrypted frames arriving before TLS completes are a
+/// protocol violation, since decryption isn't yet possible.
+fn push_decoded_frame(
+    frame: DecodedFrame<'_>,
+    assembler: &mut MessageAssembler,
+    tls: &mut OpenSslTlsClient,
+    handshake_state: HandshakeState,
+) -> Result<Option<Message>, CliError> {
+    match frame.header.encryption {
+        Encryption::Plain => assembler
+            .push(frame)
+            .map_err(|error| CliError::Protocol(error.to_string())),
+        Encryption::Encrypted => {
+            if !matches!(
+                handshake_state,
+                HandshakeState::AwaitingServiceDiscovery | HandshakeState::ServiceDiscoveryReceived
+            ) {
+                return Err(CliError::Protocol(
+                    "encrypted frame received before TLS handshake completed".into(),
+                ));
+            }
+            println!("probe_state=encrypted_frame_received");
+            let plaintext = tls
+                .decrypt_application_data(frame.payload)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            let decrypted_frame = DecodedFrame {
+                header: frame.header,
+                total_message_size: frame.total_message_size,
+                payload: &plaintext,
+                consumed: frame.consumed,
+            };
+            assembler
+                .push(decrypted_frame)
+                .map_err(|error| CliError::Protocol(error.to_string()))
+        }
+    }
+}
+
+/// Validates an assembled message's metadata, then advances the handshake
+/// state machine with its (now-plaintext) payload.
+fn handle_assembled_message<T: SessionTransport>(
+    message: &Message,
+    handshake: &mut HandshakeStateMachine,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<Option<ServiceDiscoveryRequestSummary>, CliError> {
+    if message.channel_id != 0 || message.message_type != MessageType::Specific {
+        println!("unexpected_message_channel_id={}", message.channel_id);
+        println!("unexpected_message_encryption={:?}", message.encryption);
+        println!("unexpected_message_type={:?}", message.message_type);
+        println!("unexpected_message_payload_bytes={}", message.payload.len());
+        return Err(CliError::Protocol(
+            "unexpected message metadata during auth/service-discovery probe".into(),
+        ));
+    }
+
+    let mut actions: VecDeque<_> = handshake
+        .advance(HandshakeEvent::InboundControl(&message.payload))
+        .map_err(|error| CliError::Protocol(error.to_string()))?
+        .into();
+    process_actions(&mut actions, handshake, tls, transport, limits)
 }
 
 fn print_summary(summary: &ServiceDiscoveryRequestSummary) {

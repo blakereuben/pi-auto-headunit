@@ -87,10 +87,40 @@ service types and their leaf enum/config messages are recorded as not yet
 mapped. No `Service`/`ServiceDiscoveryResponse` Rust wire encoder exists;
 response encoding remains gated.
 
+`auth-discovery-probe` previously rejected any AAP frame with the
+`Encrypted` flag outright, which would have hard-failed against a real
+phone's post-handshake `AuthComplete`/`ServiceDiscoveryRequest` traffic
+(sent as TLS-encrypted application data, not more `EncapsulatedTls`
+handshake messages). `TlsClient` (`crates/protocol-aap/src/tls.rs`) now has
+`encrypt_application_data`/`decrypt_application_data`, implemented on
+`OpenSslTlsClient` using the same live post-handshake `SslStream` the
+handshake completed on (`crates/security-openssl/src/linux.rs`, no session
+reconstruction). `auth-discovery-probe`'s receive loop decrypts each
+`Encrypted` frame's payload before it reaches bounded reassembly, and
+rejects an encrypted frame only if it arrives before TLS has completed.
+Verified with real OpenSSL crypto, not fakes: client/server round-trip,
+split/coalesced TLS records, invalid ciphertext, premature use before
+handshake completion, session closure, and sanitized errors
+(`crates/security-openssl/src/linux.rs`'s test module), plus a real TLS 1.2
+handshake and a possibly-fragmented encrypted `ServiceDiscoveryRequest`
+reassembled end to end (`crates/protocol-aap/tests/encrypted_service_discovery.rs`).
+This work also surfaced and fixed a latent defect in the frame codec itself
+(`crates/protocol-aap/src/lib.rs`): `decode_frame`/`encode_frame` compared
+a first frame's declared total against that frame's on-wire length
+unconditionally, which is only valid when both are plaintext-domain (true
+for plain frames) — for encrypted frames the wire length is ciphertext,
+which can exceed a small plaintext total by TLS per-record overhead. The
+check is now skipped only for `Encryption::Encrypted`; the `Plain` path is
+unchanged and still strictly enforced. Confirmed against the pinned primary
+AASDK source (`docs/protocol/aasdk-adoption.md`, "Encrypted-message
+framing"): the declared total is plaintext-domain, matching what the fix
+assumes.
+
 **First step in a new session: run the verification commands above and
 report the actual results before writing any more code.** The next M2
 milestone step is running the gated `auth-discovery-probe` CLI subcommand
 against a real phone over USB/TCP behind its explicit `--allow-live-aap`
-opt-in (implemented and Pi-verified only at the synthetic/unit level so
-far), followed by proving clean timeout, malformed-message, unplug, and
-reconnect recovery.
+opt-in (implemented and Pi-verified only at the synthetic/unit/integration
+level so far, now including real encrypted post-handshake traffic — not
+yet against a real phone), followed by proving clean timeout,
+malformed-message, unplug, and reconnect recovery.

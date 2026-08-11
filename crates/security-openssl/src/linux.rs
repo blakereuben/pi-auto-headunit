@@ -20,6 +20,10 @@ pub enum OpenSslTlsError {
     NotStarted,
     AlreadyStarted,
     AlreadyComplete,
+    HandshakeNotComplete,
+    InvalidRecordData(String),
+    PlaintextUnavailable,
+    SessionClosed,
 }
 
 impl fmt::Display for OpenSslTlsError {
@@ -38,6 +42,16 @@ impl fmt::Display for OpenSslTlsError {
             Self::NotStarted => formatter.write_str("TLS handshake has not been started"),
             Self::AlreadyStarted => formatter.write_str("TLS handshake is already started"),
             Self::AlreadyComplete => formatter.write_str("TLS handshake is already complete"),
+            Self::HandshakeNotComplete => {
+                formatter.write_str("TLS handshake must complete before application data")
+            }
+            Self::InvalidRecordData(error) => {
+                write!(formatter, "invalid TLS application-data record: {error}")
+            }
+            Self::PlaintextUnavailable => formatter.write_str(
+                "TLS session cannot produce plaintext without further protocol progress",
+            ),
+            Self::SessionClosed => formatter.write_str("TLS session was closed by the peer"),
         }
     }
 }
@@ -353,6 +367,256 @@ impl TlsClient for OpenSslTlsClient {
         self.stream.get_mut().feed(inbound);
         self.progress()
     }
+
+    fn encrypt_application_data(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, Self::Error> {
+        if !self.complete {
+            return Err(OpenSslTlsError::HandshakeNotComplete);
+        }
+        if plaintext.len() > self.maximum_chunk_size {
+            return Err(OpenSslTlsError::InputTooLarge {
+                size: plaintext.len(),
+                maximum: self.maximum_chunk_size,
+            });
+        }
+        match self.stream.ssl_write(plaintext) {
+            Ok(_) => {}
+            Err(error) if error.code() == ErrorCode::ZERO_RETURN => {
+                return Err(OpenSslTlsError::SessionClosed);
+            }
+            Err(error) => return Err(OpenSslTlsError::InvalidRecordData(error.to_string())),
+        }
+
+        let outbound = self.stream.get_mut().take_outbound();
+        if outbound.len() > self.maximum_chunk_size {
+            return Err(OpenSslTlsError::OutputTooLarge {
+                size: outbound.len(),
+                maximum: self.maximum_chunk_size,
+            });
+        }
+        Ok(outbound)
+    }
+
+    fn decrypt_application_data(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, Self::Error> {
+        if !self.complete {
+            return Err(OpenSslTlsError::HandshakeNotComplete);
+        }
+        if ciphertext.len() > self.maximum_chunk_size {
+            return Err(OpenSslTlsError::InputTooLarge {
+                size: ciphertext.len(),
+                maximum: self.maximum_chunk_size,
+            });
+        }
+        self.stream.get_mut().feed(ciphertext);
+
+        let mut plaintext = Vec::new();
+        let mut chunk = vec![0_u8; self.maximum_chunk_size];
+        loop {
+            match self.stream.ssl_read(&mut chunk) {
+                Ok(0) => {
+                    // A clean `Ok(0)` (as opposed to `WANT_READ`) means the
+                    // peer sent a close-notify. Preserve any plaintext
+                    // already decrypted this call; the closure is reported
+                    // once nothing else remains.
+                    if plaintext.is_empty() {
+                        return Err(OpenSslTlsError::SessionClosed);
+                    }
+                    break;
+                }
+                Ok(count) => plaintext.extend_from_slice(&chunk[..count]),
+                Err(error) if error.code() == ErrorCode::WANT_READ => break,
+                Err(error) if error.code() == ErrorCode::WANT_WRITE => {
+                    if plaintext.is_empty() {
+                        return Err(OpenSslTlsError::PlaintextUnavailable);
+                    }
+                    break;
+                }
+                Err(error) if error.code() == ErrorCode::ZERO_RETURN => {
+                    return Err(OpenSslTlsError::SessionClosed);
+                }
+                Err(error) => return Err(OpenSslTlsError::InvalidRecordData(error.to_string())),
+            }
+            if plaintext.len() > self.maximum_chunk_size {
+                return Err(OpenSslTlsError::OutputTooLarge {
+                    size: plaintext.len(),
+                    maximum: self.maximum_chunk_size,
+                });
+            }
+        }
+        Ok(plaintext)
+    }
+}
+
+/// Server-role TLS peer for deterministic scripted-peer tests, e.g. a fake
+/// phone completing a real TLS session opposite an `OpenSslTlsClient`
+/// (which is always client-role). Gated behind `test-support`; never part
+/// of the production client/server boundary.
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct TestServerTls {
+    stream: SslStream<MemoryTransport>,
+    maximum_chunk_size: usize,
+    complete: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl TestServerTls {
+    pub fn from_pem(
+        certificate_pem: &[u8],
+        private_key_pem: &[u8],
+        trusted_client_certificate_pem: &[u8],
+        maximum_chunk_size: usize,
+    ) -> Result<Self, OpenSslTlsError> {
+        if maximum_chunk_size == 0 {
+            return Err(OpenSslTlsError::InvalidLimit);
+        }
+        let (certificate, private_key) = parse_credential_pair(certificate_pem, private_key_pem)?;
+        let trusted_client_certificate = X509::from_pem(trusted_client_certificate_pem)
+            .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
+
+        let mut context = SslContextBuilder::new(SslMethod::tls_server())
+            .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+        context
+            .set_certificate(&certificate)
+            .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
+        context
+            .set_private_key(&private_key)
+            .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
+        context
+            .check_private_key()
+            .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
+        context
+            .cert_store_mut()
+            .add_cert(trusted_client_certificate)
+            .map_err(|error| OpenSslTlsError::Credentials(error.to_string()))?;
+        context.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+
+        let mut ssl = Ssl::new(&context.build())
+            .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+        ssl.set_accept_state();
+        let stream = SslStream::new(ssl, MemoryTransport::default())
+            .map_err(|error| OpenSslTlsError::Setup(error.to_string()))?;
+
+        Ok(Self {
+            stream,
+            maximum_chunk_size,
+            complete: false,
+        })
+    }
+
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Feeds handshake bytes (or none, to begin/continue accepting) and
+    /// returns the server's next outbound chunk plus completion state.
+    pub fn accept(&mut self, inbound: &[u8]) -> Result<TlsProgress, OpenSslTlsError> {
+        if inbound.len() > self.maximum_chunk_size {
+            return Err(OpenSslTlsError::InputTooLarge {
+                size: inbound.len(),
+                maximum: self.maximum_chunk_size,
+            });
+        }
+        if !inbound.is_empty() {
+            self.stream.get_mut().feed(inbound);
+        }
+        match self.stream.accept() {
+            Ok(()) => self.complete = true,
+            Err(error)
+                if error.code() == ErrorCode::WANT_READ
+                    || error.code() == ErrorCode::WANT_WRITE => {}
+            Err(error) => return Err(OpenSslTlsError::Handshake(error.to_string())),
+        }
+        let outbound = self.stream.get_mut().take_outbound();
+        if outbound.len() > self.maximum_chunk_size {
+            return Err(OpenSslTlsError::OutputTooLarge {
+                size: outbound.len(),
+                maximum: self.maximum_chunk_size,
+            });
+        }
+        Ok(TlsProgress {
+            outbound,
+            complete: self.complete,
+        })
+    }
+
+    pub fn encrypt_application_data(
+        &mut self,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, OpenSslTlsError> {
+        if !self.complete {
+            return Err(OpenSslTlsError::HandshakeNotComplete);
+        }
+        if plaintext.len() > self.maximum_chunk_size {
+            return Err(OpenSslTlsError::InputTooLarge {
+                size: plaintext.len(),
+                maximum: self.maximum_chunk_size,
+            });
+        }
+        match self.stream.ssl_write(plaintext) {
+            Ok(_) => {}
+            Err(error) if error.code() == ErrorCode::ZERO_RETURN => {
+                return Err(OpenSslTlsError::SessionClosed);
+            }
+            Err(error) => return Err(OpenSslTlsError::InvalidRecordData(error.to_string())),
+        }
+        let outbound = self.stream.get_mut().take_outbound();
+        if outbound.len() > self.maximum_chunk_size {
+            return Err(OpenSslTlsError::OutputTooLarge {
+                size: outbound.len(),
+                maximum: self.maximum_chunk_size,
+            });
+        }
+        Ok(outbound)
+    }
+
+    pub fn decrypt_application_data(
+        &mut self,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, OpenSslTlsError> {
+        if !self.complete {
+            return Err(OpenSslTlsError::HandshakeNotComplete);
+        }
+        if ciphertext.len() > self.maximum_chunk_size {
+            return Err(OpenSslTlsError::InputTooLarge {
+                size: ciphertext.len(),
+                maximum: self.maximum_chunk_size,
+            });
+        }
+        self.stream.get_mut().feed(ciphertext);
+
+        let mut plaintext = Vec::new();
+        let mut chunk = vec![0_u8; self.maximum_chunk_size];
+        loop {
+            match self.stream.ssl_read(&mut chunk) {
+                Ok(0) => {
+                    if plaintext.is_empty() {
+                        return Err(OpenSslTlsError::SessionClosed);
+                    }
+                    break;
+                }
+                Ok(count) => plaintext.extend_from_slice(&chunk[..count]),
+                Err(error) if error.code() == ErrorCode::WANT_READ => break,
+                Err(error) if error.code() == ErrorCode::WANT_WRITE => {
+                    if plaintext.is_empty() {
+                        return Err(OpenSslTlsError::PlaintextUnavailable);
+                    }
+                    break;
+                }
+                Err(error) if error.code() == ErrorCode::ZERO_RETURN => {
+                    return Err(OpenSslTlsError::SessionClosed);
+                }
+                Err(error) => return Err(OpenSslTlsError::InvalidRecordData(error.to_string())),
+            }
+            if plaintext.len() > self.maximum_chunk_size {
+                return Err(OpenSslTlsError::OutputTooLarge {
+                    size: plaintext.len(),
+                    maximum: self.maximum_chunk_size,
+                });
+            }
+        }
+        Ok(plaintext)
+    }
 }
 
 #[cfg(test)]
@@ -433,6 +697,77 @@ mod tests {
             Err(error) => panic!("server handshake failed: {error}"),
         };
         (complete, stream.get_mut().take_outbound())
+    }
+
+    /// Feeds `bytes` into an already-complete client and drains whatever
+    /// `ssl_read` reports, discarding the content. Used to consume
+    /// post-handshake TLS-internal data (e.g. session tickets) that would
+    /// otherwise desync the client's read-sequence state for later
+    /// application-data decryption.
+    fn drain_into_client(client: &mut OpenSslTlsClient, bytes: &[u8]) {
+        client.stream.get_mut().feed(bytes);
+        let mut sink = [0_u8; 4096];
+        loop {
+            match client.stream.ssl_read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(error) if error.code() == ErrorCode::WANT_READ => break,
+                Err(error) => panic!("failed to drain post-handshake server data: {error}"),
+            }
+        }
+    }
+
+    /// Drives a real client+server handshake to completion and returns both
+    /// sides, mirroring `completes_mutual_tls_when_the_client_identity_is_trusted`.
+    /// The returned pair shares no state with the caller's own credentials.
+    fn established_pair(
+        maximum_chunk_size: usize,
+    ) -> (OpenSslTlsClient, SslStream<MemoryTransport>) {
+        let (client_certificate, client_key) = credentials();
+        let (server_certificate, server_key) = credentials();
+        let mut client = OpenSslTlsClient::from_pem(
+            &client_certificate.to_pem().expect("client certificate PEM"),
+            &client_key
+                .private_key_to_pem_pkcs8()
+                .expect("client private key PEM"),
+            maximum_chunk_size,
+        )
+        .expect("client");
+        let mut server = accepting_server(&server_certificate, &server_key, &client_certificate);
+
+        let mut client_progress = client.start().expect("start client");
+        let mut server_complete = false;
+        for _ in 0..16 {
+            if !client_progress.outbound.is_empty() {
+                server.get_mut().feed(&client_progress.outbound);
+            }
+            let (complete, server_outbound) = progress_server(&mut server);
+            server_complete = complete;
+            if server_outbound.is_empty() {
+                client_progress.outbound.clear();
+            } else if client_progress.complete {
+                // TLS 1.3 servers may emit post-handshake data (e.g.
+                // session tickets) after the client already reports
+                // complete. `TlsClient::feed` rejects input once complete,
+                // but the bytes must still reach the client's TLS session
+                // or its read-sequence state for the server-write direction
+                // would desync from what the server actually sent, breaking
+                // later application-data decryption. Drain it directly.
+                drain_into_client(&mut client, &server_outbound);
+            } else {
+                client_progress = client.feed(&server_outbound).expect("progress client");
+            }
+            if client_progress.complete && server_complete {
+                break;
+            }
+        }
+
+        assert!(
+            client_progress.complete,
+            "client handshake did not complete"
+        );
+        assert!(server_complete, "server handshake did not complete");
+        (client, server)
     }
 
     #[test]
@@ -563,5 +898,153 @@ mod tests {
                 maximum: 4096
             })
         ));
+    }
+
+    #[test]
+    fn round_trips_application_data_both_directions_after_handshake() {
+        let (mut client, mut server) = established_pair(64 * 1024);
+
+        let ciphertext = client
+            .encrypt_application_data(b"service discovery request")
+            .expect("client encrypt");
+        assert_ne!(ciphertext, b"service discovery request");
+        server.get_mut().feed(&ciphertext);
+        let mut received = vec![0_u8; 64];
+        let count = server.ssl_read(&mut received).expect("server decrypt");
+        assert_eq!(&received[..count], b"service discovery request");
+
+        server
+            .ssl_write(b"service discovery response")
+            .expect("server encrypt");
+        let server_ciphertext = server.get_mut().take_outbound();
+        let plaintext = client
+            .decrypt_application_data(&server_ciphertext)
+            .expect("client decrypt");
+        assert_eq!(plaintext, b"service discovery response");
+    }
+
+    #[test]
+    fn decrypt_handles_a_tls_record_split_across_two_calls() {
+        let (mut client, mut server) = established_pair(64 * 1024);
+
+        server.ssl_write(b"fragmented").expect("server encrypt");
+        let record = server.get_mut().take_outbound();
+        assert!(record.len() > 4, "test needs a splittable record");
+        let (first_half, second_half) = record.split_at(record.len() / 2);
+
+        let first_result = client
+            .decrypt_application_data(first_half)
+            .expect("feed first half");
+        assert!(
+            first_result.is_empty(),
+            "an incomplete record must not yield plaintext yet"
+        );
+
+        let second_result = client
+            .decrypt_application_data(second_half)
+            .expect("feed second half");
+        assert_eq!(second_result, b"fragmented");
+    }
+
+    #[test]
+    fn decrypt_returns_multiple_coalesced_records_from_one_call() {
+        let (mut client, mut server) = established_pair(64 * 1024);
+
+        server
+            .ssl_write(b"first-record")
+            .expect("server encrypt first");
+        server
+            .ssl_write(b"second-record")
+            .expect("server encrypt second");
+        let combined = server.get_mut().take_outbound();
+
+        let plaintext = client
+            .decrypt_application_data(&combined)
+            .expect("client decrypt combined");
+        assert_eq!(plaintext, b"first-recordsecond-record");
+    }
+
+    #[test]
+    fn rejects_invalid_ciphertext() {
+        let (mut client, _server) = established_pair(64 * 1024);
+        let garbage = vec![0xff_u8; 64];
+        assert!(matches!(
+            client.decrypt_application_data(&garbage),
+            Err(OpenSslTlsError::InvalidRecordData(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_application_data_before_handshake_completion() {
+        let (certificate, key) = credentials();
+        let mut client = OpenSslTlsClient::from_pem(
+            &certificate.to_pem().expect("certificate PEM"),
+            &key.private_key_to_pem_pkcs8().expect("private key PEM"),
+            64 * 1024,
+        )
+        .expect("client");
+
+        assert!(matches!(
+            client.encrypt_application_data(b"too early"),
+            Err(OpenSslTlsError::HandshakeNotComplete)
+        ));
+        assert!(matches!(
+            client.decrypt_application_data(b"too early"),
+            Err(OpenSslTlsError::HandshakeNotComplete)
+        ));
+
+        client.start().expect("start");
+        assert!(matches!(
+            client.encrypt_application_data(b"still mid-handshake"),
+            Err(OpenSslTlsError::HandshakeNotComplete)
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_application_data() {
+        let (mut client, _server) = established_pair(4096);
+        assert!(matches!(
+            client.encrypt_application_data(&vec![0; 4097]),
+            Err(OpenSslTlsError::InputTooLarge {
+                size: 4097,
+                maximum: 4096
+            })
+        ));
+        assert!(matches!(
+            client.decrypt_application_data(&vec![0; 4097]),
+            Err(OpenSslTlsError::InputTooLarge {
+                size: 4097,
+                maximum: 4096
+            })
+        ));
+    }
+
+    #[test]
+    fn reports_session_closed_after_peer_close_notify() {
+        let (mut client, mut server) = established_pair(64 * 1024);
+
+        let _ = server.shutdown();
+        let close_notify = server.get_mut().take_outbound();
+        assert!(!close_notify.is_empty(), "shutdown must emit close-notify");
+
+        assert!(matches!(
+            client.decrypt_application_data(&close_notify),
+            Err(OpenSslTlsError::SessionClosed)
+        ));
+    }
+
+    #[test]
+    fn application_data_errors_never_contain_payload_bytes() {
+        let (mut client, _server) = established_pair(64 * 1024);
+        let secret_marker = "sk_live_super_secret_marker";
+        let garbage = format!("{secret_marker}-not-a-valid-tls-record").into_bytes();
+
+        let error = client
+            .decrypt_application_data(&garbage)
+            .expect_err("garbage must be rejected");
+        assert!(
+            !error.to_string().contains(secret_marker),
+            "error text must not echo back input bytes: {error}"
+        );
     }
 }

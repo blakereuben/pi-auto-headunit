@@ -575,6 +575,7 @@ name = "protocol-aap"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "security-openssl",
  "transport-api",
 ]
 

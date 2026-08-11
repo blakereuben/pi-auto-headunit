@@ -17,3 +17,6 @@ pub use linux::{
     CredentialSummary, EphemeralCredentials, OpenSslTlsClient, OpenSslTlsError, TlsVersionPolicy,
     generate_ephemeral_credentials, validate_credential_pair,
 };
+
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub use linux::TestServerTls;
