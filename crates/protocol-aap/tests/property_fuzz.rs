@@ -81,7 +81,7 @@ proptest! {
     }
 
     /// The summary never retains (and its Debug output never leaks) the
-    /// actual device name/brand text a phone supplied, for arbitrary
+    /// actual label text/device name a phone supplied, for arbitrary
     /// generated values — generalizing the fixed-input unit test in
     /// `service_discovery.rs`.
     #[test]
@@ -90,20 +90,20 @@ proptest! {
         // it cannot coincidentally collide with the short fixed vocabulary
         // (field names, "None"/"Some") or the 1-2 digit byte counts that
         // legitimately appear in the summary's own Debug output.
+        label_text in "[a-zA-Z]{8,64}",
         device_name in "[a-zA-Z]{8,64}",
-        device_brand in "[a-zA-Z]{8,64}",
     ) {
         let mut body = Vec::new();
-        push_length_delimited_field(&mut body, 4, device_name.as_bytes());
-        push_length_delimited_field(&mut body, 5, device_brand.as_bytes());
+        push_length_delimited_field(&mut body, 4, label_text.as_bytes());
+        push_length_delimited_field(&mut body, 5, device_name.as_bytes());
 
         let summary = summarize_service_discovery_request(&body, ServiceDiscoveryLimits::default())
             .expect("summarize");
+        prop_assert_eq!(summary.label_text_bytes, Some(label_text.len()));
         prop_assert_eq!(summary.device_name_bytes, Some(device_name.len()));
-        prop_assert_eq!(summary.device_brand_bytes, Some(device_brand.len()));
 
         let debug = format!("{summary:?}");
+        prop_assert!(!debug.contains(&label_text));
         prop_assert!(!debug.contains(&device_name));
-        prop_assert!(!debug.contains(&device_brand));
     }
 }

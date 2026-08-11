@@ -59,29 +59,38 @@ step.
 
 ## Status as of this note
 
-Working tree has uncommitted groundwork for the new probe, not yet verified
-on real Rust tooling (written from a sandbox with no Rust toolchain and no
-network access — logic was traced against existing compiling patterns in
-the repo, not compiled):
+Verified on native Pi 5 Rust tooling (fmt, check, strict clippy, full
+workspace test suite, secret-marker scan, ARM64 `.deb` packaging all pass):
+the fake in-memory transport (`crates/transport-api/src/fake.rs`), the
+fake-phone handshake integration test
+(`crates/protocol-aap/tests/fake_phone_transport.rs`), parser fuzz/property
+tests for untrusted phone input (`crates/protocol-aap/tests/property_fuzz.rs`),
+and the gated `auth-discovery-probe` CLI subcommand in
+`apps/aa-headunit-diagnostics` are implemented and committed.
 
-- `crates/protocol-aap/src/service_discovery.rs`: fixed a field-mapping bug
-  in `ServiceDiscoveryRequestSummary` — field 4 is `device_name_bytes` and
-  field 5 is `device_brand_bytes` (previously reversed/mislabeled as
-  `label_text_bytes`). Confirmed against the `aap_protobuf` schema.
-- `crates/transport-api/src/fake.rs` (new, behind the `test-support`
-  feature): a bounded in-memory duplex `SessionTransport` pair
-  (`fake::Transport` / `fake::Peer`) for deterministic scripted-peer tests,
-  with its own unit tests.
-- `crates/protocol-aap/tests/fake_phone_transport.rs` (new): an integration
-  test that drives the real frame codec + `MessageAssembler` +
-  `HandshakeStateMachine` over the fake transport against a scripted
-  deterministic phone (version accept → fake TLS → `AuthComplete` sent →
-  synthetic `ServiceDiscoveryRequest` → asserts only a bounded summary is
-  produced and nothing further is sent).
+`crates/protocol-aap/src/service_discovery.rs`'s `ServiceDiscoveryRequestSummary`
+field naming is now confirmed directly against the pinned primary AASDK
+source (`docs/protocol/aasdk-adoption.md`, revision `9bf6adf`): field 4 is
+`label_text_bytes` and field 5 is `device_name_bytes`. An earlier revision of
+this file incorrectly named them `device_name_bytes`/`device_brand_bytes`
+(sourced from a secondary reference instead of the pinned primary source);
+there is no `device_brand` field in the schema. This was a naming-only
+defect — the summarizer only ever recorded byte length and validated UTF-8,
+never the field's semantic name.
+
+The newer AASDK `Service`/`ServiceDiscoveryResponse` schema is now mapped
+field by field in `docs/protocol/aasdk-adoption.md` for the five service
+kinds the current catalogue models (sensor source, media sink, input
+source, media source, Bluetooth) and explicitly contrasted against
+OpenAuto's older `ChannelDescriptor` schema. The remaining eight nested
+service types and their leaf enum/config messages are recorded as not yet
+mapped. No `Service`/`ServiceDiscoveryResponse` Rust wire encoder exists;
+response encoding remains gated.
 
 **First step in a new session: run the verification commands above and
-report the actual results before writing any more code.** If everything is
-green, the next milestone step is the gated `auth-discovery-probe` CLI
-subcommand in `apps/aa-headunit-diagnostics`, reusing this logic against
-real USB/TCP transports behind an explicit `--allow-live-aap`-style opt-in,
-mirroring `credential-probe`'s pattern without modifying it.
+report the actual results before writing any more code.** The next M2
+milestone step is running the gated `auth-discovery-probe` CLI subcommand
+against a real phone over USB/TCP behind its explicit `--allow-live-aap`
+opt-in (implemented and Pi-verified only at the synthetic/unit level so
+far), followed by proving clean timeout, malformed-message, unplug, and
+reconnect recovery.

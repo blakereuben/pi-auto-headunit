@@ -153,12 +153,12 @@ fn print_summary(summary: &ServiceDiscoveryRequestSummary) {
         bytes(summary.large_icon_bytes)
     );
     println!(
-        "service_discovery_device_name_bytes={}",
-        bytes(summary.device_name_bytes)
+        "service_discovery_label_text_bytes={}",
+        bytes(summary.label_text_bytes)
     );
     println!(
-        "service_discovery_device_brand_bytes={}",
-        bytes(summary.device_brand_bytes)
+        "service_discovery_device_name_bytes={}",
+        bytes(summary.device_name_bytes)
     );
     println!(
         "service_discovery_phone_info_bytes={}",
