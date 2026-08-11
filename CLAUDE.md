@@ -116,11 +116,23 @@ AASDK source (`docs/protocol/aasdk-adoption.md`, "Encrypted-message
 framing"): the declared total is plaintext-domain, matching what the fix
 assumes.
 
+`usb auth-discovery-probe --device <bus:address> --allow-live-aap` has now
+been run on Pi 5 against a real phone (USB accessory transition, the phone
+re-enumerated as the documented Google AOA accessory ID) using the
+operator-authorised external identity, requiring `sudo` since
+`/etc/aa-headunit/credentials` is root-only (`0700`). It reached
+`probe_result=service_discovery_summary_received`: version negotiated, TLS
+handshake completed, `AuthComplete` sent, and — the specific behaviour this
+session's TLS application-data work targeted — the phone's real
+TLS-encrypted `ServiceDiscoveryRequest` was decrypted and reassembled
+(`probe_state=encrypted_frame_received`) into a bounded, byte-count-only
+summary. The probe stopped cleanly before any response or media setup, and
+the USB interface was released cleanly. The installed `/usr/bin/aa-headunit-diagnostics`
+package binary was stale (missing `auth-discovery-probe` entirely); the
+freshly built `target/release/aa-headunit-diagnostics` was used instead —
+worth re-installing the package before the next real-phone run.
+
 **First step in a new session: run the verification commands above and
 report the actual results before writing any more code.** The next M2
-milestone step is running the gated `auth-discovery-probe` CLI subcommand
-against a real phone over USB/TCP behind its explicit `--allow-live-aap`
-opt-in (implemented and Pi-verified only at the synthetic/unit/integration
-level so far, now including real encrypted post-handshake traffic — not
-yet against a real phone), followed by proving clean timeout,
-malformed-message, unplug, and reconnect recovery.
+milestone step is proving clean timeout, malformed-message, unplug, and
+reconnect recovery against a real phone — not yet attempted.
