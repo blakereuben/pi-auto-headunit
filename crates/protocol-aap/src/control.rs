@@ -30,6 +30,8 @@ pub enum ControlMessageId {
     AuthComplete,
     ServiceDiscoveryRequest,
     ServiceDiscoveryResponse,
+    ChannelOpenRequest,
+    ChannelOpenResponse,
     Unknown(u16),
 }
 
@@ -43,6 +45,8 @@ impl ControlMessageId {
             Self::AuthComplete => 4,
             Self::ServiceDiscoveryRequest => 5,
             Self::ServiceDiscoveryResponse => 6,
+            Self::ChannelOpenRequest => 7,
+            Self::ChannelOpenResponse => 8,
             Self::Unknown(value) => value,
         }
     }
@@ -55,6 +59,8 @@ impl ControlMessageId {
             4 => Self::AuthComplete,
             5 => Self::ServiceDiscoveryRequest,
             6 => Self::ServiceDiscoveryResponse,
+            7 => Self::ChannelOpenRequest,
+            8 => Self::ChannelOpenResponse,
             value => Self::Unknown(value),
         }
     }

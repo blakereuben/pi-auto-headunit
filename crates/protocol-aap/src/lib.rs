@@ -14,16 +14,28 @@
 use std::fmt;
 
 mod assembly;
+mod channel_open;
 mod control;
+mod media_message;
+mod protobuf;
 mod service_catalogue;
 mod service_discovery;
+mod service_discovery_response;
 mod tls;
+mod video_setup;
 
 pub use assembly::{AssemblyError, Message, MessageAssembler};
+pub use channel_open::{
+    ChannelOpenAction, ChannelOpenError, ChannelOpenEvent, ChannelOpenState,
+    ChannelOpenStateMachine,
+};
 pub use control::{
     AASDK_PROTOCOL_VERSION, CONTROL_CHANNEL_ID, ControlError, ControlMessage, ControlMessageId,
     DEFAULT_MAX_CONTROL_BODY_SIZE, DEFAULT_MAX_TLS_CHUNK_SIZE, HandshakeAction, HandshakeEvent,
     HandshakeState, HandshakeStateMachine, ProtocolVersion,
+};
+pub use media_message::{
+    DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE, MediaMessage, MediaMessageError, MediaMessageId,
 };
 pub use service_catalogue::{
     DEFAULT_MAX_SERVICE_CANDIDATES, ServiceAvailability, ServiceCandidate, ServiceCatalogue,
@@ -34,7 +46,14 @@ pub use service_discovery::{
     DEFAULT_MAX_SERVICE_DISCOVERY_SIZE, ServiceDiscoveryError, ServiceDiscoveryLimits,
     ServiceDiscoveryRequestSummary, summarize_service_discovery_request,
 };
+pub use service_discovery_response::{
+    ServiceCapabilities, ServiceDiscoveryResponseError, TouchCapability, TouchScreenType,
+    VideoCapability, VideoCodecResolution, VideoFrameRate, encode_service_discovery_response,
+};
 pub use tls::{TlsClient, TlsProgress};
+pub use video_setup::{
+    VideoSetupAction, VideoSetupError, VideoSetupEvent, VideoSetupState, VideoSetupStateMachine,
+};
 
 pub const AASDK_MAX_FRAME_PAYLOAD_SIZE: usize = 0x4000;
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
