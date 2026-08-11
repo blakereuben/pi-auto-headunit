@@ -11,6 +11,17 @@ use crate::{
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub const CONTROL_CHANNEL_ID: u8 = 0;
+/// Matches the pinned AASDK source's own `Version.hpp`
+/// (`AASDK_MAJOR`/`AASDK_MINOR`), confirmed unchanged even on that fork's
+/// current HEAD. A real phone accepted this and separately reported it is
+/// running protocol `1.7` (`probe_negotiated_version=1.7`,
+/// `HandshakeStateMachine::negotiated_version`); temporarily offering `1.7`
+/// here to test whether the version number itself was the cause of a
+/// real-phone "phone and car are running incompatible software" rejection
+/// made no observable difference, so that deviation was reverted — Android
+/// Auto's version negotiation is designed to be backward-compatible, and
+/// the evidence now points at a gap in this project's `ServiceDiscoveryResponse`
+/// content instead of the offered version number.
 pub const AASDK_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 6 };
 pub const DEFAULT_MAX_CONTROL_BODY_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MAX_TLS_CHUNK_SIZE: usize = 64 * 1024;

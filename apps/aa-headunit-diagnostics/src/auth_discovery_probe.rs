@@ -5,16 +5,34 @@
 //! (`live_probe.rs`, unmodified). Beyond that, this probe lets
 //! `HandshakeStateMachine::advance` run through to
 //! `ServiceDiscoveryRequest`, then goes further still: it builds and sends
-//! `ServiceDiscoveryResponse` (advertising exactly two channels — video and
-//! touch/input — see `protocol_aap::service_discovery_response`), then
-//! drives each channel's `ChannelOpenRequest`/`ChannelOpenResponse`
-//! handshake (`protocol_aap::channel_open`), then the video channel's
+//! `ServiceDiscoveryResponse` (advertising video, touch/input, and one
+//! experimental media-audio channel — see
+//! `protocol_aap::service_discovery_response`), then drives each channel's
+//! `ChannelOpenRequest`/`ChannelOpenResponse` handshake
+//! (`protocol_aap::channel_open`), then the video channel's
 //! `Setup`→`Config`→`Start` handshake (`protocol_aap::video_setup`). It
 //! stops the instant the video channel receives `Start` and the input
 //! channel has opened — no `MEDIA_MESSAGE_DATA` byte is ever parsed, no
 //! video decode/render/UI work happens here, and no other service kind is
 //! advertised. See the channel-setup design record for the full scope
 //! boundary and provenance trail.
+//!
+//! The media-audio channel (`AUDIO_CHANNEL_ID`) and the populated
+//! `HeadUnitInfo` are both experiments toward the same real-phone finding:
+//! Android Auto's "phone and car are running incompatible software"
+//! (Error 2) appears immediately after the phone receives
+//! `ServiceDiscoveryResponse`, before any `ChannelOpenRequest` arrives.
+//! Adding an audio channel didn't change the outcome, and neither did
+//! offering the phone's own reported protocol version (`1.7`, versus the
+//! pinned source's `1.6`) instead of the pinned value — ruling out a
+//! simple missing-service or version-number-mismatch cause (Android
+//! Auto's version negotiation is designed to be backward-compatible).
+//! `HeadUnitInfo` tests a different theory: the response never identifies
+//! the head unit at all, which may fail an app-level check distinct from
+//! the wire schema itself. The audio channel is driven only to
+//! `ChannelOpenState::Open` — no audio `Setup`/`Config`/`Start` handshake
+//! exists yet; that is separate follow-on scope once a hypothesis is
+//! confirmed.
 //!
 //! Once TLS completes, a real phone sends `AuthComplete`/
 //! `ServiceDiscoveryRequest` as TLS-encrypted application data at the AAP
@@ -35,10 +53,11 @@
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{
-    AASDK_MAX_FRAME_PAYLOAD_SIZE, ChannelOpenAction, ChannelOpenEvent, ChannelOpenStateMachine,
-    ControlMessage, DEFAULT_MAX_CONTROL_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
+    AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioStreamType, ChannelOpenAction,
+    ChannelOpenEvent, ChannelOpenState, ChannelOpenStateMachine, ControlMessage,
+    DEFAULT_MAX_CONTROL_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
     DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption, FrameError, FrameHeader, FrameType,
-    HandshakeAction, HandshakeEvent, HandshakeState, HandshakeStateMachine, Message,
+    HandshakeAction, HandshakeEvent, HandshakeState, HandshakeStateMachine, HeadUnitInfo, Message,
     MessageAssembler, MessageType, ProtocolLimits, ServiceAvailability, ServiceCandidate,
     ServiceCapabilities, ServiceCatalogue, ServiceDiscoveryRequestSummary, ServiceKind, TlsClient,
     TlsProgress, TouchCapability, TouchScreenType, VideoCapability, VideoCodecResolution,
@@ -60,6 +79,11 @@ const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
 /// protocol-mandated).
 const VIDEO_CHANNEL_ID: u8 = 1;
 const INPUT_CHANNEL_ID: u8 = 2;
+/// Experimental: advertised to test whether a real phone's "phone and car
+/// are running incompatible software" (Error 2) rejection is caused by
+/// advertising no audio service at all. Driven only to `ChannelOpenState::Open`
+/// this pass — no audio Setup/Config/Start handshake exists yet.
+const AUDIO_CHANNEL_ID: u8 = 3;
 /// The Pi 5 reference display: the official 7-inch DSI touchscreen,
 /// matching the 800x480/30fps baseline already selected in
 /// `ARCHITECTURE.md`/M3.
@@ -131,6 +155,7 @@ pub fn run<T: SessionTransport>(
 
     let mut video_channel: Option<VideoChannel> = None;
     let mut input_channel: Option<InputChannel> = None;
+    let mut audio_channel: Option<ChannelOpenStateMachine> = None;
 
     while Instant::now() < deadline {
         let size = match transport.receive(&mut read_buffer) {
@@ -163,6 +188,7 @@ pub fn run<T: SessionTransport>(
                 &mut handshake,
                 &mut video_channel,
                 &mut input_channel,
+                &mut audio_channel,
                 &mut tls,
                 transport,
                 limits,
@@ -190,6 +216,7 @@ fn handle_message<T: SessionTransport>(
     handshake: &mut HandshakeStateMachine,
     video_channel: &mut Option<VideoChannel>,
     input_channel: &mut Option<InputChannel>,
+    audio_channel: &mut Option<ChannelOpenStateMachine>,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
@@ -206,6 +233,7 @@ fn handle_message<T: SessionTransport>(
             *input_channel = Some(InputChannel::AwaitingOpen(ChannelOpenStateMachine::new(
                 INPUT_CHANNEL_ID,
             )));
+            *audio_channel = Some(ChannelOpenStateMachine::new(AUDIO_CHANNEL_ID));
         }
         return Ok(false);
     }
@@ -214,6 +242,8 @@ fn handle_message<T: SessionTransport>(
         handle_video_channel_message(message, video_channel, tls, transport, limits)?;
     } else if message.channel_id == INPUT_CHANNEL_ID {
         handle_input_channel_message(message, input_channel, tls, transport, limits)?;
+    } else if message.channel_id == AUDIO_CHANNEL_ID {
+        handle_audio_channel_message(message, audio_channel, tls, transport, limits)?;
     } else {
         return Err(CliError::Protocol(format!(
             "message on unadvertised channel {}",
@@ -225,10 +255,11 @@ fn handle_message<T: SessionTransport>(
         && matches!(input_channel, Some(InputChannel::Open)))
 }
 
-/// Builds and sends `ServiceDiscoveryResponse`, advertising exactly two
-/// channels (video, input/touch) with head-unit-chosen capability data —
-/// not phone-derived, so safe to construct without any privacy concern
-/// (unlike `ServiceDiscoveryRequestSummary`).
+/// Builds and sends `ServiceDiscoveryResponse`, advertising video,
+/// input/touch, and (experimentally — see `AUDIO_CHANNEL_ID`) one
+/// media-audio channel, with head-unit-chosen capability data — not
+/// phone-derived, so safe to construct without any privacy concern (unlike
+/// `ServiceDiscoveryRequestSummary`).
 fn send_service_discovery_response<T: SessionTransport>(
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
@@ -246,6 +277,11 @@ fn send_service_discovery_response<T: SessionTransport>(
                 kind: ServiceKind::Input,
                 availability: ServiceAvailability::Ready,
             },
+            ServiceCandidate {
+                channel_id: AUDIO_CHANNEL_ID,
+                kind: ServiceKind::MediaAudio,
+                availability: ServiceAvailability::Ready,
+            },
         ],
         DEFAULT_MAX_SERVICE_CANDIDATES,
     )
@@ -259,6 +295,22 @@ fn send_service_discovery_response<T: SessionTransport>(
             width: REFERENCE_DISPLAY_WIDTH,
             height: REFERENCE_DISPLAY_HEIGHT,
             touch_type: TouchScreenType::Capacitive,
+        }),
+        media_audio: Some(AudioCapability {
+            sampling_rate: 48_000,
+            number_of_bits: 16,
+            number_of_channels: 2,
+            stream_type: AudioStreamType::Media,
+        }),
+        head_unit_info: Some(HeadUnitInfo {
+            make: "pi-auto-headunit".into(),
+            model: "aa-headunit-diagnostics".into(),
+            year: "2026".into(),
+            vehicle_id: "dev-probe".into(),
+            head_unit_make: "pi-auto-headunit".into(),
+            head_unit_model: "aa-headunit-diagnostics".into(),
+            head_unit_software_build: env!("CARGO_PKG_VERSION").into(),
+            head_unit_software_version: env!("CARGO_PKG_VERSION").into(),
         }),
     };
     let response = encode_service_discovery_response(&catalogue, &capabilities)
@@ -400,6 +452,51 @@ fn handle_input_channel_message<T: SessionTransport>(
             "unexpected message on input channel after open".into(),
         )),
     }
+}
+
+/// Drives the experimental audio channel's `ChannelOpenStateMachine` only —
+/// no wrapper enum, since (unlike video/input) there is no further state to
+/// track this pass: no audio Setup/Config/Start handshake exists yet. See
+/// `AUDIO_CHANNEL_ID`.
+fn handle_audio_channel_message<T: SessionTransport>(
+    message: &Message,
+    audio_channel: &mut Option<ChannelOpenStateMachine>,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let machine = audio_channel.as_mut().ok_or_else(|| {
+        CliError::Protocol("audio channel message before ServiceDiscoveryResponse was sent".into())
+    })?;
+    if machine.state() != ChannelOpenState::AwaitingOpenRequest {
+        return Err(CliError::Protocol(
+            "unexpected message on audio channel after open".into(),
+        ));
+    }
+    if message.message_type != MessageType::Control {
+        return Err(CliError::Protocol(
+            "expected ChannelOpenRequest on audio channel".into(),
+        ));
+    }
+    let actions = machine
+        .advance(ChannelOpenEvent::InboundControl(&message.payload))
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    for action in actions {
+        let ChannelOpenAction::SendControl(response) = action;
+        let payload = response
+            .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+            .map_err(|error| CliError::Protocol(error.to_string()))?;
+        send_encrypted(
+            transport,
+            tls,
+            AUDIO_CHANNEL_ID,
+            MessageType::Control,
+            &payload,
+            limits,
+        )?;
+    }
+    println!("probe_state=audio_channel_open");
+    Ok(())
 }
 
 /// Encrypts `plaintext_payload` and sends it framed on `channel_id`.
@@ -551,6 +648,12 @@ fn process_actions<T: SessionTransport>(
             }
             HandshakeAction::StartTlsClient => {
                 println!("probe_state=version_accepted");
+                if let Some(version) = handshake.negotiated_version() {
+                    println!(
+                        "probe_negotiated_version={}.{}",
+                        version.major, version.minor
+                    );
+                }
                 let progress = tls
                     .start()
                     .map_err(|error| CliError::Protocol(error.to_string()))?;

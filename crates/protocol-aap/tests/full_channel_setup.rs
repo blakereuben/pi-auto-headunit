@@ -227,6 +227,8 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
             height: 480,
             touch_type: TouchScreenType::Capacitive,
         }),
+        media_audio: None,
+        head_unit_info: None,
     };
     let response =
         encode_service_discovery_response(&catalogue, &capabilities).expect("encode response");

@@ -47,8 +47,9 @@ pub use service_discovery::{
     ServiceDiscoveryRequestSummary, summarize_service_discovery_request,
 };
 pub use service_discovery_response::{
-    ServiceCapabilities, ServiceDiscoveryResponseError, TouchCapability, TouchScreenType,
-    VideoCapability, VideoCodecResolution, VideoFrameRate, encode_service_discovery_response,
+    AudioCapability, AudioStreamType, HeadUnitInfo, ServiceCapabilities,
+    ServiceDiscoveryResponseError, TouchCapability, TouchScreenType, VideoCapability,
+    VideoCodecResolution, VideoFrameRate, encode_service_discovery_response,
 };
 pub use tls::{TlsClient, TlsProgress};
 pub use video_setup::{

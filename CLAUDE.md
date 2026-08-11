@@ -162,20 +162,38 @@ installed `/usr/bin/aa-headunit-diagnostics` package is current and
 includes `auth-discovery-probe`, so either it or a freshly built
 `target/release/aa-headunit-diagnostics` works.
 
-**This is a natural stopping point.** Every M2 checklist item tied to the
-gated `auth-discovery-probe` — implementation, real-phone service-discovery
-summary, encrypted post-handshake traffic, and clean
-timeout/malformed/unplug/reconnect recovery — is now `[x]` and Pi-verified
-against a real phone. What remains open in M2 is a materially different
-and larger scope, not a continuation of this probe work: mapping the
-remaining eight `Service` nested types and their leaf enum/config messages
-in `docs/protocol/aasdk-adoption.md`, then adding the actual
-`ServiceDiscoveryResponse` Rust wire encoder (currently gated/absent
-entirely), plus defining cooperative tree-wide cancellation (today only a
-wall-clock deadline plus `Drop`-based release, per `ARCHITECTURE.md` §6).
-That response-encoding work needs its own scoped design pass before any
-code — it's the point where the probe stops being read-only and this
-project starts building the parts of a real Android Auto session (channel
-setup, then eventually media). **First step in a new session: run the
-verification commands above and report the actual results before writing
-any more code.**
+Since the note above, the remaining `Service`/`ServiceDiscoveryResponse`
+schema mapping (all 13 nested kinds, every leaf enum/config message, and
+`DriverPosition`/`ConnectionConfiguration`/`HeadUnitInfo`) was completed in
+`docs/protocol/aasdk-adoption.md`, and a full implementation was built on
+top of it, scoped to `Video`/`Input`/`MediaAudio`:
+`crates/protocol-aap/src/{protobuf,service_discovery_response,channel_open,
+media_message,video_setup}.rs`, wired into `auth-discovery-probe`
+(`apps/aa-headunit-diagnostics/src/auth_discovery_probe.rs`). This sends
+`ServiceDiscoveryResponse` the instant the phone's request summary is
+received, drives `ChannelOpenRequest`/`ChannelOpenResponse` for all three
+channels, and drives the video channel through `Setup`→`Config`→`Start`.
+It's proven correct end to end with real TLS crypto and real frame
+reassembly across three concurrently-fragmenting channels
+(`crates/protocol-aap/tests/full_channel_setup.rs`), and the frame codec,
+message assembler, and every new state machine have their own unit tests.
+
+**This is blocked on real hardware, not a natural stopping point.** Running
+`usb auth-discovery-probe --allow-live-aap` against a real phone reaches
+`probe_state=service_discovery_response_sent` cleanly (TLS-encrypted, no
+local error) and then the phone shows Android Auto's **"Error 2: phone and
+car are running incompatible software"** — no `ChannelOpenRequest` ever
+arrives. Three independent, minimal, reversible hypotheses were tested
+against the real phone and each refuted: a missing audio service, the
+offered protocol version (the phone negotiates `1.7`, undocumented in any
+known open-source AASDK fork — offering `1.7` instead of the pinned `1.6`
+made no difference and was reverted), and missing head-unit identity
+(`HeadUnitInfo`, now populated and kept). The `MediaAudio` channel and
+`HeadUnitInfo` both remain in the code as genuine completeness
+improvements, independent of the fact neither alone fixed Error 2.
+
+Full investigation writeup, confirmed facts, what's ruled out, what isn't,
+and research leads for whoever picks this up:
+**`docs/protocol/error-2-investigation.md`**. **First step in a new
+session: read that file, then run the verification commands above and
+report the actual results before writing any more code.**

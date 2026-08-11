@@ -150,6 +150,14 @@ pub(crate) fn write_length_delimited_field(out: &mut Vec<u8>, field: u32, bytes:
     out.extend_from_slice(bytes);
 }
 
+/// Writes a proto2 `uint32`/`uint64` field. Distinct from
+/// [`write_int32_field`]: unlike `int32`/enum, unsigned fields never
+/// sign-extend, so this is a pure (lossless) widening cast.
+pub(crate) fn write_uint32_field(out: &mut Vec<u8>, field: u32, value: u32) {
+    write_tag(out, field, 0);
+    write_varint(out, u64::from(value));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +308,17 @@ mod tests {
         let mut out = Vec::new();
         write_int32_field(&mut out, 1, 0);
         assert_eq!(out, vec![0x08, 0x00]);
+    }
+
+    #[test]
+    fn write_uint32_field_matches_hand_computed_bytes_and_round_trips() {
+        let mut out = Vec::new();
+        write_uint32_field(&mut out, 1, 48_000);
+        let mut cursor = 0;
+        let (field, wire_type) = read_tag::<TestError>(&out, &mut cursor).expect("tag");
+        assert_eq!((field, wire_type), (1, 0));
+        let value = read_varint::<TestError>(&out, &mut cursor).expect("value");
+        assert_eq!(value, 48_000);
     }
 
     #[test]
