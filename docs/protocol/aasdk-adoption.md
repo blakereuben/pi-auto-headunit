@@ -99,7 +99,7 @@ Field numbers, labels, and types below are read directly from the same pinned AA
 
 The first five nested per-kind messages were selected because they are the only ones with a corresponding `ServiceKind` in `crates/protocol-aap/src/service_catalogue.rs` today (`Sensors`, `Video`/`MediaAudio`/`SpeechAudio`/`SystemAudio`, `Input`, `Microphone`, `Bluetooth`). The remaining eight — `radio_service`, `navigation_status_service`, `media_playback_service`, `phone_status_service`, `media_browser_service`, `vendor_extension_service`, `generic_notification_service`, `wifi_projection_service` — have no corresponding `ServiceKind` yet; they are mapped below purely as a provenance record, ahead of any catalogue or encoder work that would consume them. None of these proto files carry a per-file licence/copyright header at the pinned revision — the same posture already recorded above for `ServiceDiscoveryRequest.proto` and the other already-adopted proto files in this document, which rely on the repository-wide GPL-3.0-or-later notices found in the adopted `.hpp`/`.cpp` files rather than a per-proto notice.
 
-**Not yet mapped**: every leaf enum/config message referenced below (`MediaCodecType`, `AudioStreamType`, `AudioConfiguration`, `VideoConfiguration`, `DisplayType`, `KeyCode`, `Sensor`, `FuelType`, `EvConnectorType`, `BluetoothPairingMethod`, `TouchScreenType`, `FeedbackEvent`, `RadioType`, `Range`, `RdsType`, `TrafficServiceType`, `ItuRegion`), plus `ServiceDiscoveryResponse`'s non-deprecated `DriverPosition`, `ConnectionConfiguration`, and `HeadUnitInfo` messages. These must each be mapped and recorded here before any encoder reads or writes them.
+**Not yet mapped**: `ServiceDiscoveryResponse`'s non-deprecated `DriverPosition`, `ConnectionConfiguration`, and `HeadUnitInfo` messages, plus a further tier of leaf types discovered while mapping the leaf enum/config messages below but not themselves requested by any already-mapped type's immediate field list — `SensorType` is now mapped (it was the sole field of `Sensor`, so mapping `Sensor` meaningfully required it), as are `VideoFrameRateType` and `VideoCodecResolutionType` (both trivial one-hop enums needed to make `VideoConfiguration` meaningful); `UiConfig` (referenced by `VideoConfiguration`, itself referencing `UiTheme` and `Insets`) is deliberately left unmapped as the next recursion boundary. These must each be mapped and recorded here before any encoder reads or writes them.
 
 ### `Service` (`aap_protobuf.service.Service`, proto2)
 
@@ -149,23 +149,23 @@ Field 12 is genuinely absent upstream (the sequence skips from 11 to 13); this i
 
 | # | Name | Label | Type |
 |---|---|---|---|
-| 1 | `sensors` | repeated | `message.Sensor` (not yet mapped) |
+| 1 | `sensors` | repeated | `message.Sensor` (mapped below) |
 | 2 | `location_characterization` | optional | `uint32` |
-| 3 | `supported_fuel_types` | repeated | `message.FuelType` enum (not yet mapped) |
-| 4 | `supported_ev_connector_types` | repeated | `message.EvConnectorType` enum (not yet mapped) |
+| 3 | `supported_fuel_types` | repeated | `message.FuelType` enum (mapped below) |
+| 4 | `supported_ev_connector_types` | repeated | `message.EvConnectorType` enum (mapped below) |
 
 ### `MediaSinkService` (`aap_protobuf.service.media.sink.MediaSinkService`, proto2)
 
 | # | Name | Label | Type |
 |---|---|---|---|
-| 1 | `available_type` | optional | `shared.message.MediaCodecType` enum, default `MEDIA_CODEC_AUDIO_PCM` (not yet mapped) |
-| 2 | `audio_type` | optional | `message.AudioStreamType` enum (not yet mapped) |
-| 3 | `audio_configs` | repeated | `shared.message.AudioConfiguration` (not yet mapped) |
-| 4 | `video_configs` | repeated | `message.VideoConfiguration` (not yet mapped) |
+| 1 | `available_type` | optional | `shared.message.MediaCodecType` enum, default `MEDIA_CODEC_AUDIO_PCM` (mapped below) |
+| 2 | `audio_type` | optional | `message.AudioStreamType` enum (mapped below) |
+| 3 | `audio_configs` | repeated | `shared.message.AudioConfiguration` (mapped below) |
+| 4 | `video_configs` | repeated | `message.VideoConfiguration` (mapped below) |
 | 5 | `available_while_in_call` | optional | `bool` |
 | 6 | `display_id` | optional | `uint32` |
-| 7 | `display_type` | optional | `message.DisplayType` enum (not yet mapped) |
-| 8 | `initial_content_keycode` | optional | `message.KeyCode` enum (not yet mapped) |
+| 7 | `display_type` | optional | `message.DisplayType` enum (mapped below) |
+| 8 | `initial_content_keycode` | optional | `message.KeyCode` enum (mapped below) |
 
 ### `InputSourceService` (`aap_protobuf.service.inputsource.InputSourceService`, proto2)
 
@@ -174,7 +174,7 @@ Field 12 is genuinely absent upstream (the sequence skips from 11 to 13); this i
 | 1 | `keycodes_supported` | repeated, packed | `int32` |
 | 2 | `touchscreen` | repeated | nested `TouchScreen` (below) |
 | 3 | `touchpad` | repeated | nested `TouchPad` (below) |
-| 4 | `feedback_events_supported` | repeated | `message.FeedbackEvent` enum (not yet mapped) |
+| 4 | `feedback_events_supported` | repeated | `message.FeedbackEvent` enum (mapped below) |
 | 5 | `display_id` | optional | `uint32` |
 
 Nested `InputSourceService.TouchScreen`:
@@ -183,7 +183,7 @@ Nested `InputSourceService.TouchScreen`:
 |---|---|---|---|
 | 1 | `width` | required | `int32` |
 | 2 | `height` | required | `int32` |
-| 3 | `type` | optional | `message.TouchScreenType` enum (not yet mapped) |
+| 3 | `type` | optional | `message.TouchScreenType` enum (mapped below) |
 | 4 | `is_secondary` | optional | `bool` |
 
 Nested `InputSourceService.TouchPad`:
@@ -203,8 +203,8 @@ Nested `InputSourceService.TouchPad`:
 
 | # | Name | Label | Type |
 |---|---|---|---|
-| 1 | `available_type` | optional | `media.shared.message.MediaCodecType` enum, default `MEDIA_CODEC_AUDIO_PCM` (not yet mapped) |
-| 2 | `audio_config` | optional | `media.shared.message.AudioConfiguration` (not yet mapped) |
+| 1 | `available_type` | optional | `media.shared.message.MediaCodecType` enum, default `MEDIA_CODEC_AUDIO_PCM` (mapped below) |
+| 2 | `audio_config` | optional | `media.shared.message.AudioConfiguration` (mapped below) |
 | 3 | `available_while_in_call` | optional | `bool` |
 
 ### `BluetoothService` (`aap_protobuf.service.bluetooth.BluetoothService`, proto2)
@@ -212,7 +212,7 @@ Nested `InputSourceService.TouchPad`:
 | # | Name | Label | Type |
 |---|---|---|---|
 | 1 | `car_address` | required | `string` |
-| 2 | `supported_pairing_methods` | repeated, packed | `message.BluetoothPairingMethod` enum (not yet mapped) |
+| 2 | `supported_pairing_methods` | repeated, packed | `message.BluetoothPairingMethod` enum (mapped below) |
 
 ### `RadioService` (`aap_protobuf.service.radio.RadioService`, proto2)
 
@@ -225,16 +225,16 @@ Nested `RadioProperties` (`aap_protobuf.service.radio.message.RadioProperties`, 
 | # | Name | Label | Type |
 |---|---|---|---|
 | 1 | `radio_id` | required | `int32` |
-| 2 | `type` | required | `message.RadioType` enum (not yet mapped) |
-| 3 | `channel_range` | repeated | `message.Range` (not yet mapped) |
+| 2 | `type` | required | `message.RadioType` enum (mapped below) |
+| 3 | `channel_range` | repeated | `message.Range` (mapped below) |
 | 4 | `channel_spacings` | repeated | `int32` |
 | 5 | `channel_spacing` | required | `int32` |
 | 6 | `background_tuner` | optional | `bool` |
-| 7 | `region` | optional | `message.ItuRegion` enum (not yet mapped) |
-| 8 | `rds` | optional | `message.RdsType` enum (not yet mapped) |
+| 7 | `region` | optional | `message.ItuRegion` enum (mapped below) |
+| 8 | `rds` | optional | `message.RdsType` enum (mapped below) |
 | 9 | `af_switch` | optional | `bool` |
 | 10 | `ta` | optional | `bool` |
-| 11 | `traffic_service` | optional | `message.TrafficServiceType` enum (not yet mapped) |
+| 11 | `traffic_service` | optional | `message.TrafficServiceType` enum (mapped below) |
 | 12 | `audio_loopback` | optional | `bool` |
 | 13 | `mute_capability` | optional | `bool` |
 | 14 | `station_presets_access` | optional | `int32` |
@@ -288,6 +288,229 @@ Empty message — no fields, same bare-marker shape. Runtime payloads (`GenericN
 | # | Name | Label | Type |
 |---|---|---|---|
 | 1 | `car_wifi_bssid` | optional | `string` |
+
+### Leaf enum and config messages
+
+Every leaf type referenced as "not yet mapped" above is mapped here, read from its own proto file at the same pinned revision. None carry a per-file licence/copyright header, consistent with every other proto file cited in this section.
+
+`MediaCodecType` (`aap_protobuf.service.media.shared.message.MediaCodecType`, enum, `service/media/shared/message/MediaCodecType.proto`):
+
+| Value | Name |
+|---|---|
+| 1 | `MEDIA_CODEC_AUDIO_PCM` |
+| 2 | `MEDIA_CODEC_AUDIO_AAC_LC` |
+| 3 | `MEDIA_CODEC_VIDEO_H264_BP` |
+| 4 | `MEDIA_CODEC_AUDIO_AAC_LC_ADTS` |
+| 5 | `MEDIA_CODEC_VIDEO_VP9` |
+| 6 | `MEDIA_CODEC_VIDEO_AV1` |
+| 7 | `MEDIA_CODEC_VIDEO_H265` |
+
+`AudioStreamType` (`aap_protobuf.service.media.sink.message.AudioStreamType`, enum, `service/media/sink/message/AudioStreamType.proto`):
+
+| Value | Name |
+|---|---|
+| 1 | `AUDIO_STREAM_GUIDANCE` |
+| 2 | `AUDIO_STREAM_SYSTEM_AUDIO` |
+| 3 | `AUDIO_STREAM_MEDIA` |
+| 4 | `AUDIO_STREAM_TELEPHONY` |
+
+`AudioConfiguration` (`aap_protobuf.service.media.shared.message.AudioConfiguration`, proto2, `service/media/shared/message/AudioConfiguration.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `sampling_rate` | required | `uint32` |
+| 2 | `number_of_bits` | required | `uint32` |
+| 3 | `number_of_channels` | required | `uint32` |
+
+`VideoConfiguration` (`aap_protobuf.service.media.sink.message.VideoConfiguration`, proto2, `service/media/sink/message/VideoConfiguration.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `codec_resolution` | optional | `VideoCodecResolutionType` enum (mapped below) |
+| 2 | `frame_rate` | optional | `VideoFrameRateType` enum (mapped below) |
+| 3 | `width_margin` | optional | `uint32` |
+| 4 | `height_margin` | optional | `uint32` |
+| 5 | `density` | optional | `uint32` |
+| 6 | `decoder_additional_depth` | optional | `uint32` |
+| 7 | `viewing_distance` | optional | `uint32` |
+| 8 | `pixel_aspect_ratio_e4` | optional | `uint32` |
+| 9 | `real_density` | optional | `uint32` |
+| 10 | `video_codec_type` | optional | `shared.message.MediaCodecType` enum (mapped above) |
+| 11 | `ui_config` | optional | `shared.message.UiConfig` (not yet mapped) |
+
+`VideoCodecResolutionType` (`aap_protobuf.service.media.sink.message.VideoCodecResolutionType`, enum, `service/media/sink/message/VideoCodecResolutionType.proto`):
+
+| Value | Name |
+|---|---|
+| 1 | `VIDEO_800x480` |
+| 2 | `VIDEO_1280x720` |
+| 3 | `VIDEO_1920x1080` |
+| 4 | `VIDEO_2560x1440` |
+| 5 | `VIDEO_3840x2160` |
+| 6 | `VIDEO_720x1280` |
+| 7 | `VIDEO_1080x1920` |
+| 8 | `VIDEO_1440x2560` |
+| 9 | `VIDEO_2160x3840` |
+
+`VideoFrameRateType` (`aap_protobuf.service.media.sink.message.VideoFrameRateType`, enum, `service/media/sink/message/VideoFrameRateType.proto`):
+
+| Value | Name |
+|---|---|
+| 1 | `VIDEO_FPS_60` |
+| 2 | `VIDEO_FPS_30` |
+
+`DisplayType` (`aap_protobuf.service.media.sink.message.DisplayType`, enum, `service/media/sink/message/DisplayType.proto`):
+
+| Value | Name |
+|---|---|
+| 0 | `DISPLAY_TYPE_MAIN` |
+| 1 | `DISPLAY_TYPE_CLUSTER` |
+| 2 | `DISPLAY_TYPE_AUXILIARY` |
+
+`KeyCode` (`aap_protobuf.service.media.sink.message.KeyCode`, enum, `service/media/sink/message/KeyCode.proto`): a large enum (278 named values total) mirroring Android's `KeyEvent` key codes. The main contiguous block runs `KEYCODE_UNKNOWN = 0` through `KEYCODE_DPAD_DOWN_RIGHT = 271` (268 values), with values 264–267 genuinely absent upstream — the sequence skips from `KEYCODE_NAVIGATE_OUT = 263` straight to `KEYCODE_DPAD_UP_LEFT = 268` — not an omission in this record. A separate, non-contiguous block of ten car-specific/sentinel values sits at 65535–65544: `KEYCODE_SENTINEL`, `KEYCODE_ROTARY_CONTROLLER`, `KEYCODE_MEDIA`, `KEYCODE_NAVIGATION`, `KEYCODE_RADIO`, `KEYCODE_TEL`, `KEYCODE_PRIMARY_BUTTON`, `KEYCODE_SECONDARY_BUTTON`, `KEYCODE_TERTIARY_BUTTON`, `KEYCODE_TURN_CARD`. The full enumeration is not transcribed here; consult the pinned proto file directly for any value not named above.
+
+`Sensor` (`aap_protobuf.service.sensorsource.message.Sensor`, proto2, `service/sensorsource/message/Sensor.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `sensor_type` | required | `SensorType` enum (mapped below) |
+
+`SensorType` (`aap_protobuf.service.sensorsource.message.SensorType`, enum, `service/sensorsource/message/SensorType.proto`):
+
+| Value | Name |
+|---|---|
+| 1 | `SENSOR_LOCATION` |
+| 2 | `SENSOR_COMPASS` |
+| 3 | `SENSOR_SPEED` |
+| 4 | `SENSOR_RPM` |
+| 5 | `SENSOR_ODOMETER` |
+| 6 | `SENSOR_FUEL` |
+| 7 | `SENSOR_PARKING_BRAKE` |
+| 8 | `SENSOR_GEAR` |
+| 9 | `SENSOR_OBDII_DIAGNOSTIC_CODE` |
+| 10 | `SENSOR_NIGHT_MODE` |
+| 11 | `SENSOR_ENVIRONMENT_DATA` |
+| 12 | `SENSOR_HVAC_DATA` |
+| 13 | `SENSOR_DRIVING_STATUS_DATA` |
+| 14 | `SENSOR_DEAD_RECKONING_DATA` |
+| 15 | `SENSOR_PASSENGER_DATA` |
+| 16 | `SENSOR_DOOR_DATA` |
+| 17 | `SENSOR_LIGHT_DATA` |
+| 18 | `SENSOR_TIRE_PRESSURE_DATA` |
+| 19 | `SENSOR_ACCELEROMETER_DATA` |
+| 20 | `SENSOR_GYROSCOPE_DATA` |
+| 21 | `SENSOR_GPS_SATELLITE_DATA` |
+| 22 | `SENSOR_TOLL_CARD` |
+
+`FuelType` (`aap_protobuf.service.sensorsource.message.FuelType`, enum, `service/sensorsource/message/FuelType.proto`):
+
+| Value | Name |
+|---|---|
+| 0 | `FUEL_TYPE_UNKNOWN` |
+| 1 | `FUEL_TYPE_UNLEADED` |
+| 2 | `FUEL_TYPE_LEADED` |
+| 3 | `FUEL_TYPE_DIESEL_1` |
+| 4 | `FUEL_TYPE_DIESEL_2` |
+| 5 | `FUEL_TYPE_BIODIESEL` |
+| 6 | `FUEL_TYPE_E85` |
+| 7 | `FUEL_TYPE_LPG` |
+| 8 | `FUEL_TYPE_CNG` |
+| 9 | `FUEL_TYPE_LNG` |
+| 10 | `FUEL_TYPE_ELECTRIC` |
+| 11 | `FUEL_TYPE_HYDROGEN` |
+| 12 | `FUEL_TYPE_OTHER` |
+
+`EvConnectorType` (`aap_protobuf.service.sensorsource.message.EvConnectorType`, enum, `service/sensorsource/message/EvConnectorType.proto`):
+
+| Value | Name | Notes |
+|---|---|---|
+| 0 | `EV_CONNECTOR_TYPE_UNKNOWN` | |
+| 1 | `EV_CONNECTOR_TYPE_J1772` | |
+| 2 | `EV_CONNECTOR_TYPE_MENNEKES` | |
+| 3 | `EV_CONNECTOR_TYPE_CHADEMO` | |
+| 4 | `EV_CONNECTOR_TYPE_COMBO_1` | |
+| 5 | `EV_CONNECTOR_TYPE_COMBO_2` | |
+| 6 | `EV_CONNECTOR_TYPE_TESLA_ROADSTER` | `[deprecated = true]` upstream |
+| 7 | `EV_CONNECTOR_TYPE_TESLA_HPWC` | `[deprecated = true]` upstream |
+| 8 | `EV_CONNECTOR_TYPE_TESLA_SUPERCHARGER` | |
+| 9 | `EV_CONNECTOR_TYPE_GBT` | |
+| 101 | `EV_CONNECTOR_TYPE_OTHER` | non-contiguous jump from 9, genuinely upstream |
+
+`BluetoothPairingMethod` (`aap_protobuf.service.bluetooth.message.BluetoothPairingMethod`, enum, `service/bluetooth/message/BluetoothPairingMethod.proto`):
+
+| Value | Name |
+|---|---|
+| -1 | `BLUETOOTH_PAIRING_UNAVAILABLE` |
+| 1 | `BLUETOOTH_PAIRING_OOB` |
+| 2 | `BLUETOOTH_PAIRING_NUMERIC_COMPARISON` |
+| 3 | `BLUETOOTH_PAIRING_PASSKEY_ENTRY` |
+| 4 | `BLUETOOTH_PAIRING_PIN` |
+
+The only negative enum value seen anywhere in this document's mappings so far — proto2 permits this since the wire encoding is a plain varint (zigzag encoding does not apply to plain `enum` fields), but it means a naive unsigned-width Rust representation would be wrong for this one type specifically.
+
+`TouchScreenType` (`aap_protobuf.service.inputsource.message.TouchScreenType`, enum, `service/inputsource/message/TouchScreenType.proto`):
+
+| Value | Name |
+|---|---|
+| 1 | `CAPACITIVE` |
+| 2 | `RESISTIVE` |
+| 3 | `INFRARED` |
+
+`FeedbackEvent` (`aap_protobuf.service.inputsource.message.FeedbackEvent`, enum, `service/inputsource/message/FeedbackEvent.proto`):
+
+| Value | Name |
+|---|---|
+| 1 | `FEEDBACK_SELECT` |
+| 2 | `FEEDBACK_FOCUS_CHANGE` |
+| 3 | `FEEDBACK_DRAG_SELECT` |
+| 4 | `FEEDBACK_DRAG_START` |
+| 5 | `FEEDBACK_DRAG_END` |
+
+`RadioType` (`aap_protobuf.service.radio.message.RadioType`, enum, `service/radio/message/RadioType.proto`):
+
+| Value | Name |
+|---|---|
+| 0 | `AM_RADIO` |
+| 1 | `FM_RADIO` |
+| 2 | `AM_HD_RADIO` |
+| 3 | `FM_HD_RADIO` |
+| 4 | `DAB_RADIO` |
+| 5 | `XM_RADIO` |
+
+`Range` (`aap_protobuf.service.radio.message.Range`, proto2, `service/radio/message/Range.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `min` | required | `int32` |
+| 2 | `max` | required | `int32` |
+
+`RdsType` (`aap_protobuf.service.radio.message.RdsType`, enum, `service/radio/message/RdsType.proto`):
+
+| Value | Name |
+|---|---|
+| 0 | `NO_RDS` |
+| 1 | `RDS` |
+| 2 | `RBDS` |
+
+`TrafficServiceType` (`aap_protobuf.service.radio.message.TrafficServiceType`, enum, `service/radio/message/TrafficServiceType.proto`):
+
+| Value | Name |
+|---|---|
+| 0 | `NO_TRAFFIC_SERVICE` |
+| 1 | `TMC_TRAFFIC_SERVICE` |
+
+`ItuRegion` (`aap_protobuf.service.radio.ItuRegion`, enum, `service/radio/message/ItuRegion.proto`):
+
+| Value | Name |
+|---|---|
+| 0 | `RADIO_REGION_NONE` |
+| 1 | `RADIO_REGION_ITU_1` |
+| 2 | `RADIO_REGION_ITU_2` |
+| 3 | `RADIO_REGION_OIRT` |
+| 4 | `RADIO_REGION_JAPAN` |
+| 5 | `RADIO_REGION_KOREA` |
+
+Note the package deviation: `ItuRegion.proto` declares `package aap_protobuf.service.radio;` (one level shallower than every sibling file in the same `service/radio/message/` directory, which all declare `aap_protobuf.service.radio.message`) — its own file location and every other file's package agree with each other, only this one file's package statement is shallower than its directory would suggest. `RadioProperties.proto` refers to it as unqualified `ItuRegion`, which resolves correctly under proto2 scoping rules regardless of the package mismatch, but a Rust codegen path that derives module paths from directory structure rather than each file's own `package` statement would place this type incorrectly.
 
 ### Contrast against OpenAuto's older schema
 
