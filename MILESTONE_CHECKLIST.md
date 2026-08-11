@@ -51,9 +51,9 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Build and install the credential-aware ARM64 `.deb` on Pi 5; verify empty-package, missing, mismatched, valid synthetic, configured status, and non-overwrite states.
 - [x] Add an explicit live TLS bench probe using fresh in-memory credentials and a hard stop before authentication/service discovery.
 - [x] Pass native formatting, strict linting, and all 78 workspace tests after adding runtime credential loading and the bounded authorised-identity probe.
-- [ ] Identify an approved source for every required session/protocol behaviour.
+- [ ] Identify an approved source for every required session/protocol behaviour. Confirmed complete for the M2 boundary through receipt and parsing of `ServiceDiscoveryRequest` (`docs/protocol/m2-session-bounds.md` §1, cross-referencing `certainty-matrix.md`); remains open for `ServiceDiscoveryResponse` encoding, unmapped nested service schemas, media, and wireless.
 - [x] Record the licence and source-adoption decision in the architecture and protocol records.
-- [ ] Define message limits, timeouts, cancellation, and privacy-safe logging.
+- [ ] Define message limits, timeouts, cancellation, and privacy-safe logging. Message-size bounds, timeouts, and logging are catalogued and enforced through the `ServiceDiscoveryRequest` boundary (`docs/protocol/m2-session-bounds.md` §2, §3, §5); cancellation is explicitly not: the only mechanism today is a wall-clock deadline plus `Drop`-based resource release, not the cooperative tree-wide cancellation `ARCHITECTURE.md` §6 specifies for the future `app` layer (§4).
 - [x] Exclude OpenAuto/OpenAuto Pro/AASDK shared credentials and security bypasses from implementation and distribution.
 - [x] Add and Pi-verify the loopback-only TCP transport for the official developer-mode ADB-forwarded port 5277; the connection probe sends no protocol data.
 - [x] Validate the bounded session skeleton against the user-enabled Android Auto head-unit server: version 1.6 accepted and TLS peer data received, followed by error-7 identity rejection.
