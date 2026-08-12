@@ -5,34 +5,55 @@
 //! (`live_probe.rs`, unmodified). Beyond that, this probe lets
 //! `HandshakeStateMachine::advance` run through to
 //! `ServiceDiscoveryRequest`, then goes further still: it builds and sends
-//! `ServiceDiscoveryResponse` (advertising video, touch/input, and one
-//! experimental media-audio channel — see
-//! `protocol_aap::service_discovery_response`), then drives each channel's
+//! `ServiceDiscoveryResponse` advertising the full canonical eight-service
+//! set (video, touch/input, media/system/speech audio, sensors, Bluetooth,
+//! microphone — see `protocol_aap::service_discovery_response`), then
+//! handles `AudioFocusRequest`/`AudioFocusNotification` on the control
+//! channel (`protocol_aap::audio_focus`), then drives each channel's
 //! `ChannelOpenRequest`/`ChannelOpenResponse` handshake
 //! (`protocol_aap::channel_open`), then the video channel's
-//! `Setup`→`Config`→`Start` handshake (`protocol_aap::video_setup`). It
-//! stops the instant the video channel receives `Start` and the input
-//! channel has opened — no `MEDIA_MESSAGE_DATA` byte is ever parsed, no
-//! video decode/render/UI work happens here, and no other service kind is
-//! advertised. See the channel-setup design record for the full scope
-//! boundary and provenance trail.
+//! `Setup`→`Config`→`Start` handshake (`protocol_aap::video_setup`) and the
+//! input channel's `KeyBindingRequest`/`KeyBindingResponse` exchange
+//! (`protocol_aap::input_message`). It stops the instant the video channel
+//! receives `Start` and the input channel has opened — no
+//! `MEDIA_MESSAGE_DATA` byte is ever parsed, no video decode/render/UI work
+//! happens here, and none of the other six channels are driven past open.
+//! See the channel-setup design record for the full scope boundary and
+//! provenance trail.
 //!
-//! The media-audio channel (`AUDIO_CHANNEL_ID`) and the populated
-//! `HeadUnitInfo` are both experiments toward the same real-phone finding:
-//! Android Auto's "phone and car are running incompatible software"
-//! (Error 2) appears immediately after the phone receives
-//! `ServiceDiscoveryResponse`, before any `ChannelOpenRequest` arrives.
-//! Adding an audio channel didn't change the outcome, and neither did
-//! offering the phone's own reported protocol version (`1.7`, versus the
-//! pinned source's `1.6`) instead of the pinned value — ruling out a
-//! simple missing-service or version-number-mismatch cause (Android
-//! Auto's version negotiation is designed to be backward-compatible).
-//! `HeadUnitInfo` tests a different theory: the response never identifies
-//! the head unit at all, which may fail an app-level check distinct from
-//! the wire schema itself. The audio channel is driven only to
-//! `ChannelOpenState::Open` — no audio `Setup`/`Config`/`Start` handshake
-//! exists yet; that is separate follow-on scope once a hypothesis is
-//! confirmed.
+//! Every non-video channel, the populated `HeadUnitInfo`, `AudioFocusRequest`
+//! handling, and `KeyBindingRequest` handling are all experiments toward the
+//! same real-phone finding: Android Auto's "phone and car are running
+//! incompatible software" (Error 2). Advertising one audio channel, offering
+//! the phone's own reported protocol version (`1.7`, versus the pinned
+//! source's `1.6`), and populating `HeadUnitInfo` were each tried
+//! independently against the earliest form of this failure (appearing
+//! immediately after `ServiceDiscoveryResponse`, before any
+//! `ChannelOpenRequest` arrived) and each made no difference — ruling out a
+//! simple missing-service, version-number-mismatch, or missing-identity
+//! cause. Advertising the full canonical set instead — motivated directly by
+//! this project's own already-approved `OpenAuto` source
+//! (`ServiceFactory::create()`, revision `aa90412bf93b5a5078495ea85ac9270c6297d369`):
+//! it unconditionally constructs seven of these eight services (an eighth,
+//! `SpeechAudio`, is config-gated but on by default), not a curated subset —
+//! was the first change that altered real-phone behavior: the phone stopped
+//! rejecting `ServiceDiscoveryResponse` and progressed into the session,
+//! first requesting audio focus, then opening every channel and driving
+//! video through `Setup`→`Config`, then requesting key bindings on the input
+//! channel. Error 2 still appears at each new point reached (confirmed on
+//! the phone screen, not inferred from probe output), but the failure
+//! boundary keeps moving further into the session as each new message is
+//! handled — see `docs/protocol/error-2-investigation.md` for the full,
+//! still-open history. Every non-video channel besides input is driven only
+//! to `ChannelOpenState::Open` — no further handshake (sensor data,
+//! Bluetooth pairing, microphone capture, audio playback) exists yet; that
+//! is separate follow-on scope once a hypothesis is confirmed. The input
+//! channel's `KeyBindingRequest` is answered `KeycodeNotBound` for any
+//! non-empty request, matching this project's own `ServiceDiscoveryResponse`
+//! exactly (it advertises zero supported keycodes — no button hardware
+//! exists yet), mirroring `OpenAuto`'s `InputService::onBindingRequest`
+//! validation-against-declared-capability behavior rather than fabricating
+//! success.
 //!
 //! Once TLS completes, a real phone sends `AuthComplete`/
 //! `ServiceDiscoveryRequest` as TLS-encrypted application data at the AAP
@@ -53,19 +74,23 @@
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{
-    AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioStreamType, ChannelOpenAction,
-    ChannelOpenEvent, ChannelOpenState, ChannelOpenStateMachine, ControlMessage,
-    DEFAULT_MAX_CONTROL_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
+    AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
+    AudioStreamType, BluetoothCapability, ChannelOpenAction, ChannelOpenEvent, ChannelOpenState,
+    ChannelOpenStateMachine, ControlMessage, ControlMessageId, DEFAULT_MAX_CONTROL_BODY_SIZE,
+    DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
     DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption, FrameError, FrameHeader, FrameType,
-    HandshakeAction, HandshakeEvent, HandshakeState, HandshakeStateMachine, HeadUnitInfo, Message,
-    MessageAssembler, MessageType, ProtocolLimits, ServiceAvailability, ServiceCandidate,
+    HandshakeAction, HandshakeEvent, HandshakeState, HandshakeStateMachine, HeadUnitInfo,
+    InputMessage, InputMessageId, KeyBindingStatus, Message, MessageAssembler, MessageType,
+    MicrophoneCapability, ProtocolLimits, ServiceAvailability, ServiceCandidate,
     ServiceCapabilities, ServiceCatalogue, ServiceDiscoveryRequestSummary, ServiceKind, TlsClient,
     TlsProgress, TouchCapability, TouchScreenType, VideoCapability, VideoCodecResolution,
-    VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupStateMachine, decode_frame,
-    encode_frame, encode_service_discovery_response,
+    VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupStateMachine,
+    decode_audio_focus_request, decode_frame, decode_key_binding_request,
+    encode_audio_focus_notification, encode_frame, encode_key_binding_response,
+    encode_service_discovery_response,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use transport_api::{SessionTransport, TransportError};
 
@@ -79,16 +104,24 @@ const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
 /// protocol-mandated).
 const VIDEO_CHANNEL_ID: u8 = 1;
 const INPUT_CHANNEL_ID: u8 = 2;
-/// Experimental: advertised to test whether a real phone's "phone and car
-/// are running incompatible software" (Error 2) rejection is caused by
-/// advertising no audio service at all. Driven only to `ChannelOpenState::Open`
-/// this pass — no audio Setup/Config/Start handshake exists yet.
-const AUDIO_CHANNEL_ID: u8 = 3;
+const MEDIA_AUDIO_CHANNEL_ID: u8 = 3;
+const SYSTEM_AUDIO_CHANNEL_ID: u8 = 4;
+const SPEECH_AUDIO_CHANNEL_ID: u8 = 5;
+const SENSORS_CHANNEL_ID: u8 = 6;
+const BLUETOOTH_CHANNEL_ID: u8 = 7;
+const MICROPHONE_CHANNEL_ID: u8 = 8;
 /// The Pi 5 reference display: the official 7-inch DSI touchscreen,
 /// matching the 800x480/30fps baseline already selected in
 /// `ARCHITECTURE.md`/M3.
 const REFERENCE_DISPLAY_WIDTH: i32 = 800;
 const REFERENCE_DISPLAY_HEIGHT: i32 = 480;
+/// `OpenAuto`'s `ServiceFactory` defaults (`MediaAudioService`: 2ch/16-bit/48kHz;
+/// `SpeechAudioService`/`SystemAudioService`/`AudioInputService`: 1ch/16-bit/16kHz),
+/// not invented values.
+const MEDIA_AUDIO_SAMPLING_RATE: u32 = 48_000;
+const VOICE_AUDIO_SAMPLING_RATE: u32 = 16_000;
+const VOICE_AUDIO_BITS: u32 = 16;
+const VOICE_AUDIO_CHANNELS: u32 = 1;
 
 /// Per-channel progress for the video channel, driven once
 /// `ServiceDiscoveryResponse` has been sent.
@@ -96,14 +129,6 @@ enum VideoChannel {
     AwaitingOpen(ChannelOpenStateMachine),
     AwaitingSetup(VideoSetupStateMachine),
     Ready,
-}
-
-/// Per-channel progress for the input/touch channel. No setup handshake is
-/// needed beyond channel-open — confirmed from `InputSourceService.cpp`:
-/// touch/key events are head-unit→phone only.
-enum InputChannel {
-    AwaitingOpen(ChannelOpenStateMachine),
-    Open,
 }
 
 pub fn run<T: SessionTransport>(
@@ -154,8 +179,11 @@ pub fn run<T: SessionTransport>(
         MessageAssembler::new(3).map_err(|error| CliError::Protocol(error.to_string()))?;
 
     let mut video_channel: Option<VideoChannel> = None;
-    let mut input_channel: Option<InputChannel> = None;
-    let mut audio_channel: Option<ChannelOpenStateMachine> = None;
+    // Every channel that only ever needs to reach ChannelOpenState::Open —
+    // input/touch plus all six non-video channels this experiment adds.
+    // None until ServiceDiscoveryResponse is sent, then populated with one
+    // entry per advertised channel_id.
+    let mut simple_channels: HashMap<u8, ChannelOpenStateMachine> = HashMap::new();
 
     while Instant::now() < deadline {
         let size = match transport.receive(&mut read_buffer) {
@@ -187,8 +215,7 @@ pub fn run<T: SessionTransport>(
                 &message,
                 &mut handshake,
                 &mut video_channel,
-                &mut input_channel,
-                &mut audio_channel,
+                &mut simple_channels,
                 &mut tls,
                 transport,
                 limits,
@@ -215,14 +242,16 @@ fn handle_message<T: SessionTransport>(
     message: &Message,
     handshake: &mut HandshakeStateMachine,
     video_channel: &mut Option<VideoChannel>,
-    input_channel: &mut Option<InputChannel>,
-    audio_channel: &mut Option<ChannelOpenStateMachine>,
+    simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
 ) -> Result<bool, CliError> {
     if message.channel_id == 0 {
-        if let Some(summary) = handle_assembled_message(message, handshake, tls, transport, limits)?
+        if handshake.state() == HandshakeState::ServiceDiscoveryReceived {
+            handle_post_discovery_control_message(message, tls, transport, limits)?;
+        } else if let Some(summary) =
+            handle_assembled_message(message, handshake, tls, transport, limits)?
         {
             print_summary(&summary);
             println!("probe_result=service_discovery_summary_received");
@@ -230,42 +259,129 @@ fn handle_message<T: SessionTransport>(
             *video_channel = Some(VideoChannel::AwaitingOpen(ChannelOpenStateMachine::new(
                 VIDEO_CHANNEL_ID,
             )));
-            *input_channel = Some(InputChannel::AwaitingOpen(ChannelOpenStateMachine::new(
+            for channel_id in [
                 INPUT_CHANNEL_ID,
-            )));
-            *audio_channel = Some(ChannelOpenStateMachine::new(AUDIO_CHANNEL_ID));
+                MEDIA_AUDIO_CHANNEL_ID,
+                SYSTEM_AUDIO_CHANNEL_ID,
+                SPEECH_AUDIO_CHANNEL_ID,
+                SENSORS_CHANNEL_ID,
+                BLUETOOTH_CHANNEL_ID,
+                MICROPHONE_CHANNEL_ID,
+            ] {
+                simple_channels.insert(channel_id, ChannelOpenStateMachine::new(channel_id));
+            }
         }
         return Ok(false);
     }
 
     if message.channel_id == VIDEO_CHANNEL_ID {
         handle_video_channel_message(message, video_channel, tls, transport, limits)?;
-    } else if message.channel_id == INPUT_CHANNEL_ID {
-        handle_input_channel_message(message, input_channel, tls, transport, limits)?;
-    } else if message.channel_id == AUDIO_CHANNEL_ID {
-        handle_audio_channel_message(message, audio_channel, tls, transport, limits)?;
+    } else if message.channel_id == INPUT_CHANNEL_ID
+        && simple_channels
+            .get(&INPUT_CHANNEL_ID)
+            .is_some_and(|machine| machine.state() == ChannelOpenState::Open)
+    {
+        handle_input_channel_message(message, tls, transport, limits)?;
     } else {
-        return Err(CliError::Protocol(format!(
-            "message on unadvertised channel {}",
-            message.channel_id
-        )));
+        handle_simple_channel_message(
+            message.channel_id,
+            message,
+            simple_channels,
+            tls,
+            transport,
+            limits,
+        )?;
     }
 
-    Ok(matches!(video_channel, Some(VideoChannel::Ready))
-        && matches!(input_channel, Some(InputChannel::Open)))
+    let input_open = simple_channels
+        .get(&INPUT_CHANNEL_ID)
+        .is_some_and(|machine| machine.state() == ChannelOpenState::Open);
+    Ok(matches!(video_channel, Some(VideoChannel::Ready)) && input_open)
 }
 
-/// Builds and sends `ServiceDiscoveryResponse`, advertising video,
-/// input/touch, and (experimentally — see `AUDIO_CHANNEL_ID`) one
-/// media-audio channel, with head-unit-chosen capability data — not
-/// phone-derived, so safe to construct without any privacy concern (unlike
+/// Handles control-channel traffic that arrives after `HandshakeStateMachine`
+/// has already reached `ServiceDiscoveryReceived` (which has nothing further
+/// to do — see `docs/protocol/error-2-investigation.md`). Only
+/// `AudioFocusRequest` is handled; anything else fails closed with a clear,
+/// distinct error naming the unexpected message, so if the phone sends
+/// something new next, that's immediately visible rather than silently
+/// swallowed.
+fn handle_post_discovery_control_message<T: SessionTransport>(
+    message: &Message,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    if message.message_type != MessageType::Specific {
+        return Err(CliError::Protocol(
+            "unexpected control message type after service discovery".into(),
+        ));
+    }
+    let control_message = ControlMessage::decode(&message.payload, DEFAULT_MAX_CONTROL_BODY_SIZE)
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    match control_message.id {
+        ControlMessageId::AudioFocusRequest => {
+            let requested = decode_audio_focus_request(&control_message.body)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            println!("probe_state=audio_focus_requested");
+            println!("audio_focus_request_type={requested:?}");
+            let granted = grant_audio_focus(requested);
+            let response = encode_audio_focus_notification(granted);
+            let payload = response
+                .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits)?;
+            println!("probe_state=audio_focus_notification_sent");
+            Ok(())
+        }
+        other => Err(CliError::Protocol(format!(
+            "unexpected control message {other:?} after service discovery"
+        ))),
+    }
+}
+
+/// Placeholder audio-focus policy: grant exactly what's asked. This
+/// project has no real audio hardware/focus-arbitration pipeline yet (M3
+/// still open) — this is the simplest thing that answers honestly and
+/// keeps the session alive, not a claim about real Android Auto behavior
+/// (none is publicly documented — see the module doc comment).
+const fn grant_audio_focus(requested: AudioFocusRequestType) -> AudioFocusStateType {
+    match requested {
+        AudioFocusRequestType::Gain => AudioFocusStateType::Gain,
+        AudioFocusRequestType::GainTransient | AudioFocusRequestType::GainTransientMayDuck => {
+            AudioFocusStateType::GainTransient
+        }
+        AudioFocusRequestType::Release => AudioFocusStateType::Loss,
+    }
+}
+
+/// Builds and sends `ServiceDiscoveryResponse`, advertising all eight
+/// `ServiceKind`s (the full canonical set `OpenAuto`'s `ServiceFactory`
+/// unconditionally constructs — see the module doc comment) with
+/// head-unit-chosen capability data — not phone-derived, so safe to
+/// construct without any privacy concern (unlike
 /// `ServiceDiscoveryRequestSummary`).
 fn send_service_discovery_response<T: SessionTransport>(
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
 ) -> Result<(), CliError> {
-    let catalogue = ServiceCatalogue::build(
+    let catalogue = build_service_catalogue()?;
+    let capabilities = build_service_capabilities();
+    let response = encode_service_discovery_response(&catalogue, &capabilities)
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    let payload = response
+        .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits)?;
+    println!("probe_state=service_discovery_response_sent");
+    Ok(())
+}
+
+/// The full canonical eight-service set — see the module doc comment for
+/// why (`OpenAuto`'s `ServiceFactory` finding).
+fn build_service_catalogue() -> Result<ServiceCatalogue, CliError> {
+    ServiceCatalogue::build(
         &[
             ServiceCandidate {
                 channel_id: VIDEO_CHANNEL_ID,
@@ -278,15 +394,46 @@ fn send_service_discovery_response<T: SessionTransport>(
                 availability: ServiceAvailability::Ready,
             },
             ServiceCandidate {
-                channel_id: AUDIO_CHANNEL_ID,
+                channel_id: MEDIA_AUDIO_CHANNEL_ID,
                 kind: ServiceKind::MediaAudio,
+                availability: ServiceAvailability::Ready,
+            },
+            ServiceCandidate {
+                channel_id: SYSTEM_AUDIO_CHANNEL_ID,
+                kind: ServiceKind::SystemAudio,
+                availability: ServiceAvailability::Ready,
+            },
+            ServiceCandidate {
+                channel_id: SPEECH_AUDIO_CHANNEL_ID,
+                kind: ServiceKind::SpeechAudio,
+                availability: ServiceAvailability::Ready,
+            },
+            ServiceCandidate {
+                channel_id: SENSORS_CHANNEL_ID,
+                kind: ServiceKind::Sensors,
+                availability: ServiceAvailability::Ready,
+            },
+            ServiceCandidate {
+                channel_id: BLUETOOTH_CHANNEL_ID,
+                kind: ServiceKind::Bluetooth,
+                availability: ServiceAvailability::Ready,
+            },
+            ServiceCandidate {
+                channel_id: MICROPHONE_CHANNEL_ID,
+                kind: ServiceKind::Microphone,
                 availability: ServiceAvailability::Ready,
             },
         ],
         DEFAULT_MAX_SERVICE_CANDIDATES,
     )
-    .map_err(|error| CliError::Protocol(error.to_string()))?;
-    let capabilities = ServiceCapabilities {
+    .map_err(|error| CliError::Protocol(error.to_string()))
+}
+
+/// Head-unit-chosen capability data for every advertised service — not
+/// phone-derived, so safe to construct and log without any privacy
+/// concern (unlike `ServiceDiscoveryRequestSummary`).
+fn build_service_capabilities() -> ServiceCapabilities {
+    ServiceCapabilities {
         video: Some(VideoCapability {
             resolution: VideoCodecResolution::Video800x480,
             frame_rate: VideoFrameRate::Fps30,
@@ -297,10 +444,30 @@ fn send_service_discovery_response<T: SessionTransport>(
             touch_type: TouchScreenType::Capacitive,
         }),
         media_audio: Some(AudioCapability {
-            sampling_rate: 48_000,
-            number_of_bits: 16,
+            sampling_rate: MEDIA_AUDIO_SAMPLING_RATE,
+            number_of_bits: VOICE_AUDIO_BITS,
             number_of_channels: 2,
             stream_type: AudioStreamType::Media,
+        }),
+        system_audio: Some(AudioCapability {
+            sampling_rate: VOICE_AUDIO_SAMPLING_RATE,
+            number_of_bits: VOICE_AUDIO_BITS,
+            number_of_channels: VOICE_AUDIO_CHANNELS,
+            stream_type: AudioStreamType::SystemAudio,
+        }),
+        speech_audio: Some(AudioCapability {
+            sampling_rate: VOICE_AUDIO_SAMPLING_RATE,
+            number_of_bits: VOICE_AUDIO_BITS,
+            number_of_channels: VOICE_AUDIO_CHANNELS,
+            stream_type: AudioStreamType::Guidance,
+        }),
+        bluetooth: Some(BluetoothCapability {
+            car_address: "02:00:00:00:00:01".into(),
+        }),
+        microphone: Some(MicrophoneCapability {
+            sampling_rate: VOICE_AUDIO_SAMPLING_RATE,
+            number_of_bits: VOICE_AUDIO_BITS,
+            number_of_channels: VOICE_AUDIO_CHANNELS,
         }),
         head_unit_info: Some(HeadUnitInfo {
             make: "pi-auto-headunit".into(),
@@ -312,15 +479,7 @@ fn send_service_discovery_response<T: SessionTransport>(
             head_unit_software_build: env!("CARGO_PKG_VERSION").into(),
             head_unit_software_version: env!("CARGO_PKG_VERSION").into(),
         }),
-    };
-    let response = encode_service_discovery_response(&catalogue, &capabilities)
-        .map_err(|error| CliError::Protocol(error.to_string()))?;
-    let payload = response
-        .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
-        .map_err(|error| CliError::Protocol(error.to_string()))?;
-    send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits)?;
-    println!("probe_state=service_discovery_response_sent");
-    Ok(())
+    }
 }
 
 /// Drives the video channel's `ChannelOpenStateMachine` then
@@ -408,75 +567,32 @@ fn handle_video_channel_message<T: SessionTransport>(
     }
 }
 
-/// Drives the input/touch channel's `ChannelOpenStateMachine`. No further
-/// setup is needed once it opens — see the module doc comment.
-fn handle_input_channel_message<T: SessionTransport>(
+/// Drives one "advertise → open → nothing further" channel's
+/// `ChannelOpenStateMachine` — covers `Input` and all six new non-video
+/// channels this experiment adds. Generalizes what used to be two
+/// near-identical per-channel functions, since this shape now repeats
+/// seven times; `VideoChannel`'s `Setup`/`Config`/`Start` follow-through is
+/// genuinely different and stays separate.
+fn handle_simple_channel_message<T: SessionTransport>(
+    channel_id: u8,
     message: &Message,
-    input_channel: &mut Option<InputChannel>,
+    simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
 ) -> Result<(), CliError> {
-    let state = input_channel.as_mut().ok_or_else(|| {
-        CliError::Protocol("input channel message before ServiceDiscoveryResponse was sent".into())
-    })?;
-    match state {
-        InputChannel::AwaitingOpen(machine) => {
-            if message.message_type != MessageType::Control {
-                return Err(CliError::Protocol(
-                    "expected ChannelOpenRequest on input channel".into(),
-                ));
-            }
-            let actions = machine
-                .advance(ChannelOpenEvent::InboundControl(&message.payload))
-                .map_err(|error| CliError::Protocol(error.to_string()))?;
-            for action in actions {
-                let ChannelOpenAction::SendControl(response) = action;
-                let payload = response
-                    .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
-                    .map_err(|error| CliError::Protocol(error.to_string()))?;
-                send_encrypted(
-                    transport,
-                    tls,
-                    INPUT_CHANNEL_ID,
-                    MessageType::Control,
-                    &payload,
-                    limits,
-                )?;
-            }
-            println!("probe_state=input_channel_open");
-            *state = InputChannel::Open;
-            Ok(())
-        }
-        InputChannel::Open => Err(CliError::Protocol(
-            "unexpected message on input channel after open".into(),
-        )),
-    }
-}
-
-/// Drives the experimental audio channel's `ChannelOpenStateMachine` only —
-/// no wrapper enum, since (unlike video/input) there is no further state to
-/// track this pass: no audio Setup/Config/Start handshake exists yet. See
-/// `AUDIO_CHANNEL_ID`.
-fn handle_audio_channel_message<T: SessionTransport>(
-    message: &Message,
-    audio_channel: &mut Option<ChannelOpenStateMachine>,
-    tls: &mut OpenSslTlsClient,
-    transport: &mut T,
-    limits: ProtocolLimits,
-) -> Result<(), CliError> {
-    let machine = audio_channel.as_mut().ok_or_else(|| {
-        CliError::Protocol("audio channel message before ServiceDiscoveryResponse was sent".into())
+    let machine = simple_channels.get_mut(&channel_id).ok_or_else(|| {
+        CliError::Protocol(format!("message on unadvertised channel {channel_id}"))
     })?;
     if machine.state() != ChannelOpenState::AwaitingOpenRequest {
-        return Err(CliError::Protocol(
-            "unexpected message on audio channel after open".into(),
-        ));
+        return Err(CliError::Protocol(format!(
+            "unexpected message on channel {channel_id} after open"
+        )));
     }
     if message.message_type != MessageType::Control {
-        return Err(CliError::Protocol(
-            "expected ChannelOpenRequest on audio channel".into(),
-        ));
+        return Err(CliError::Protocol(format!(
+            "expected ChannelOpenRequest on channel {channel_id}"
+        )));
     }
     let actions = machine
         .advance(ChannelOpenEvent::InboundControl(&message.payload))
@@ -489,14 +605,75 @@ fn handle_audio_channel_message<T: SessionTransport>(
         send_encrypted(
             transport,
             tls,
-            AUDIO_CHANNEL_ID,
+            channel_id,
             MessageType::Control,
             &payload,
             limits,
         )?;
     }
-    println!("probe_state=audio_channel_open");
+    println!("probe_state=simple_channel_open channel_id={channel_id}");
     Ok(())
+}
+
+/// Handles Input-channel traffic that arrives once the channel has already
+/// reached `ChannelOpenState::Open`. Only `KeyBindingRequest` is handled;
+/// anything else fails closed with a clear, distinct error naming the
+/// unexpected message, matching `handle_post_discovery_control_message`'s
+/// posture.
+fn handle_input_channel_message<T: SessionTransport>(
+    message: &Message,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    if message.message_type != MessageType::Specific {
+        return Err(CliError::Protocol(
+            "unexpected message type on input channel after open".into(),
+        ));
+    }
+    let input_message = InputMessage::decode(&message.payload, DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE)
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    match input_message.id {
+        InputMessageId::KeyBindingRequest => {
+            let keycodes = decode_key_binding_request(&input_message.body)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            println!("probe_state=key_binding_requested");
+            println!("key_binding_requested_count={}", keycodes.len());
+            let status = evaluate_key_binding_request(&keycodes);
+            let response = encode_key_binding_response(status);
+            let payload = response
+                .encode(DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            send_encrypted(
+                transport,
+                tls,
+                INPUT_CHANNEL_ID,
+                MessageType::Specific,
+                &payload,
+                limits,
+            )?;
+            println!("probe_state=key_binding_response_sent");
+            println!("key_binding_response_status={status:?}");
+            Ok(())
+        }
+        other => Err(CliError::Protocol(format!(
+            "unexpected input message {other:?} after open"
+        ))),
+    }
+}
+
+/// This project's `ServiceDiscoveryResponse` advertises zero supported
+/// keycodes today (no button hardware wired up yet), so the only honest
+/// response is `KeycodeNotBound` for any non-empty request — matching that
+/// declared capability exactly, not a guess (mirrors `OpenAuto`'s
+/// `InputService::onBindingRequest` validation against its own advertised
+/// list). An empty request trivially has nothing unsupported in it.
+const fn evaluate_key_binding_request(keycodes: &[i32]) -> KeyBindingStatus {
+    if keycodes.is_empty() {
+        KeyBindingStatus::Success
+    } else {
+        KeyBindingStatus::KeycodeNotBound
+    }
 }
 
 /// Encrypts `plaintext_payload` and sends it framed on `channel_id`.

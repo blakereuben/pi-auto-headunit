@@ -1,29 +1,55 @@
 # Real-phone investigation: Android Auto "Error 2" after `ServiceDiscoveryResponse`
 
-## Status: open, unresolved. Three specific hypotheses tested and refuted.
+## Status: open, unresolved, but the failure boundary has moved substantially further into the session. Three early hypotheses tested and refuted; a fourth (advertising the full 8-service canonical set) produced real forward progress — the phone now opens every channel and reaches video `Config` — but Error 2 still appears, now triggered by a new, later, unhandled message.
 
-## Symptom
+## Current symptom (most recent real-phone run)
 
-Running `usb auth-discovery-probe --device <bus:address> --allow-live-aap` against a real phone reaches, reliably and repeatably:
+Running `usb auth-discovery-probe --device <bus:address> --allow-live-aap` against a real phone now reaches, reliably and repeatably:
 
 ```
-probe_state=version_accepted
 probe_negotiated_version=1.7
-probe_state=tls_peer_data_received
-probe_state=tls_peer_data_received
 probe_state=tls_handshake_complete
+probe_result=service_discovery_summary_received
+probe_state=service_discovery_response_sent
 probe_state=encrypted_frame_received
-service_discovery_small_icon_bytes=152
-...
+probe_state=audio_focus_requested
+audio_focus_request_type=Release
+probe_state=audio_focus_notification_sent
+probe_state=video_channel_open
+probe_state=simple_channel_open channel_id=2   # Input
+probe_state=simple_channel_open channel_id=3   # MediaAudio
+probe_state=simple_channel_open channel_id=4   # SystemAudio
+probe_state=simple_channel_open channel_id=5   # SpeechAudio
+probe_state=simple_channel_open channel_id=6   # Sensors
+probe_state=simple_channel_open channel_id=7   # Bluetooth
+probe_state=simple_channel_open channel_id=8   # Microphone
+probe_state=video_channel_setup_config_sent
+probe_state=encrypted_frame_received
+error=protocol probe: unexpected message on channel 2 after open
+```
+
+**Confirmed on the phone screen: still Error 2** ("Communication error 2 — the phone and the car are running incompatible software"), despite the probe now getting substantially further than in every earlier attempt recorded below. This means Error 2 is not a single fixed rejection point tied to one specific message — it re-appears at whatever point the session first does something the phone doesn't accept, and that point has now moved from "immediately after `ServiceDiscoveryResponse`" all the way to "after all 8 channels are open and video `Config` has been sent."
+
+**New failure boundary:** channel 2 (`Input`) receives a message after `ChannelOpenResponse` that the probe has no handler for — `ChannelOpenStateMachine` only models advertise→open, nothing past `Open`. This is expected: this project has never implemented anything past channel-open for non-video channels. Byte content of the unhandled message was not logged (no raw payloads, per this project's fail-closed instrumentation policy) — only that it arrived and on which channel.
+
+## What changed and why it mattered
+
+The prior three hypotheses (below) each produced **zero change** in behavior — the phone rejected `ServiceDiscoveryResponse` identically every time, which was itself a strong hint that the problem was structural rather than a single missing field. Externally-sourced research (AASDK/OpenAuto/LIVI all construct a complete, fixed 8-service `ServiceDiscoveryResponse` unconditionally, not a curated subset) was checked directly against this project's already-approved `OpenAuto` primary source (`ServiceFactory.cpp`) and confirmed: `ServiceFactory::create()` unconditionally constructs 7 of 8 canonical services, with the 8th config-gated but on by default.
+
+Implementing the full canonical set (`Video`, `Input`, `MediaAudio`, `SystemAudio`, `SpeechAudio`, `Sensors`, `Bluetooth`, `Microphone` — `crates/protocol-aap/src/service_discovery_response.rs`, generic `ChannelOpenStateMachine` reused per channel in `auth_discovery_probe.rs`) was the first change in this entire investigation that altered real-phone behavior: the phone stopped rejecting `ServiceDiscoveryResponse` and instead proceeded into the session, first sending a previously-unseen encrypted control message (`AudioFocusRequest`, control ID 18). Implementing and answering that (`crates/protocol-aap/src/audio_focus.rs`, `AudioFocusNotification` granting exactly what's asked — see that file's doc comments for full wire provenance against the pinned AASDK source) unblocked the phone further still: it proceeded to open all 8 channels and drive the video channel through `Setup`→`Config`.
+
+## Original symptom (earlier in this investigation, now superseded)
+
+Before the full-service-catalogue change, the probe reached only as far as:
+
+```
 probe_result=service_discovery_summary_received
 probe_state=service_discovery_response_sent
 probe_tls_state=SSL negotiation finished successfully
 error=protocol probe: auth/service-discovery/channel-setup probe timed out before completion
 ```
 
-The probe builds, TLS-encrypts, and sends `ServiceDiscoveryResponse` with **no local error** — encoding, encryption, and framing all succeed. The phone's screen shows **"Communication error 2 — the phone and the car are running incompatible software"** immediately after. No `ChannelOpenRequest` ever arrives on any channel within the 10s `PROBE_TIMEOUT`. The probe always fails closed cleanly (exit 19, no hang) and the USB interface always releases cleanly (`usb list` responsive immediately after).
-
-This is a **new** failure boundary — every prior real-phone milestone (version negotiation, TLS handshake, `ServiceDiscoveryRequest` receipt/summary) is unaffected and still works exactly as documented elsewhere in this repo. The failure is specifically: real phone rejects our `ServiceDiscoveryResponse`.
+with Error 2 on screen immediately after `ServiceDiscoveryResponse` was sent, and no `ChannelOpenRequest` ever arriving. The three hypotheses below were tested against *this* earlier boundary.
 
 ## Confirmed facts (from our own real-phone runs, not speculation)
 
@@ -60,14 +86,17 @@ Given three independent, content-varying experiments produced *identical* behavi
 
 ## What's still in place in the code (not reverted)
 
-- `ServiceKind::MediaAudio` channel, `AudioCapability`/`AudioStreamType` (`crates/protocol-aap/src/service_discovery_response.rs`), advertised via `AUDIO_CHANNEL_ID` in `auth_discovery_probe.rs`. Driven only to `ChannelOpenState::Open` — no audio `Setup`/`Config`/`Start` handshake exists.
-- `HeadUnitInfo` (same file), populated with fixed project-identifying strings in `auth_discovery_probe.rs`.
+- All 8 canonical services (`Video`, `Input`, `MediaAudio`, `SystemAudio`, `SpeechAudio`, `Sensors`, `Bluetooth`, `Microphone`) advertised in `ServiceDiscoveryResponse` (`crates/protocol-aap/src/service_discovery_response.rs`), each driven to `ChannelOpenState::Open` via `ChannelOpenStateMachine` in `auth_discovery_probe.rs`. Only `Video` goes further (`Setup`→`Config`→`Start` via `VideoSetupStateMachine`) — no other channel has any post-open handshake.
+- `AudioFocusRequest`/`AudioFocusNotification` handling (`crates/protocol-aap/src/audio_focus.rs`, `handle_post_discovery_control_message`/`grant_audio_focus` in `auth_discovery_probe.rs`) — grants exactly what's requested (placeholder policy, no real audio-focus arbitration exists yet).
+- `HeadUnitInfo` (`service_discovery_response.rs`), populated with fixed project-identifying strings in `auth_discovery_probe.rs`.
 - `probe_negotiated_version=<major>.<minor>` diagnostic print in `process_actions` (`auth_discovery_probe.rs`) — cheap, permanent, useful visibility into what the phone actually negotiates.
 - `AASDK_PROTOCOL_VERSION` is back to the pinned source's `1.6` (the `1.7` experiment was reverted).
 
 ## Suggested next steps for whoever picks this up
 
-1. Look for a newer/different open-source Android Auto receiver project (not necessarily AASDK-derived) that has demonstrably worked with a *current* phone, and diff its `ServiceDiscoveryResponse` construction against ours field-by-field.
-2. Consider whether a packet capture against a **known-working** current head unit (if one becomes available) could reveal what a real 1.7 response looks like, rather than continuing to guess at content changes.
-3. Re-check whether any AASDK fork has been updated since this investigation (2026-08-12) — the ecosystem may catch up.
-4. If continuing to experiment against real hardware, keep changes as minimal and independently reversible as the three tried here, and keep running the full verification sweep before each real-phone cycle.
+1. **Immediate next boundary:** figure out what message the phone sends on the `Input` channel (channel 2) right after it opens, and after video reaches `Config`. `ChannelOpenStateMachine` has no state past `Open` for any non-video channel; this is expected to need its own handler, same shape as the `AudioFocusRequest` work. Check the pinned AASDK source's `InputServiceChannel`/`InputChannel` message handling (`BindingRequest`? a report-capabilities style message?) before writing any code — same provenance discipline as every prior increment.
+2. Given the pattern so far (each unblocked boundary reveals exactly one more previously-unseen message type, and Error 2 keeps re-appearing at the new edge rather than disappearing), expect this to continue: handling the Input-channel message may well reveal a next message on another channel. Budget for several more minimal, reversible increments rather than expecting one fix to resolve it.
+3. Look for a newer/different open-source Android Auto receiver project (not necessarily AASDK-derived) that has demonstrably worked with a *current* phone, and diff its full post-service-discovery message sequence against ours.
+4. Consider whether a packet capture against a **known-working** current head unit (if one becomes available) could reveal the complete expected message sequence, rather than continuing to discover it one real-phone run at a time.
+5. Re-check whether any AASDK fork has been updated since this investigation (2026-08-12) — the ecosystem may catch up.
+6. If continuing to experiment against real hardware, keep changes as minimal and independently reversible as every increment so far, and keep running the full verification sweep before each real-phone cycle.

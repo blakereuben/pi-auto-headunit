@@ -142,6 +142,22 @@ pub struct HeadUnitInfo {
     pub head_unit_software_version: String,
 }
 
+/// `aap_protobuf.service.bluetooth.BluetoothService`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BluetoothCapability {
+    pub car_address: String,
+}
+
+/// `aap_protobuf.service.media.source.MediaSourceService` (the microphone
+/// role — a phone-to-head-unit audio source, distinct from the
+/// head-unit-to-phone `MediaSinkService` audio roles).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MicrophoneCapability {
+    pub sampling_rate: u32,
+    pub number_of_bits: u32,
+    pub number_of_channels: u32,
+}
+
 /// Capability data for the services [`encode_service_discovery_response`]
 /// knows how to encode. Kept separate from [`ServiceCatalogue`], which stays
 /// wire-neutral per `ARCHITECTURE.md` §4.
@@ -150,24 +166,21 @@ pub struct ServiceCapabilities {
     pub video: Option<VideoCapability>,
     pub touch: Option<TouchCapability>,
     pub media_audio: Option<AudioCapability>,
+    pub system_audio: Option<AudioCapability>,
+    pub speech_audio: Option<AudioCapability>,
+    pub bluetooth: Option<BluetoothCapability>,
+    pub microphone: Option<MicrophoneCapability>,
     pub head_unit_info: Option<HeadUnitInfo>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceDiscoveryResponseError {
-    UnsupportedServiceKind(ServiceKind),
     MissingCapability { channel_id: u8, kind: ServiceKind },
 }
 
 impl fmt::Display for ServiceDiscoveryResponseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedServiceKind(kind) => {
-                write!(
-                    formatter,
-                    "service discovery response encoding does not support {kind:?} yet"
-                )
-            }
             Self::MissingCapability { channel_id, kind } => write!(
                 formatter,
                 "channel {channel_id} advertises {kind:?} but no matching capability was supplied"
@@ -180,11 +193,9 @@ impl std::error::Error for ServiceDiscoveryResponseError {}
 
 /// Encodes a `ServiceDiscoveryResponse` control message advertising every
 /// `Ready` service in `catalogue`, using `capabilities` for the per-service
-/// payload. Only [`ServiceKind::Video`], [`ServiceKind::Input`], and
-/// [`ServiceKind::MediaAudio`] are supported; any other kind in the
-/// catalogue fails closed with
-/// [`ServiceDiscoveryResponseError::UnsupportedServiceKind`] rather than
-/// being silently dropped from the response.
+/// payload. All eight [`ServiceKind`] variants are supported; `ServiceKind`
+/// growing a ninth variant becomes a compile error here (the match is
+/// exhaustive over the enum, not a runtime fallback), which is deliberate.
 pub fn encode_service_discovery_response(
     catalogue: &ServiceCatalogue,
     capabilities: &ServiceCapabilities,
@@ -262,7 +273,44 @@ fn encode_service(
             // which of its own fields are populated.
             protobuf::write_length_delimited_field(&mut out, 3, &media_sink_service);
         }
-        other => return Err(ServiceDiscoveryResponseError::UnsupportedServiceKind(other)),
+        ServiceKind::SystemAudio => {
+            let capability = capabilities
+                .system_audio
+                .ok_or(ServiceDiscoveryResponseError::MissingCapability { channel_id, kind })?;
+            let media_sink_service = encode_media_sink_audio(capability);
+            protobuf::write_length_delimited_field(&mut out, 3, &media_sink_service);
+        }
+        ServiceKind::SpeechAudio => {
+            let capability = capabilities
+                .speech_audio
+                .ok_or(ServiceDiscoveryResponseError::MissingCapability { channel_id, kind })?;
+            let media_sink_service = encode_media_sink_audio(capability);
+            protobuf::write_length_delimited_field(&mut out, 3, &media_sink_service);
+        }
+        ServiceKind::Sensors => {
+            // Service.sensor_source_service (field 2). SensorSourceService's
+            // fields are all optional/repeated (docs/protocol/aasdk-adoption.md),
+            // so the empty message is a valid minimal entry — no capability
+            // data to configure.
+            protobuf::write_length_delimited_field(&mut out, 2, &[]);
+        }
+        ServiceKind::Bluetooth => {
+            let capability = capabilities
+                .bluetooth
+                .as_ref()
+                .ok_or(ServiceDiscoveryResponseError::MissingCapability { channel_id, kind })?;
+            let bluetooth_service = encode_bluetooth_service(capability);
+            // Service.bluetooth_service (field 6).
+            protobuf::write_length_delimited_field(&mut out, 6, &bluetooth_service);
+        }
+        ServiceKind::Microphone => {
+            let capability = capabilities
+                .microphone
+                .ok_or(ServiceDiscoveryResponseError::MissingCapability { channel_id, kind })?;
+            let media_source_service = encode_media_source_service(capability);
+            // Service.media_source_service (field 5).
+            protobuf::write_length_delimited_field(&mut out, 5, &media_source_service);
+        }
     }
     Ok(out)
 }
@@ -290,14 +338,27 @@ fn encode_media_sink_service(capability: VideoCapability) -> Vec<u8> {
     media_sink_service
 }
 
-fn encode_media_sink_audio(capability: AudioCapability) -> Vec<u8> {
-    let mut audio_configuration = Vec::new();
+fn encode_audio_configuration(
+    sampling_rate: u32,
+    number_of_bits: u32,
+    number_of_channels: u32,
+) -> Vec<u8> {
+    let mut out = Vec::new();
     // AudioConfiguration.sampling_rate (field 1, required uint32).
-    protobuf::write_uint32_field(&mut audio_configuration, 1, capability.sampling_rate);
+    protobuf::write_uint32_field(&mut out, 1, sampling_rate);
     // AudioConfiguration.number_of_bits (field 2, required uint32).
-    protobuf::write_uint32_field(&mut audio_configuration, 2, capability.number_of_bits);
+    protobuf::write_uint32_field(&mut out, 2, number_of_bits);
     // AudioConfiguration.number_of_channels (field 3, required uint32).
-    protobuf::write_uint32_field(&mut audio_configuration, 3, capability.number_of_channels);
+    protobuf::write_uint32_field(&mut out, 3, number_of_channels);
+    out
+}
+
+fn encode_media_sink_audio(capability: AudioCapability) -> Vec<u8> {
+    let audio_configuration = encode_audio_configuration(
+        capability.sampling_rate,
+        capability.number_of_bits,
+        capability.number_of_channels,
+    );
 
     let mut media_sink_service = Vec::new();
     // MediaSinkService.audio_type (field 2, optional enum).
@@ -328,6 +389,30 @@ fn encode_input_source_service(capability: TouchCapability) -> Vec<u8> {
     // InputSourceService.touchscreen (field 2, repeated TouchScreen).
     protobuf::write_length_delimited_field(&mut input_source_service, 2, &touch_screen);
     input_source_service
+}
+
+fn encode_bluetooth_service(capability: &BluetoothCapability) -> Vec<u8> {
+    let mut out = Vec::new();
+    // BluetoothService.car_address (field 1, required string).
+    protobuf::write_length_delimited_field(&mut out, 1, capability.car_address.as_bytes());
+    // BluetoothService.supported_pairing_methods (field 2, repeated packed
+    // enum) is deliberately left empty — nothing to advertise yet.
+    out
+}
+
+fn encode_media_source_service(capability: MicrophoneCapability) -> Vec<u8> {
+    let audio_config = encode_audio_configuration(
+        capability.sampling_rate,
+        capability.number_of_bits,
+        capability.number_of_channels,
+    );
+    let mut out = Vec::new();
+    // MediaSourceService.audio_config (field 2, optional AudioConfiguration).
+    protobuf::write_length_delimited_field(&mut out, 2, &audio_config);
+    // MediaSourceService.available_type (field 1, MediaCodecType) is left
+    // unset for the same reason as MediaSinkService's: its documented
+    // proto2 default is MEDIA_CODEC_AUDIO_PCM.
+    out
 }
 
 #[cfg(test)]
@@ -375,6 +460,10 @@ mod tests {
             }),
             touch: None,
             media_audio: None,
+            system_audio: None,
+            speech_audio: None,
+            bluetooth: None,
+            microphone: None,
             head_unit_info: None,
         };
 
@@ -409,6 +498,10 @@ mod tests {
                 touch_type: TouchScreenType::Capacitive,
             }),
             media_audio: None,
+            system_audio: None,
+            speech_audio: None,
+            bluetooth: None,
+            microphone: None,
             head_unit_info: None,
         };
 
@@ -443,6 +536,10 @@ mod tests {
                 number_of_channels: 2,
                 stream_type: AudioStreamType::Media,
             }),
+            system_audio: None,
+            speech_audio: None,
+            bluetooth: None,
+            microphone: None,
             head_unit_info: None,
         };
 
@@ -491,6 +588,10 @@ mod tests {
                 touch_type: TouchScreenType::Capacitive,
             }),
             media_audio: None,
+            system_audio: None,
+            speech_audio: None,
+            bluetooth: None,
+            microphone: None,
             head_unit_info: None,
         };
 
@@ -514,9 +615,6 @@ mod tests {
     fn encodes_head_unit_info_when_present() {
         let catalogue = catalogue(&[]);
         let capabilities = ServiceCapabilities {
-            video: None,
-            touch: None,
-            media_audio: None,
             head_unit_info: Some(HeadUnitInfo {
                 make: "a".into(),
                 model: "b".into(),
@@ -527,6 +625,7 @@ mod tests {
                 head_unit_software_build: "g".into(),
                 head_unit_software_version: "h".into(),
             }),
+            ..ServiceCapabilities::default()
         };
 
         let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
@@ -547,18 +646,161 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_service_kinds() {
+    fn encodes_sensors_as_an_empty_message() {
         let catalogue = catalogue(&[ServiceCandidate {
-            channel_id: 1,
+            channel_id: 6,
             kind: ServiceKind::Sensors,
             availability: ServiceAvailability::Ready,
         }]);
+        let message =
+            encode_service_discovery_response(&catalogue, &ServiceCapabilities::default())
+                .expect("encode");
         assert_eq!(
-            encode_service_discovery_response(&catalogue, &ServiceCapabilities::default()),
-            Err(ServiceDiscoveryResponseError::UnsupportedServiceKind(
-                ServiceKind::Sensors
-            ))
+            message.body,
+            vec![
+                0x0a, 0x04, // channels (field 1), length 4
+                0x08, 0x06, // Service.id = 6
+                0x12, 0x00, // Service.sensor_source_service (field 2), length 0
+            ]
         );
+    }
+
+    #[test]
+    fn encodes_bluetooth_service_with_exact_bytes() {
+        let catalogue = catalogue(&[ServiceCandidate {
+            channel_id: 7,
+            kind: ServiceKind::Bluetooth,
+            availability: ServiceAvailability::Ready,
+        }]);
+        let capabilities = ServiceCapabilities {
+            bluetooth: Some(BluetoothCapability {
+                car_address: "ab".into(),
+            }),
+            ..ServiceCapabilities::default()
+        };
+        let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
+        assert_eq!(
+            message.body,
+            vec![
+                0x0a, 0x08, // channels (field 1), length 8
+                0x08, 0x07, // Service.id = 7
+                0x32, 0x04, // Service.bluetooth_service (field 6), length 4
+                0x0a, 0x02, b'a', b'b', // BluetoothService.car_address = "ab"
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_microphone_service_with_exact_bytes() {
+        let catalogue = catalogue(&[ServiceCandidate {
+            channel_id: 8,
+            kind: ServiceKind::Microphone,
+            availability: ServiceAvailability::Ready,
+        }]);
+        let capabilities = ServiceCapabilities {
+            microphone: Some(MicrophoneCapability {
+                sampling_rate: 1,
+                number_of_bits: 2,
+                number_of_channels: 3,
+            }),
+            ..ServiceCapabilities::default()
+        };
+        let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
+        assert_eq!(
+            message.body,
+            vec![
+                0x0a, 0x0c, // channels (field 1), length 12
+                0x08, 0x08, // Service.id = 8
+                0x2a, 0x08, // Service.media_source_service (field 5), length 8
+                0x12, 0x06, // MediaSourceService.audio_config (field 2), length 6
+                0x08, 0x01, // AudioConfiguration.sampling_rate = 1
+                0x10, 0x02, // AudioConfiguration.number_of_bits = 2
+                0x18, 0x03, // AudioConfiguration.number_of_channels = 3
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_all_eight_service_kinds_with_well_formed_structure() {
+        // Mirrors encodes_realistic_video_and_touch_dimensions_with_well_formed_structure:
+        // structural verification (tag/length framing) rather than a fully
+        // hand-expanded byte vector, since eight services makes the latter
+        // unreadable without adding verification value beyond what the
+        // per-kind exact-byte tests above already prove.
+        let kinds = [
+            ServiceKind::Video,
+            ServiceKind::Input,
+            ServiceKind::MediaAudio,
+            ServiceKind::SystemAudio,
+            ServiceKind::SpeechAudio,
+            ServiceKind::Sensors,
+            ServiceKind::Bluetooth,
+            ServiceKind::Microphone,
+        ];
+        let candidates: Vec<_> = kinds
+            .iter()
+            .enumerate()
+            .map(|(index, &kind)| ServiceCandidate {
+                #[allow(clippy::cast_possible_truncation)]
+                channel_id: (index + 1) as u8,
+                kind,
+                availability: ServiceAvailability::Ready,
+            })
+            .collect();
+        let catalogue = catalogue(&candidates);
+        let capabilities = ServiceCapabilities {
+            video: Some(VideoCapability {
+                resolution: VideoCodecResolution::Video800x480,
+                frame_rate: VideoFrameRate::Fps30,
+            }),
+            touch: Some(TouchCapability {
+                width: 800,
+                height: 480,
+                touch_type: TouchScreenType::Capacitive,
+            }),
+            media_audio: Some(AudioCapability {
+                sampling_rate: 48_000,
+                number_of_bits: 16,
+                number_of_channels: 2,
+                stream_type: AudioStreamType::Media,
+            }),
+            system_audio: Some(AudioCapability {
+                sampling_rate: 16_000,
+                number_of_bits: 16,
+                number_of_channels: 1,
+                stream_type: AudioStreamType::SystemAudio,
+            }),
+            speech_audio: Some(AudioCapability {
+                sampling_rate: 16_000,
+                number_of_bits: 16,
+                number_of_channels: 1,
+                stream_type: AudioStreamType::Guidance,
+            }),
+            bluetooth: Some(BluetoothCapability {
+                car_address: "02:00:00:00:00:01".into(),
+            }),
+            microphone: Some(MicrophoneCapability {
+                sampling_rate: 16_000,
+                number_of_bits: 16,
+                number_of_channels: 1,
+            }),
+            head_unit_info: None,
+        };
+
+        let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
+
+        let mut cursor = 0;
+        let mut channel_count = 0;
+        while cursor < message.body.len() {
+            let (field, wire_type) =
+                read_tag::<TestDecodeError>(&message.body, &mut cursor).expect("tag");
+            assert_eq!((field, wire_type), (1, 2));
+            let channel = read_length_delimited::<TestDecodeError>(&message.body, &mut cursor)
+                .expect("channel bytes");
+            assert!(!channel.is_empty());
+            channel_count += 1;
+        }
+        assert_eq!(channel_count, 8);
     }
 
     #[test]

@@ -43,6 +43,8 @@ pub enum ControlMessageId {
     ServiceDiscoveryResponse,
     ChannelOpenRequest,
     ChannelOpenResponse,
+    AudioFocusRequest,
+    AudioFocusNotification,
     Unknown(u16),
 }
 
@@ -58,6 +60,8 @@ impl ControlMessageId {
             Self::ServiceDiscoveryResponse => 6,
             Self::ChannelOpenRequest => 7,
             Self::ChannelOpenResponse => 8,
+            Self::AudioFocusRequest => 18,
+            Self::AudioFocusNotification => 19,
             Self::Unknown(value) => value,
         }
     }
@@ -72,6 +76,8 @@ impl ControlMessageId {
             6 => Self::ServiceDiscoveryResponse,
             7 => Self::ChannelOpenRequest,
             8 => Self::ChannelOpenResponse,
+            18 => Self::AudioFocusRequest,
+            19 => Self::AudioFocusNotification,
             value => Self::Unknown(value),
         }
     }

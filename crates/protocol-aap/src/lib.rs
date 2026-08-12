@@ -14,8 +14,10 @@
 use std::fmt;
 
 mod assembly;
+mod audio_focus;
 mod channel_open;
 mod control;
+mod input_message;
 mod media_message;
 mod protobuf;
 mod service_catalogue;
@@ -25,6 +27,10 @@ mod tls;
 mod video_setup;
 
 pub use assembly::{AssemblyError, Message, MessageAssembler};
+pub use audio_focus::{
+    AudioFocusError, AudioFocusRequestType, AudioFocusStateType, decode_audio_focus_request,
+    encode_audio_focus_notification,
+};
 pub use channel_open::{
     ChannelOpenAction, ChannelOpenError, ChannelOpenEvent, ChannelOpenState,
     ChannelOpenStateMachine,
@@ -33,6 +39,10 @@ pub use control::{
     AASDK_PROTOCOL_VERSION, CONTROL_CHANNEL_ID, ControlError, ControlMessage, ControlMessageId,
     DEFAULT_MAX_CONTROL_BODY_SIZE, DEFAULT_MAX_TLS_CHUNK_SIZE, HandshakeAction, HandshakeEvent,
     HandshakeState, HandshakeStateMachine, ProtocolVersion,
+};
+pub use input_message::{
+    DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE, InputMessage, InputMessageError, InputMessageId,
+    KeyBindingError, KeyBindingStatus, decode_key_binding_request, encode_key_binding_response,
 };
 pub use media_message::{
     DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE, MediaMessage, MediaMessageError, MediaMessageId,
@@ -47,9 +57,9 @@ pub use service_discovery::{
     ServiceDiscoveryRequestSummary, summarize_service_discovery_request,
 };
 pub use service_discovery_response::{
-    AudioCapability, AudioStreamType, HeadUnitInfo, ServiceCapabilities,
-    ServiceDiscoveryResponseError, TouchCapability, TouchScreenType, VideoCapability,
-    VideoCodecResolution, VideoFrameRate, encode_service_discovery_response,
+    AudioCapability, AudioStreamType, BluetoothCapability, HeadUnitInfo, MicrophoneCapability,
+    ServiceCapabilities, ServiceDiscoveryResponseError, TouchCapability, TouchScreenType,
+    VideoCapability, VideoCodecResolution, VideoFrameRate, encode_service_discovery_response,
 };
 pub use tls::{TlsClient, TlsProgress};
 pub use video_setup::{
