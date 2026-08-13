@@ -16,10 +16,12 @@ use std::fmt;
 mod assembly;
 mod audio_focus;
 mod audio_setup;
+mod byebye;
 mod channel_open;
 mod control;
 mod input_message;
 mod media_message;
+mod nav_focus;
 mod ping;
 mod protobuf;
 mod sensor;
@@ -37,6 +39,7 @@ pub use audio_focus::{
 pub use audio_setup::{
     AudioSetupAction, AudioSetupError, AudioSetupEvent, AudioSetupState, AudioSetupStateMachine,
 };
+pub use byebye::{ByeByeError, ByeByeReason, decode_byebye_request, encode_byebye_response};
 pub use channel_open::{
     ChannelOpenAction, ChannelOpenError, ChannelOpenEvent, ChannelOpenState,
     ChannelOpenStateMachine,
@@ -52,6 +55,9 @@ pub use input_message::{
 };
 pub use media_message::{
     DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE, MediaMessage, MediaMessageError, MediaMessageId,
+};
+pub use nav_focus::{
+    NavFocusError, NavFocusType, decode_nav_focus_request, encode_nav_focus_notification,
 };
 pub use ping::{PingError, decode_ping_response, encode_ping_request};
 pub use sensor::{

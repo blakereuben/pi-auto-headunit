@@ -127,27 +127,51 @@
 //! (`DRIVE_STATUS_UNRESTRICTED`, or night mode `false` — this project has no
 //! real driving-restriction or day/night sensor pipeline yet), matching
 //! `OpenAuto`'s own `SensorService::onSensorStartRequest` behavior exactly.
+//! Real-hardware result: also refuted — the phone opened the Sensors
+//! channel but never sent a `SensorRequest` even once both types were
+//! advertised (`docs/protocol/error-2-investigation.md`).
+//!
+//! The same `AndroidAutoEntity`/`ControlServiceChannel` audit also named two
+//! remaining control-channel gaps, using this project's actually-pinned
+//! AASDK fork's own names (`opencardev/aasdk` @ `9bf6adf933665dee26532201719fac14a047ccf1`,
+//! `ControlMessageType.proto`) rather than the older fork's names an earlier
+//! pass of this same research used for `OpenAuto`'s C++ *behavior* —
+//! `NavFocusRequest`/`NavFocusNotification` (wire 13/14, not
+//! "NavigationFocusRequest/Response") and `ByeByeRequest`/`ByeByeResponse`
+//! (wire 15/16, not "ShutdownRequest/Response"); the wire values are
+//! unchanged between forks, only the names differ. Both are now handled
+//! (`protocol_aap::nav_focus`, `protocol_aap::byebye`): `NavFocusRequest`
+//! always gets a hardcoded `Projected` answer (this project has no native
+//! in-car navigation to contest focus with, matching `OpenAuto`'s own
+//! hardcoded reply). `ByeByeRequest` — the protocol's own explicit
+//! session-end signal, carrying a `reason` enum — is answered with an empty
+//! `ByeByeResponse` and then treated as a clean, non-error probe stop
+//! (`ProbeOutcome::PhoneEndedSession`), matching `OpenAuto`'s own
+//! `triggerQuit()`-after-response behavior; its `reason` value is printed
+//! since, if a real phone ever sends this, it could be directly diagnostic
+//! about *why* it considers this head unit incompatible.
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
     AudioSetupAction, AudioSetupEvent, AudioSetupStateMachine, AudioStreamType,
-    BluetoothCapability, ChannelOpenAction, ChannelOpenEvent, ChannelOpenState,
+    BluetoothCapability, ByeByeReason, ChannelOpenAction, ChannelOpenEvent, ChannelOpenState,
     ChannelOpenStateMachine, ControlMessage, ControlMessageId, DEFAULT_MAX_CONTROL_BODY_SIZE,
     DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
     DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE, DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption,
     FrameError, FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
     HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus, Message,
-    MessageAssembler, MessageType, MicrophoneCapability, ProtocolLimits, SensorCapability,
-    SensorMessage, SensorMessageId, SensorType, ServiceAvailability, ServiceCandidate,
-    ServiceCapabilities, ServiceCatalogue, ServiceDiscoveryRequestSummary, ServiceKind, TlsClient,
-    TlsProgress, TouchCapability, TouchScreenType, VideoCapability, VideoCodecResolution,
-    VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupStateMachine,
-    decode_audio_focus_request, decode_frame, decode_key_binding_request, decode_ping_response,
-    decode_sensor_request, encode_audio_focus_notification,
+    MessageAssembler, MessageType, MicrophoneCapability, NavFocusType, ProtocolLimits,
+    SensorCapability, SensorMessage, SensorMessageId, SensorType, ServiceAvailability,
+    ServiceCandidate, ServiceCapabilities, ServiceCatalogue, ServiceDiscoveryRequestSummary,
+    ServiceKind, TlsClient, TlsProgress, TouchCapability, TouchScreenType, VideoCapability,
+    VideoCodecResolution, VideoFrameRate, VideoSetupAction, VideoSetupEvent,
+    VideoSetupStateMachine, decode_audio_focus_request, decode_byebye_request, decode_frame,
+    decode_key_binding_request, decode_nav_focus_request, decode_ping_response,
+    decode_sensor_request, encode_audio_focus_notification, encode_byebye_response,
     encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
-    encode_night_mode_batch, encode_ping_request, encode_sensor_response,
-    encode_service_discovery_response,
+    encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
+    encode_sensor_response, encode_service_discovery_response,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::{HashMap, VecDeque};
@@ -164,13 +188,17 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// session-liveness mechanism decoupled from handshake/channel-setup
 /// progress that this probe has never previously implemented.
 ///
-/// Was temporarily raised past `PROBE_TIMEOUT` for the Sensors real-hardware
-/// trial, to isolate that trial's variable from the still-unresolved local
-/// USB bulk-OUT write timeout two earlier ping-enabled runs hit (see
-/// `docs/protocol/error-2-investigation.md`, "Ping/liveness experiment").
-/// Reverted back to 5s now that trial is recorded, matching the
-/// `PROBE_TIMEOUT` 10s→30s→10s precedent — the write-timeout investigation
-/// itself remains a separate, still-open follow-up.
+/// Was temporarily raised past `PROBE_TIMEOUT` twice more for the
+/// NavFocus/ByeBye real-hardware trials: with `PING_INTERVAL` active at 5s,
+/// a run reached `SensorRequest`/`SensorResponse`/`SensorBatch` for the
+/// first time ever, then hit the same USB bulk-OUT write timeout as the
+/// original Ping trial; neutralizing `PING_INTERVAL` reproduced the same
+/// sensor exchange with a clean timeout instead — strong evidence the write
+/// timeout is specifically tied to the ping write, not incidental USB
+/// flakiness (see `docs/protocol/error-2-investigation.md`,
+/// "Ping/liveness experiment"). Reverted back to 5s now that both trials
+/// are recorded; the write-timeout root cause itself remains a separate,
+/// still-open follow-up.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
 /// Head-unit-assigned channel ids advertised in `ServiceDiscoveryResponse`.
@@ -250,6 +278,17 @@ enum SpeechAudioChannel {
 enum SensorsChannel {
     AwaitingOpen(ChannelOpenStateMachine),
     Open,
+}
+
+/// What happened while routing one assembled message, as returned by
+/// `handle_message`. Distinguishes the probe's original success condition
+/// (video `Start` received, input opened) from the phone's own explicit
+/// `ByeByeRequest` session-end signal — both are clean, non-error stops,
+/// but warrant different `run()` reporting.
+enum ProbeOutcome {
+    Continue,
+    ChannelSetupComplete,
+    PhoneEndedSession(ByeByeReason),
 }
 
 pub fn run<T: SessionTransport>(
@@ -346,7 +385,7 @@ pub fn run<T: SessionTransport>(
                 continue;
             };
 
-            let done = handle_message(
+            let outcome = handle_message(
                 &message,
                 &mut handshake,
                 &mut video_channel,
@@ -359,9 +398,7 @@ pub fn run<T: SessionTransport>(
                 transport,
                 limits,
             )?;
-            if done {
-                println!("probe_result=video_channel_start_received");
-                println!("probe_stop=video_channel_start_received_ready_for_media_data");
+            if report_probe_outcome(&outcome) {
                 return Ok(());
             }
         }
@@ -373,9 +410,26 @@ pub fn run<T: SessionTransport>(
     ))
 }
 
-/// Routes one assembled message by channel. Returns `true` once the video
-/// channel has received `Start` and the input channel has opened — the
-/// probe's success condition.
+/// Prints the terminal `probe_result`/`probe_stop` lines for a
+/// [`ProbeOutcome`] and reports whether `run()` should stop now.
+fn report_probe_outcome(outcome: &ProbeOutcome) -> bool {
+    match outcome {
+        ProbeOutcome::Continue => false,
+        ProbeOutcome::ChannelSetupComplete => {
+            println!("probe_result=video_channel_start_received");
+            println!("probe_stop=video_channel_start_received_ready_for_media_data");
+            true
+        }
+        ProbeOutcome::PhoneEndedSession(reason) => {
+            println!("probe_result=phone_ended_session");
+            println!("byebye_reason={reason:?}");
+            println!("probe_stop=byebye_request_received");
+            true
+        }
+    }
+}
+
+/// Routes one assembled message by channel. See [`ProbeOutcome`].
 #[allow(clippy::too_many_arguments)]
 fn handle_message<T: SessionTransport>(
     message: &Message,
@@ -389,10 +443,14 @@ fn handle_message<T: SessionTransport>(
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
-) -> Result<bool, CliError> {
+) -> Result<ProbeOutcome, CliError> {
     if message.channel_id == 0 {
         if handshake.state() == HandshakeState::ServiceDiscoveryReceived {
-            handle_post_discovery_control_message(message, tls, transport, limits)?;
+            if let Some(reason) =
+                handle_post_discovery_control_message(message, tls, transport, limits)?
+            {
+                return Ok(ProbeOutcome::PhoneEndedSession(reason));
+            }
         } else if let Some(summary) =
             handle_assembled_message(message, handshake, tls, transport, limits)?
         {
@@ -422,7 +480,7 @@ fn handle_message<T: SessionTransport>(
                 simple_channels.insert(channel_id, ChannelOpenStateMachine::new(channel_id));
             }
         }
-        return Ok(false);
+        return Ok(ProbeOutcome::Continue);
     }
 
     if message.channel_id == VIDEO_CHANNEL_ID {
@@ -455,22 +513,30 @@ fn handle_message<T: SessionTransport>(
     let input_open = simple_channels
         .get(&INPUT_CHANNEL_ID)
         .is_some_and(|machine| machine.state() == ChannelOpenState::Open);
-    Ok(matches!(video_channel, Some(VideoChannel::Ready)) && input_open)
+    Ok(
+        if matches!(video_channel, Some(VideoChannel::Ready)) && input_open {
+            ProbeOutcome::ChannelSetupComplete
+        } else {
+            ProbeOutcome::Continue
+        },
+    )
 }
 
 /// Handles control-channel traffic that arrives after `HandshakeStateMachine`
 /// has already reached `ServiceDiscoveryReceived` (which has nothing further
-/// to do — see `docs/protocol/error-2-investigation.md`). Only
-/// `AudioFocusRequest` is handled; anything else fails closed with a clear,
-/// distinct error naming the unexpected message, so if the phone sends
-/// something new next, that's immediately visible rather than silently
-/// swallowed.
+/// to do — see `docs/protocol/error-2-investigation.md`). `AudioFocusRequest`,
+/// `PingResponse`, `NavFocusRequest`, and `ByeByeRequest` are handled;
+/// anything else fails closed with a clear, distinct error naming the
+/// unexpected message, so if the phone sends something new next, that's
+/// immediately visible rather than silently swallowed. Returns
+/// `Some(reason)` only for `ByeByeRequest` — the protocol's own explicit
+/// session-end signal, which `run()` treats as a clean stop, not an error.
 fn handle_post_discovery_control_message<T: SessionTransport>(
     message: &Message,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
-) -> Result<(), CliError> {
+) -> Result<Option<ByeByeReason>, CliError> {
     if message.message_type != MessageType::Specific {
         return Err(CliError::Protocol(
             "unexpected control message type after service discovery".into(),
@@ -491,14 +557,40 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
                 .map_err(|error| CliError::Protocol(error.to_string()))?;
             send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits)?;
             println!("probe_state=audio_focus_notification_sent");
-            Ok(())
+            Ok(None)
         }
         ControlMessageId::PingResponse => {
             let echoed_timestamp = decode_ping_response(&control_message.body)
                 .map_err(|error| CliError::Protocol(error.to_string()))?;
             println!("probe_state=ping_response_received");
             println!("ping_response_echoed_timestamp={echoed_timestamp}");
-            Ok(())
+            Ok(None)
+        }
+        ControlMessageId::NavFocusRequest => {
+            let requested_type = decode_nav_focus_request(&control_message.body)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            println!("probe_state=nav_focus_requested");
+            println!("nav_focus_requested_type={requested_type:?}");
+            let response = encode_nav_focus_notification(NavFocusType::Projected);
+            let payload = response
+                .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits)?;
+            println!("probe_state=nav_focus_notification_sent");
+            Ok(None)
+        }
+        ControlMessageId::ByeByeRequest => {
+            let reason = decode_byebye_request(&control_message.body)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            println!("probe_state=byebye_requested");
+            println!("byebye_reason={reason:?}");
+            let response = encode_byebye_response();
+            let payload = response
+                .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits)?;
+            println!("probe_state=byebye_response_sent");
+            Ok(Some(reason))
         }
         other => Err(CliError::Protocol(format!(
             "unexpected control message {other:?} after service discovery"
