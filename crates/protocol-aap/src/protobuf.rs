@@ -142,6 +142,16 @@ pub(crate) fn write_int32_field(out: &mut Vec<u8>, field: u32, value: i32) {
     write_varint(out, i64::from(value) as u64);
 }
 
+/// Writes a proto2 `int64` field. Same wire encoding as [`write_int32_field`]
+/// (varint, sign-extended for negative values) but takes the value directly
+/// as `i64` rather than widening from `i32` — needed for fields like an
+/// epoch-millisecond timestamp that genuinely exceed `i32::MAX`.
+pub(crate) fn write_int64_field(out: &mut Vec<u8>, field: u32, value: i64) {
+    write_tag(out, field, 0);
+    #[allow(clippy::cast_sign_loss)]
+    write_varint(out, value as u64);
+}
+
 /// Writes a length-delimited field — `string`, `bytes`, or a pre-encoded
 /// nested message body.
 pub(crate) fn write_length_delimited_field(out: &mut Vec<u8>, field: u32, bytes: &[u8]) {
@@ -344,6 +354,17 @@ mod tests {
         assert_eq!((field, wire_type), (7, 0));
         let value = read_varint::<TestError>(&out, &mut cursor).expect("value");
         assert_eq!(value, 300);
+    }
+
+    #[test]
+    fn write_int64_field_matches_hand_computed_bytes_and_round_trips() {
+        let mut out = Vec::new();
+        write_int64_field(&mut out, 1, 1_700_000_000_000);
+        let mut cursor = 0;
+        let (field, wire_type) = read_tag::<TestError>(&out, &mut cursor).expect("tag");
+        assert_eq!((field, wire_type), (1, 0));
+        let value = read_varint::<TestError>(&out, &mut cursor).expect("value");
+        assert_eq!(value, 1_700_000_000_000);
     }
 
     #[test]

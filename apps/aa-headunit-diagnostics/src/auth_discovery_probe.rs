@@ -80,6 +80,53 @@
 //! *plain* by that same source despite also happening post-handshake for
 //! `AuthComplete` — encryption is message-specific, not simply
 //! before/after TLS completion.
+//!
+//! Once every implemented handshake step succeeds (all three audio
+//! channels' `Setup`/`Config`/`Start`, video through `Config`, input
+//! opened), the probe now simply times out — no further message arrives to
+//! react to, and raising `PROBE_TIMEOUT` to 30s made no difference (see
+//! `docs/protocol/error-2-investigation.md`). `OpenAuto`'s
+//! `AndroidAutoEntity::start()` (`AndroidAutoEntity.cpp`) reveals a
+//! session-liveness mechanism this project had never implemented at all:
+//! it proactively sends `PingRequest` every 5 seconds
+//! (`AndroidAutoEntityFactory.cpp`'s hard-coded `Pinger` interval),
+//! independent of handshake/channel-setup progress, starting immediately at
+//! session start. This probe now does the same (`PING_INTERVAL`,
+//! `send_ping_request`, sent unencrypted on the control channel matching
+//! AASDK's `sendPingRequest`) and handles an incoming `PingResponse`
+//! (`protocol_aap::ping`). Matching `OpenAuto`'s own scope exactly, an
+//! incoming `PingRequest` from the phone is not handled — `OpenAuto` itself
+//! only overrides `onPingResponse`, never `onPingRequest` — so one would
+//! continue to fail closed via the existing catch-all in
+//! `handle_post_discovery_control_message`, which is itself useful
+//! information if it happens. The Ping increment's own real-hardware trial
+//! was inconclusive: both runs hit a new, reproducible local USB bulk-OUT
+//! write timeout right around when the first ping fired, before the
+//! hypothesis could be fairly observed (`PING_INTERVAL` is temporarily
+//! neutralized — see its doc comment — for the Sensors trial below, to
+//! isolate that trial's variable from this still-open confound).
+//!
+//! A systematic diff against `OpenAuto`'s full post-`ServiceDiscoveryResponse`
+//! session lifecycle and service set (rather than continuing to test one
+//! hypothesis at a time) surfaced a genuine capability-advertisement bug,
+//! not just a missing handler: `ServiceDiscoveryResponse`'s
+//! `Sensors` entry was being encoded as an **empty** `SensorSourceService`
+//! message — this project never advertised support for any sensor type, so
+//! a real phone had no way to know it could ever request one. `OpenAuto`'s
+//! `SensorService::fillFeatures()` (`SensorService.cpp`, pre-approved path
+//! per `docs/protocol/openauto-adoption.md`) advertises exactly two:
+//! `DRIVING_STATUS` and `NIGHT_DATA`. Driving-status is described as
+//! eager/near-mandatory in the research behind this increment — it gates
+//! whether the phone shows a full or driving-restricted UI, and is normally
+//! requested unconditionally at session bring-up rather than
+//! user-triggered — a stronger candidate than Bluetooth pairing or
+//! microphone capture (both more clearly user/voice-triggered). This probe
+//! now advertises both sensor types and handles `SensorRequest` on the
+//! Sensors channel (`protocol_aap::sensor`), always responding `OK`
+//! (`SensorResponse`) plus a matching one-shot `SensorBatch`
+//! (`DRIVE_STATUS_UNRESTRICTED`, or night mode `false` — this project has no
+//! real driving-restriction or day/night sensor pipeline yet), matching
+//! `OpenAuto`'s own `SensorService::onSensorStartRequest` behavior exactly.
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{
@@ -88,25 +135,43 @@ use protocol_aap::{
     BluetoothCapability, ChannelOpenAction, ChannelOpenEvent, ChannelOpenState,
     ChannelOpenStateMachine, ControlMessage, ControlMessageId, DEFAULT_MAX_CONTROL_BODY_SIZE,
     DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
-    DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption, FrameError, FrameHeader, FrameType,
-    HandshakeAction, HandshakeEvent, HandshakeState, HandshakeStateMachine, HeadUnitInfo,
-    InputMessage, InputMessageId, KeyBindingStatus, Message, MessageAssembler, MessageType,
-    MicrophoneCapability, ProtocolLimits, ServiceAvailability, ServiceCandidate,
+    DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE, DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption,
+    FrameError, FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
+    HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus, Message,
+    MessageAssembler, MessageType, MicrophoneCapability, ProtocolLimits, SensorCapability,
+    SensorMessage, SensorMessageId, SensorType, ServiceAvailability, ServiceCandidate,
     ServiceCapabilities, ServiceCatalogue, ServiceDiscoveryRequestSummary, ServiceKind, TlsClient,
     TlsProgress, TouchCapability, TouchScreenType, VideoCapability, VideoCodecResolution,
     VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupStateMachine,
-    decode_audio_focus_request, decode_frame, decode_key_binding_request,
-    encode_audio_focus_notification, encode_frame, encode_key_binding_response,
+    decode_audio_focus_request, decode_frame, decode_key_binding_request, decode_ping_response,
+    decode_sensor_request, encode_audio_focus_notification,
+    encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
+    encode_night_mode_batch, encode_ping_request, encode_sensor_response,
     encode_service_discovery_response,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use transport_api::{SessionTransport, TransportError};
 
 use crate::CliError;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Matches `OpenAuto`'s `AndroidAutoEntityFactory.cpp`, which constructs its
+/// `Pinger` with a hard-coded 5000ms interval
+/// (`std::make_shared<Pinger>(ioService_, 5000)`), armed from
+/// `AndroidAutoEntity::start()` before even `VersionRequest` — a
+/// session-liveness mechanism decoupled from handshake/channel-setup
+/// progress that this probe has never previously implemented.
+///
+/// Was temporarily raised past `PROBE_TIMEOUT` for the Sensors real-hardware
+/// trial, to isolate that trial's variable from the still-unresolved local
+/// USB bulk-OUT write timeout two earlier ping-enabled runs hit (see
+/// `docs/protocol/error-2-investigation.md`, "Ping/liveness experiment").
+/// Reverted back to 5s now that trial is recorded, matching the
+/// `PROBE_TIMEOUT` 10s→30s→10s precedent — the write-timeout investigation
+/// itself remains a separate, still-open follow-up.
+const PING_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
 /// Head-unit-assigned channel ids advertised in `ServiceDiscoveryResponse`.
 /// These are this probe's own choice, not AASDK's internal `ChannelId`
@@ -176,6 +241,17 @@ enum SpeechAudioChannel {
     Ready,
 }
 
+/// Per-channel progress for the `Sensors` channel, driven once
+/// `ServiceDiscoveryResponse` has been sent. Simpler than the audio/video
+/// channels — `SensorRequest`/`SensorResponse`/`SensorBatch` is a flat
+/// request/response exchange with no further state transition, so unlike
+/// `VideoChannel`/`MediaAudioChannel`/etc. there's no dedicated inner
+/// state machine, just `AwaitingOpen` then `Open`.
+enum SensorsChannel {
+    AwaitingOpen(ChannelOpenStateMachine),
+    Open,
+}
+
 pub fn run<T: SessionTransport>(
     transport: &mut T,
     tls12_compatibility: bool,
@@ -216,24 +292,28 @@ pub fn run<T: SessionTransport>(
     println!("probe_state=version_request_sent");
 
     let deadline = Instant::now() + PROBE_TIMEOUT;
+    // Armed at session start, matching OpenAuto's AndroidAutoEntity::start()
+    // (see PING_INTERVAL's doc comment) — decoupled from handshake progress.
+    let mut last_ping = Instant::now();
     let mut received = Vec::new();
     let mut read_buffer = vec![0_u8; AASDK_MAX_FRAME_PAYLOAD_SIZE + 8];
     // Control channel (0) + video channel + input channel + MediaAudio
-    // channel + SystemAudio channel + SpeechAudio channel can each
-    // independently be mid-fragmentation once channel setup starts.
+    // channel + SystemAudio channel + SpeechAudio channel + Sensors channel
+    // can each independently be mid-fragmentation once channel setup starts.
     let mut assembler =
-        MessageAssembler::new(6).map_err(|error| CliError::Protocol(error.to_string()))?;
+        MessageAssembler::new(7).map_err(|error| CliError::Protocol(error.to_string()))?;
 
     let mut video_channel: Option<VideoChannel> = None;
     let mut media_audio_channel: Option<MediaAudioChannel> = None;
     let mut system_audio_channel: Option<SystemAudioChannel> = None;
     let mut speech_audio_channel: Option<SpeechAudioChannel> = None;
+    let mut sensors_channel: Option<SensorsChannel> = None;
     // Every channel that only ever needs to reach ChannelOpenState::Open —
-    // input/touch plus three of the six non-video channels this experiment
-    // adds (MediaAudio, SystemAudio, and SpeechAudio now have their own
-    // dedicated Setup/Config/Start state machines above, like video). None
-    // until ServiceDiscoveryResponse is sent, then populated with one entry
-    // per advertised channel_id.
+    // input/touch plus two of the six non-video channels this experiment
+    // adds (MediaAudio, SystemAudio, SpeechAudio, and Sensors now have their
+    // own dedicated state machines above, like video). None until
+    // ServiceDiscoveryResponse is sent, then populated with one entry per
+    // advertised channel_id.
     let mut simple_channels: HashMap<u8, ChannelOpenStateMachine> = HashMap::new();
 
     while Instant::now() < deadline {
@@ -242,6 +322,10 @@ pub fn run<T: SessionTransport>(
             Err(TransportError::TimedOut) => continue,
             Err(error) => return Err(CliError::Transport(error)),
         };
+        if last_ping.elapsed() >= PING_INTERVAL {
+            send_ping_request(transport, limits)?;
+            last_ping = Instant::now();
+        }
         if received.len() + size > MAX_ACCUMULATED_BYTES {
             return Err(CliError::Protocol(
                 "incoming frame buffer exceeded the probe limit".into(),
@@ -269,6 +353,7 @@ pub fn run<T: SessionTransport>(
                 &mut media_audio_channel,
                 &mut system_audio_channel,
                 &mut speech_audio_channel,
+                &mut sensors_channel,
                 &mut simple_channels,
                 &mut tls,
                 transport,
@@ -299,6 +384,7 @@ fn handle_message<T: SessionTransport>(
     media_audio_channel: &mut Option<MediaAudioChannel>,
     system_audio_channel: &mut Option<SystemAudioChannel>,
     speech_audio_channel: &mut Option<SpeechAudioChannel>,
+    sensors_channel: &mut Option<SensorsChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
@@ -325,9 +411,11 @@ fn handle_message<T: SessionTransport>(
             *speech_audio_channel = Some(SpeechAudioChannel::AwaitingOpen(
                 ChannelOpenStateMachine::new(SPEECH_AUDIO_CHANNEL_ID),
             ));
+            *sensors_channel = Some(SensorsChannel::AwaitingOpen(ChannelOpenStateMachine::new(
+                SENSORS_CHANNEL_ID,
+            )));
             for channel_id in [
                 INPUT_CHANNEL_ID,
-                SENSORS_CHANNEL_ID,
                 BLUETOOTH_CHANNEL_ID,
                 MICROPHONE_CHANNEL_ID,
             ] {
@@ -345,6 +433,8 @@ fn handle_message<T: SessionTransport>(
         handle_system_audio_channel_message(message, system_audio_channel, tls, transport, limits)?;
     } else if message.channel_id == SPEECH_AUDIO_CHANNEL_ID {
         handle_speech_audio_channel_message(message, speech_audio_channel, tls, transport, limits)?;
+    } else if message.channel_id == SENSORS_CHANNEL_ID {
+        handle_sensors_channel_message(message, sensors_channel, tls, transport, limits)?;
     } else if message.channel_id == INPUT_CHANNEL_ID
         && simple_channels
             .get(&INPUT_CHANNEL_ID)
@@ -403,10 +493,41 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
             println!("probe_state=audio_focus_notification_sent");
             Ok(())
         }
+        ControlMessageId::PingResponse => {
+            let echoed_timestamp = decode_ping_response(&control_message.body)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            println!("probe_state=ping_response_received");
+            println!("ping_response_echoed_timestamp={echoed_timestamp}");
+            Ok(())
+        }
         other => Err(CliError::Protocol(format!(
             "unexpected control message {other:?} after service discovery"
         ))),
     }
+}
+
+/// Sends `PingRequest` on the control channel, unencrypted like AASDK's own
+/// `sendPingRequest` (`EncryptionType::PLAIN`, `MessageType::SPECIFIC`) —
+/// see `PING_INTERVAL`'s doc comment for why this is sent proactively at
+/// all. `timestamp` is epoch milliseconds — a reasonable but unconfirmed
+/// assumption about the field's units (`PingRequest.proto` only declares
+/// `required int64 timestamp = 1`, no unit); not load-bearing for this
+/// experiment, since the phone only needs *a* consistent value it can echo
+/// back in `PingResponse`.
+fn send_ping_request<T: SessionTransport>(
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let timestamp_millis = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+    send_control(transport, &encode_ping_request(timestamp_millis), limits)?;
+    println!("probe_state=ping_request_sent");
+    Ok(())
 }
 
 /// Placeholder audio-focus policy: grant exactly what's asked. This
@@ -537,6 +658,9 @@ fn build_service_capabilities() -> ServiceCapabilities {
             sampling_rate: VOICE_AUDIO_SAMPLING_RATE,
             number_of_bits: VOICE_AUDIO_BITS,
             number_of_channels: VOICE_AUDIO_CHANNELS,
+        }),
+        sensors: Some(SensorCapability {
+            sensor_types: vec![SensorType::DrivingStatusData, SensorType::NightMode],
         }),
         head_unit_info: Some(HeadUnitInfo {
             make: "pi-auto-headunit".into(),
@@ -908,15 +1032,121 @@ fn handle_speech_audio_channel_message<T: SessionTransport>(
     }
 }
 
+/// Drives the `Sensors` channel's `ChannelOpenStateMachine`, then handles
+/// `SensorRequest`/responds `SensorResponse`+`SensorBatch` directly (no
+/// further state transition — a second `SensorRequest` for the other
+/// advertised sensor type is expected and handled the same way). Matches
+/// `OpenAuto`'s `SensorService::onSensorStartRequest`: always responds `OK`
+/// regardless of `sensor_type`, and only sends a follow-up `SensorBatch` for
+/// the two types this project actually advertises/models
+/// (`DrivingStatusData`, `NightMode`) — any other/`Unknown` type gets only
+/// the response, matching `OpenAuto`'s own no-op-for-unhandled-type
+/// behavior rather than introducing a new rejection path.
+fn handle_sensors_channel_message<T: SessionTransport>(
+    message: &Message,
+    sensors_channel: &mut Option<SensorsChannel>,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let state = sensors_channel.as_mut().ok_or_else(|| {
+        CliError::Protocol(
+            "sensors channel message before ServiceDiscoveryResponse was sent".into(),
+        )
+    })?;
+    match state {
+        SensorsChannel::AwaitingOpen(machine) => {
+            if message.message_type != MessageType::Control {
+                return Err(CliError::Protocol(
+                    "expected ChannelOpenRequest on sensors channel".into(),
+                ));
+            }
+            let actions = machine
+                .advance(ChannelOpenEvent::InboundControl(&message.payload))
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            for action in actions {
+                let ChannelOpenAction::SendControl(response) = action;
+                let payload = response
+                    .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+                send_encrypted(
+                    transport,
+                    tls,
+                    SENSORS_CHANNEL_ID,
+                    MessageType::Control,
+                    &payload,
+                    limits,
+                )?;
+            }
+            println!("probe_state=sensors_channel_open");
+            *state = SensorsChannel::Open;
+            Ok(())
+        }
+        SensorsChannel::Open => {
+            if message.message_type != MessageType::Specific {
+                return Err(CliError::Protocol(
+                    "unexpected message type on sensors channel after open".into(),
+                ));
+            }
+            let sensor_message =
+                SensorMessage::decode(&message.payload, DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+            match sensor_message.id {
+                SensorMessageId::SensorRequest => {
+                    let sensor_type = decode_sensor_request(&sensor_message.body)
+                        .map_err(|error| CliError::Protocol(error.to_string()))?;
+                    println!("probe_state=sensor_request_received");
+                    println!("sensor_request_type={sensor_type:?}");
+                    let response = encode_sensor_response();
+                    let payload = response
+                        .encode(DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE)
+                        .map_err(|error| CliError::Protocol(error.to_string()))?;
+                    send_encrypted(
+                        transport,
+                        tls,
+                        SENSORS_CHANNEL_ID,
+                        MessageType::Specific,
+                        &payload,
+                        limits,
+                    )?;
+                    println!("probe_state=sensor_response_sent");
+                    let batch = match sensor_type {
+                        SensorType::DrivingStatusData => {
+                            Some(encode_driving_status_unrestricted_batch())
+                        }
+                        SensorType::NightMode => Some(encode_night_mode_batch(false)),
+                        SensorType::Unknown(_) => None,
+                    };
+                    if let Some(batch) = batch {
+                        let payload = batch
+                            .encode(DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE)
+                            .map_err(|error| CliError::Protocol(error.to_string()))?;
+                        send_encrypted(
+                            transport,
+                            tls,
+                            SENSORS_CHANNEL_ID,
+                            MessageType::Specific,
+                            &payload,
+                            limits,
+                        )?;
+                        println!("probe_state=sensor_batch_sent");
+                    }
+                    Ok(())
+                }
+                other => Err(CliError::Protocol(format!(
+                    "unexpected sensor message {other:?} after open"
+                ))),
+            }
+        }
+    }
+}
+
 /// Drives one "advertise → open → nothing further" channel's
-/// `ChannelOpenStateMachine` — covers `Input` and three other non-video
-/// channels this experiment adds (`MediaAudio`, `SystemAudio`, and
-/// `SpeechAudio` now have their own dedicated Setup/Config/Start state
-/// machines above, like video). Generalizes what used to be two
-/// near-identical per-channel functions, since this shape now repeats four
-/// times; `VideoChannel`/`MediaAudioChannel`/`SystemAudioChannel`/
-/// `SpeechAudioChannel`'s `Setup`/`Config`/`Start` follow-through is
-/// genuinely different and stays separate.
+/// `ChannelOpenStateMachine` — now covers only `Input` (before it opens),
+/// `Bluetooth`, and `Microphone`; every other advertised channel
+/// (`Video`/`MediaAudio`/`SystemAudio`/`SpeechAudio`/`Sensors`) has
+/// graduated to its own dedicated state machine above as this project
+/// learned what each one needs beyond `ChannelOpenState::Open`.
 fn handle_simple_channel_message<T: SessionTransport>(
     channel_id: u8,
     message: &Message,

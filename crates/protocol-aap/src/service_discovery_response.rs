@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::control::{ControlMessage, ControlMessageId};
 use crate::protobuf;
+use crate::sensor::SensorType;
 use crate::service_catalogue::{ServiceCatalogue, ServiceKind};
 
 // Portions derived from AASDK's Service/ServiceDiscoveryResponse protobuf
@@ -148,6 +149,15 @@ pub struct BluetoothCapability {
     pub car_address: String,
 }
 
+/// `aap_protobuf.service.sensorsource.SensorSourceService`. Only the
+/// `sensors` list (field 1) is modeled — `location_characterization`,
+/// `supported_fuel_types`, and `supported_ev_connector_types` have no
+/// corresponding hardware yet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SensorCapability {
+    pub sensor_types: Vec<SensorType>,
+}
+
 /// `aap_protobuf.service.media.source.MediaSourceService` (the microphone
 /// role — a phone-to-head-unit audio source, distinct from the
 /// head-unit-to-phone `MediaSinkService` audio roles).
@@ -170,6 +180,7 @@ pub struct ServiceCapabilities {
     pub speech_audio: Option<AudioCapability>,
     pub bluetooth: Option<BluetoothCapability>,
     pub microphone: Option<MicrophoneCapability>,
+    pub sensors: Option<SensorCapability>,
     pub head_unit_info: Option<HeadUnitInfo>,
 }
 
@@ -288,11 +299,13 @@ fn encode_service(
             protobuf::write_length_delimited_field(&mut out, 3, &media_sink_service);
         }
         ServiceKind::Sensors => {
-            // Service.sensor_source_service (field 2). SensorSourceService's
-            // fields are all optional/repeated (docs/protocol/aasdk-adoption.md),
-            // so the empty message is a valid minimal entry — no capability
-            // data to configure.
-            protobuf::write_length_delimited_field(&mut out, 2, &[]);
+            let capability = capabilities
+                .sensors
+                .as_ref()
+                .ok_or(ServiceDiscoveryResponseError::MissingCapability { channel_id, kind })?;
+            let sensor_source_service = encode_sensor_source_service(capability);
+            // Service.sensor_source_service (field 2).
+            protobuf::write_length_delimited_field(&mut out, 2, &sensor_source_service);
         }
         ServiceKind::Bluetooth => {
             let capability = capabilities
@@ -391,6 +404,18 @@ fn encode_input_source_service(capability: TouchCapability) -> Vec<u8> {
     input_source_service
 }
 
+fn encode_sensor_source_service(capability: &SensorCapability) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &sensor_type in &capability.sensor_types {
+        let mut sensor = Vec::new();
+        // Sensor.sensor_type (field 1, required enum).
+        protobuf::write_int32_field(&mut sensor, 1, sensor_type.wire_value());
+        // SensorSourceService.sensors (field 1, repeated Sensor).
+        protobuf::write_length_delimited_field(&mut out, 1, &sensor);
+    }
+    out
+}
+
 fn encode_bluetooth_service(capability: &BluetoothCapability) -> Vec<u8> {
     let mut out = Vec::new();
     // BluetoothService.car_address (field 1, required string).
@@ -464,6 +489,7 @@ mod tests {
             speech_audio: None,
             bluetooth: None,
             microphone: None,
+            sensors: None,
             head_unit_info: None,
         };
 
@@ -502,6 +528,7 @@ mod tests {
             speech_audio: None,
             bluetooth: None,
             microphone: None,
+            sensors: None,
             head_unit_info: None,
         };
 
@@ -540,6 +567,7 @@ mod tests {
             speech_audio: None,
             bluetooth: None,
             microphone: None,
+            sensors: None,
             head_unit_info: None,
         };
 
@@ -592,6 +620,7 @@ mod tests {
             speech_audio: None,
             bluetooth: None,
             microphone: None,
+            sensors: None,
             head_unit_info: None,
         };
 
@@ -646,22 +675,44 @@ mod tests {
     }
 
     #[test]
-    fn encodes_sensors_as_an_empty_message() {
+    fn encodes_sensors_with_driving_status_and_night_mode() {
         let catalogue = catalogue(&[ServiceCandidate {
             channel_id: 6,
             kind: ServiceKind::Sensors,
             availability: ServiceAvailability::Ready,
         }]);
-        let message =
-            encode_service_discovery_response(&catalogue, &ServiceCapabilities::default())
-                .expect("encode");
+        let capabilities = ServiceCapabilities {
+            sensors: Some(SensorCapability {
+                sensor_types: vec![SensorType::DrivingStatusData, SensorType::NightMode],
+            }),
+            ..ServiceCapabilities::default()
+        };
+        let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
         assert_eq!(
             message.body,
             vec![
-                0x0a, 0x04, // channels (field 1), length 4
+                0x0a, 0x0c, // channels (field 1), length 12
                 0x08, 0x06, // Service.id = 6
-                0x12, 0x00, // Service.sensor_source_service (field 2), length 0
+                0x12, 0x08, // Service.sensor_source_service (field 2), length 8
+                0x0a, 0x02, 0x08, 0x0d, // SensorSourceService.sensors[0] = {sensor_type: 13}
+                0x0a, 0x02, 0x08, 0x0a, // SensorSourceService.sensors[1] = {sensor_type: 10}
             ]
+        );
+    }
+
+    #[test]
+    fn missing_sensor_capability_fails_closed() {
+        let catalogue = catalogue(&[ServiceCandidate {
+            channel_id: 6,
+            kind: ServiceKind::Sensors,
+            availability: ServiceAvailability::Ready,
+        }]);
+        assert_eq!(
+            encode_service_discovery_response(&catalogue, &ServiceCapabilities::default()),
+            Err(ServiceDiscoveryResponseError::MissingCapability {
+                channel_id: 6,
+                kind: ServiceKind::Sensors,
+            })
         );
     }
 
@@ -783,6 +834,9 @@ mod tests {
                 sampling_rate: 16_000,
                 number_of_bits: 16,
                 number_of_channels: 1,
+            }),
+            sensors: Some(SensorCapability {
+                sensor_types: vec![SensorType::DrivingStatusData, SensorType::NightMode],
             }),
             head_unit_info: None,
         };

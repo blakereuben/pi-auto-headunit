@@ -20,7 +20,9 @@ mod channel_open;
 mod control;
 mod input_message;
 mod media_message;
+mod ping;
 mod protobuf;
+mod sensor;
 mod service_catalogue;
 mod service_discovery;
 mod service_discovery_response;
@@ -51,6 +53,12 @@ pub use input_message::{
 pub use media_message::{
     DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE, MediaMessage, MediaMessageError, MediaMessageId,
 };
+pub use ping::{PingError, decode_ping_response, encode_ping_request};
+pub use sensor::{
+    DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE, SensorError, SensorMessage, SensorMessageId, SensorType,
+    decode_sensor_request, encode_driving_status_unrestricted_batch, encode_night_mode_batch,
+    encode_sensor_response,
+};
 pub use service_catalogue::{
     DEFAULT_MAX_SERVICE_CANDIDATES, ServiceAvailability, ServiceCandidate, ServiceCatalogue,
     ServiceCatalogueError, ServiceDescriptor, ServiceKind,
@@ -62,8 +70,9 @@ pub use service_discovery::{
 };
 pub use service_discovery_response::{
     AudioCapability, AudioStreamType, BluetoothCapability, HeadUnitInfo, MicrophoneCapability,
-    ServiceCapabilities, ServiceDiscoveryResponseError, TouchCapability, TouchScreenType,
-    VideoCapability, VideoCodecResolution, VideoFrameRate, encode_service_discovery_response,
+    SensorCapability, ServiceCapabilities, ServiceDiscoveryResponseError, TouchCapability,
+    TouchScreenType, VideoCapability, VideoCodecResolution, VideoFrameRate,
+    encode_service_discovery_response,
 };
 pub use tls::{TlsClient, TlsProgress};
 pub use video_setup::{

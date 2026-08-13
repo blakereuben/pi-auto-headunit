@@ -232,6 +232,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
         speech_audio: None,
         bluetooth: None,
         microphone: None,
+        sensors: None,
         head_unit_info: None,
     };
     let response =
