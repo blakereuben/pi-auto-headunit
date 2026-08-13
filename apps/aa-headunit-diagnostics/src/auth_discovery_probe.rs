@@ -20,11 +20,22 @@
 //! `MEDIA_CODEC_AUDIO_PCM` instead of H.264; the same `AudioSetupStateMachine`
 //! is reused unmodified for all three audio channels, since each advertises
 //! a single uncompressed PCM `AudioConfiguration`, just at different sample
-//! rates). It stops the instant the video channel receives `Start` and the
-//! input channel has opened — no `MEDIA_MESSAGE_DATA` byte is ever parsed,
-//! no video decode/render/UI work happens here, and none of the other three
-//! channels are driven past open. See the channel-setup design record for
-//! the full scope boundary and provenance trail.
+//! rates). Once the video channel receives `Start` and the input channel
+//! has opened, the probe no longer stops immediately — it keeps observing
+//! the video channel for whatever the phone sends next, for the remainder
+//! of `PROBE_TIMEOUT` (see `report_probe_outcome`'s doc comment). The video
+//! channel is a `MediaSinkService`: the phone sends real video data to the
+//! head unit, not the reverse (confirmed from AASDK's own
+//! `IVideoServiceChannelEventHandler` — no head-unit-side "send video"
+//! method exists), so this only ever *receives* and byte-counts `Data`
+//! (`MEDIA_MESSAGE_DATA`, an 8-byte timestamp prefix plus raw encoded-frame
+//! bytes) or `CodecConfig` (`MEDIA_MESSAGE_CODEC_CONFIG`, raw bytes, no
+//! prefix) — never any actual frame content, matching this project's
+//! no-raw-payload-logging rule. No video decode/render/UI work happens
+//! here, no `MEDIA_MESSAGE_ACK` is ever sent (so the phone may only send a
+//! single unacknowledged frame given `Config.max_unacked = 1`), and none of
+//! the other three channels are driven past open. See the channel-setup
+//! design record for the full scope boundary and provenance trail.
 //!
 //! Every non-video channel, the populated `HeadUnitInfo`, `AudioFocusRequest`
 //! handling, `KeyBindingRequest` handling, and the
@@ -173,6 +184,57 @@
 //! `encode_video_focus_notification`) — a real, pre-existing part of the
 //! protocol this project had simply never sent. `handle_video_channel_message`
 //! now sends it right after `Config`, in the same `Setup` response.
+//!
+//! Real-hardware result: the phone finally sent `Start` on the video
+//! channel — the deepest point this probe had ever reached — but Error 2
+//! still appeared. Since this probe had always exited the instant `Start`
+//! arrived, it had never actually observed what the phone does next. It
+//! now keeps running past `Start` for the rest of `PROBE_TIMEOUT`,
+//! decoding (but never rendering, and never logging content) any real
+//! `Data`/`CodecConfig` the phone sends on the video channel — see the
+//! earlier paragraph on `MediaSinkService` direction and
+//! `report_probe_outcome`'s doc comment for the stop-condition change this
+//! required (`ChannelSetupComplete` is now a milestone to keep observing
+//! past, not a termination signal).
+//!
+//! At the user's request, this pass did a comprehensive audit of `f-io/LIVI`'s
+//! **entire** session lifecycle — every channel, from connection through
+//! active streaming — rather than another narrow, single-message
+//! comparison. Two concrete, confirmed discrepancies came out of it: (1)
+//! this probe never sent `MEDIA_MESSAGE_ACK` in reply to `Data`/
+//! `CodecConfig`, despite advertising `Config.max_unacked = 1` on every
+//! channel — LIVI acks every single frame, unconditionally, on video and
+//! all three audio channels (`_sendAck()`, byte-identical in both
+//! `VideoChannel.ts`/`AudioChannel.ts`: `session_id` echoed from `Start`,
+//! `ack` always `1`), with the comment *"ACK every frame to avoid phone
+//! triggering `CAR_NOT_RESPONDING` (>400 unacked)"* — with `max_unacked=1`
+//! and no ack ever sent, the phone could send at most one frame. Now fixed
+//! (`protocol_aap::media_message::encode_media_ack`, wired into every AV
+//! channel's `Open` state — video and all three audio channels graduated
+//! from a bare, machine-discarding `Ready` variant to `Open(...)` holding
+//! the machine, the same restructuring already done for video). (2)
+//! `KeyBindingResponse` was over-strict (see `evaluate_key_binding_request`'s
+//! doc comment). Everything else the audit covered (sensors, Bluetooth,
+//! microphone, navigation, video-focus timing) was confirmed to already
+//! match what LIVI does — not gaps. Ping-cadence alignment (LIVI pings
+//! every 1500ms, not this project's 5000ms, and advertises that interval
+//! in `ServiceDiscoveryResponse` — never populated here) was a
+//! lower-confidence finding, deliberately left for a later, separate pass.
+//!
+//! Real-hardware result for the ack/`KeyBindingResponse` batch: the
+//! cleanest run in this investigation — every implemented step succeeded,
+//! `channel_setup_complete`/`observing_for_post_start_media_traffic` both
+//! printed, a `SensorRequest` arrived and was correctly answered *during*
+//! the post-`Start` observation window, and the probe ran to a clean
+//! `observation_window_complete` with no local error at all. Still no
+//! `Data`/`CodecConfig` ever arrived on the video channel, and Error 2
+//! still appeared. But `Start` typically lands late in the 10s
+//! `PROBE_TIMEOUT` budget, leaving only ~1-2s of real observation time —
+//! not enough to be confident the phone would never send media data.
+//! `PROBE_TIMEOUT` is raised here for a longer post-`Start` window, the
+//! same minimal, reversible technique already proven safe for the earlier
+//! 10s→30s experiment (see `docs/protocol/error-2-investigation.md`,
+//! "Suggested next steps").
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{
@@ -189,12 +251,12 @@ use protocol_aap::{
     ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue,
     ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress, TouchCapability,
     TouchScreenType, VideoCapability, VideoCodecResolution, VideoFrameRate, VideoSetupAction,
-    VideoSetupEvent, VideoSetupStateMachine, decode_audio_focus_request, decode_byebye_request,
-    decode_frame, decode_key_binding_request, decode_nav_focus_request, decode_ping_response,
-    decode_sensor_request, encode_audio_focus_notification, encode_byebye_response,
-    encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
-    encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
-    encode_sensor_response, encode_service_discovery_response,
+    VideoSetupEvent, VideoSetupState, VideoSetupStateMachine, decode_audio_focus_request,
+    decode_byebye_request, decode_frame, decode_key_binding_request, decode_nav_focus_request,
+    decode_ping_response, decode_sensor_request, encode_audio_focus_notification,
+    encode_byebye_response, encode_driving_status_unrestricted_batch, encode_frame,
+    encode_key_binding_response, encode_nav_focus_notification, encode_night_mode_batch,
+    encode_ping_request, encode_sensor_response, encode_service_discovery_response,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::{HashMap, VecDeque};
@@ -203,7 +265,14 @@ use transport_api::{SessionTransport, TransportError};
 
 use crate::CliError;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Raised from 10s to 30s for a longer post-`Start` media-observation
+/// window (see the module doc comment's "Real-hardware result for the
+/// ack/`KeyBindingResponse` batch" paragraph) — `Start` typically arrives
+/// late in a 10s budget, leaving too little time to tell whether the phone
+/// would eventually send `Data`/`CodecConfig`. Directly analogous to the
+/// earlier 10s→30s experiment already proven safe (no behavioral
+/// difference observed then, beyond the intended longer window).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Matches `OpenAuto`'s `AndroidAutoEntityFactory.cpp`, which constructs its
 /// `Pinger` with a hard-coded 5000ms interval
 /// (`std::make_shared<Pinger>(ioService_, 5000)`), armed from
@@ -233,8 +302,21 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// draining its own USB OUT buffer — which would manifest exactly as our
 /// bulk-OUT write eventually timing out. `send_ping_request` now sends
 /// `PingRequest` TLS-encrypted instead, as a deliberate, reversible
-/// deviation from the pinned source to test against this real phone.
-const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// deviation from the pinned source to test against this real phone. Also
+/// refuted: even with a bulk-OUT write timeout matching AASDK's own 10s
+/// reference value, the write still stalls — see `error-2-investigation.md`.
+///
+/// Was temporarily raised past `PROBE_TIMEOUT` again for the post-`Start`
+/// media-observation trial (the write timeout struck again right as the
+/// observation window opened) and again for the ack/`KeyBindingResponse`
+/// batch — both trials completed cleanly with `PING_INTERVAL` neutralized,
+/// reaching `Start` and running the full observation window with no local
+/// error, but no `Data`/`CodecConfig` ever arrived either time. Reverted
+/// back to 5s, then hit the identical write timeout again on the very next
+/// trial (the 30s `PROBE_TIMEOUT` observation-window experiment) — still
+/// unresolved, so raised past `PROBE_TIMEOUT` (3600s) once more to isolate
+/// that trial's own variable (window length) from this still-open confound.
+const PING_INTERVAL: Duration = Duration::from_secs(3600);
 const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
 /// Head-unit-assigned channel ids advertised in `ServiceDiscoveryResponse`.
 /// These are this probe's own choice, not AASDK's internal `ChannelId`
@@ -262,21 +344,25 @@ const VOICE_AUDIO_BITS: u32 = 16;
 const VOICE_AUDIO_CHANNELS: u32 = 1;
 
 /// Per-channel progress for the video channel, driven once
-/// `ServiceDiscoveryResponse` has been sent.
+/// `ServiceDiscoveryResponse` has been sent. `Open` covers the entire
+/// post-open lifecycle (`Setup`→`Config`→`Start`→ongoing media
+/// observation) — `VideoSetupStateMachine` already tracks `Ready`
+/// internally, so there's no separate app-level "ready" marker; the
+/// machine is kept (not discarded) once `Ready`, so further `InboundMedia`
+/// events keep flowing to it instead of being rejected.
 enum VideoChannel {
     AwaitingOpen(ChannelOpenStateMachine),
-    AwaitingSetup(VideoSetupStateMachine),
-    Ready,
+    Open(VideoSetupStateMachine),
 }
 
 /// Per-channel progress for the `MediaAudio` channel, driven once
 /// `ServiceDiscoveryResponse` has been sent. Same shape as `VideoChannel`
 /// (see `protocol_aap::audio_setup` for why this is a separate type rather
-/// than a shared one).
+/// than a shared one) — `Open` covers the entire post-open lifecycle, same
+/// reasoning as `VideoChannel::Open`.
 enum MediaAudioChannel {
     AwaitingOpen(ChannelOpenStateMachine),
-    AwaitingSetup(AudioSetupStateMachine),
-    Ready,
+    Open(AudioSetupStateMachine),
 }
 
 /// Per-channel progress for the `SystemAudio` channel, driven once
@@ -287,8 +373,7 @@ enum MediaAudioChannel {
 /// `AudioSetupStateMachine` is reused unmodified.
 enum SystemAudioChannel {
     AwaitingOpen(ChannelOpenStateMachine),
-    AwaitingSetup(AudioSetupStateMachine),
-    Ready,
+    Open(AudioSetupStateMachine),
 }
 
 /// Per-channel progress for the `SpeechAudio` channel, driven once
@@ -300,8 +385,7 @@ enum SystemAudioChannel {
 /// `AudioSetupStateMachine` is reused unmodified.
 enum SpeechAudioChannel {
     AwaitingOpen(ChannelOpenStateMachine),
-    AwaitingSetup(AudioSetupStateMachine),
-    Ready,
+    Open(AudioSetupStateMachine),
 }
 
 /// Per-channel progress for the `Sensors` channel, driven once
@@ -377,6 +461,10 @@ pub fn run<T: SessionTransport>(
     let mut assembler =
         MessageAssembler::new(7).map_err(|error| CliError::Protocol(error.to_string()))?;
 
+    // Set once ChannelSetupComplete is first reached; no longer stops the
+    // probe (see report_probe_outcome) — the loop keeps running to observe
+    // whatever the phone sends after video Start, until PROBE_TIMEOUT.
+    let mut channel_setup_complete = false;
     let mut video_channel: Option<VideoChannel> = None;
     let mut media_audio_channel: Option<MediaAudioChannel> = None;
     let mut system_audio_channel: Option<SystemAudioChannel> = None;
@@ -433,27 +521,38 @@ pub fn run<T: SessionTransport>(
                 transport,
                 limits,
             )?;
-            if report_probe_outcome(&outcome) {
+            if report_probe_outcome(&outcome, &mut channel_setup_complete) {
                 return Ok(());
             }
         }
     }
 
+    if channel_setup_complete {
+        println!("probe_result=observation_window_complete");
+        return Ok(());
+    }
     println!("probe_tls_state={}", tls.handshake_state());
     Err(CliError::Protocol(
         "auth/service-discovery/channel-setup probe timed out before completion".into(),
     ))
 }
 
-/// Prints the terminal `probe_result`/`probe_stop` lines for a
-/// [`ProbeOutcome`] and reports whether `run()` should stop now.
-fn report_probe_outcome(outcome: &ProbeOutcome) -> bool {
+/// Prints diagnostic lines for a [`ProbeOutcome`] and reports whether
+/// `run()` should stop immediately. `ChannelSetupComplete` no longer stops
+/// the probe — video `Start` is now a milestone to keep observing past
+/// (does the phone send real media data?), not a termination signal —
+/// `channel_setup_complete` is set once so `run()` can tell a clean
+/// end-of-observation-window timeout apart from a genuine failure.
+fn report_probe_outcome(outcome: &ProbeOutcome, channel_setup_complete: &mut bool) -> bool {
     match outcome {
         ProbeOutcome::Continue => false,
         ProbeOutcome::ChannelSetupComplete => {
-            println!("probe_result=video_channel_start_received");
-            println!("probe_stop=video_channel_start_received_ready_for_media_data");
-            true
+            if !*channel_setup_complete {
+                println!("probe_state=channel_setup_complete");
+                println!("probe_state=observing_for_post_start_media_traffic");
+                *channel_setup_complete = true;
+            }
+            false
         }
         ProbeOutcome::PhoneEndedSession(reason) => {
             println!("probe_result=phone_ended_session");
@@ -548,13 +647,15 @@ fn handle_message<T: SessionTransport>(
     let input_open = simple_channels
         .get(&INPUT_CHANNEL_ID)
         .is_some_and(|machine| machine.state() == ChannelOpenState::Open);
-    Ok(
-        if matches!(video_channel, Some(VideoChannel::Ready)) && input_open {
-            ProbeOutcome::ChannelSetupComplete
-        } else {
-            ProbeOutcome::Continue
-        },
-    )
+    let video_ready = matches!(
+        video_channel,
+        Some(VideoChannel::Open(machine)) if machine.state() == VideoSetupState::Ready
+    );
+    Ok(if video_ready && input_open {
+        ProbeOutcome::ChannelSetupComplete
+    } else {
+        ProbeOutcome::Continue
+    })
 }
 
 /// Handles control-channel traffic that arrives after `HandshakeStateMachine`
@@ -847,13 +948,13 @@ fn handle_video_channel_message<T: SessionTransport>(
                 )?;
             }
             println!("probe_state=video_channel_open");
-            *state = VideoChannel::AwaitingSetup(VideoSetupStateMachine::new());
+            *state = VideoChannel::Open(VideoSetupStateMachine::new());
             Ok(())
         }
-        VideoChannel::AwaitingSetup(machine) => {
+        VideoChannel::Open(machine) => {
             if message.message_type != MessageType::Specific {
                 return Err(CliError::Protocol(
-                    "expected Setup/Start on video channel".into(),
+                    "expected a video-channel media message".into(),
                 ));
             }
             let actions = machine
@@ -878,6 +979,9 @@ fn handle_video_channel_message<T: SessionTransport>(
                             MediaMessageId::VideoFocusNotification => {
                                 println!("probe_state=video_channel_video_focus_notification_sent");
                             }
+                            MediaMessageId::Ack => {
+                                println!("probe_state=video_channel_ack_sent");
+                            }
                             _ => {
                                 println!("probe_state=video_channel_setup_config_sent");
                             }
@@ -890,15 +994,23 @@ fn handle_video_channel_message<T: SessionTransport>(
                         println!("probe_state=video_channel_start_received");
                         println!("video_channel_session_id={session_id}");
                         println!("video_channel_configuration_index={configuration_index}");
-                        *state = VideoChannel::Ready;
+                    }
+                    VideoSetupAction::MediaDataReceived {
+                        timestamp,
+                        byte_len,
+                    } => {
+                        println!("probe_state=video_media_data_received");
+                        println!("video_media_data_timestamp={timestamp}");
+                        println!("video_media_data_bytes={byte_len}");
+                    }
+                    VideoSetupAction::CodecConfigReceived { byte_len } => {
+                        println!("probe_state=video_media_codec_config_received");
+                        println!("video_media_codec_config_bytes={byte_len}");
                     }
                 }
             }
             Ok(())
         }
-        VideoChannel::Ready => Err(CliError::Protocol(
-            "unexpected message on video channel after Start".into(),
-        )),
     }
 }
 
@@ -944,13 +1056,13 @@ fn handle_media_audio_channel_message<T: SessionTransport>(
                 )?;
             }
             println!("probe_state=media_audio_channel_open");
-            *state = MediaAudioChannel::AwaitingSetup(AudioSetupStateMachine::new());
+            *state = MediaAudioChannel::Open(AudioSetupStateMachine::new());
             Ok(())
         }
-        MediaAudioChannel::AwaitingSetup(machine) => {
+        MediaAudioChannel::Open(machine) => {
             if message.message_type != MessageType::Specific {
                 return Err(CliError::Protocol(
-                    "expected Setup/Start on media-audio channel".into(),
+                    "expected a media-audio-channel media message".into(),
                 ));
             }
             let actions = machine
@@ -962,6 +1074,7 @@ fn handle_media_audio_channel_message<T: SessionTransport>(
                         let payload = response
                             .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
                             .map_err(|error| CliError::Protocol(error.to_string()))?;
+                        let response_id = response.id;
                         send_encrypted(
                             transport,
                             tls,
@@ -970,7 +1083,14 @@ fn handle_media_audio_channel_message<T: SessionTransport>(
                             &payload,
                             limits,
                         )?;
-                        println!("probe_state=media_audio_channel_setup_config_sent");
+                        match response_id {
+                            MediaMessageId::Ack => {
+                                println!("probe_state=media_audio_channel_ack_sent");
+                            }
+                            _ => {
+                                println!("probe_state=media_audio_channel_setup_config_sent");
+                            }
+                        }
                     }
                     AudioSetupAction::Ready {
                         session_id,
@@ -979,15 +1099,23 @@ fn handle_media_audio_channel_message<T: SessionTransport>(
                         println!("probe_state=media_audio_channel_start_received");
                         println!("media_audio_channel_session_id={session_id}");
                         println!("media_audio_channel_configuration_index={configuration_index}");
-                        *state = MediaAudioChannel::Ready;
+                    }
+                    AudioSetupAction::MediaDataReceived {
+                        timestamp,
+                        byte_len,
+                    } => {
+                        println!("probe_state=media_audio_media_data_received");
+                        println!("media_audio_media_data_timestamp={timestamp}");
+                        println!("media_audio_media_data_bytes={byte_len}");
+                    }
+                    AudioSetupAction::CodecConfigReceived { byte_len } => {
+                        println!("probe_state=media_audio_media_codec_config_received");
+                        println!("media_audio_media_codec_config_bytes={byte_len}");
                     }
                 }
             }
             Ok(())
         }
-        MediaAudioChannel::Ready => Err(CliError::Protocol(
-            "unexpected message on media-audio channel after Start".into(),
-        )),
     }
 }
 
@@ -1035,13 +1163,13 @@ fn handle_system_audio_channel_message<T: SessionTransport>(
                 )?;
             }
             println!("probe_state=system_audio_channel_open");
-            *state = SystemAudioChannel::AwaitingSetup(AudioSetupStateMachine::new());
+            *state = SystemAudioChannel::Open(AudioSetupStateMachine::new());
             Ok(())
         }
-        SystemAudioChannel::AwaitingSetup(machine) => {
+        SystemAudioChannel::Open(machine) => {
             if message.message_type != MessageType::Specific {
                 return Err(CliError::Protocol(
-                    "expected Setup/Start on system-audio channel".into(),
+                    "expected a system-audio-channel media message".into(),
                 ));
             }
             let actions = machine
@@ -1053,6 +1181,7 @@ fn handle_system_audio_channel_message<T: SessionTransport>(
                         let payload = response
                             .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
                             .map_err(|error| CliError::Protocol(error.to_string()))?;
+                        let response_id = response.id;
                         send_encrypted(
                             transport,
                             tls,
@@ -1061,7 +1190,14 @@ fn handle_system_audio_channel_message<T: SessionTransport>(
                             &payload,
                             limits,
                         )?;
-                        println!("probe_state=system_audio_channel_setup_config_sent");
+                        match response_id {
+                            MediaMessageId::Ack => {
+                                println!("probe_state=system_audio_channel_ack_sent");
+                            }
+                            _ => {
+                                println!("probe_state=system_audio_channel_setup_config_sent");
+                            }
+                        }
                     }
                     AudioSetupAction::Ready {
                         session_id,
@@ -1070,15 +1206,23 @@ fn handle_system_audio_channel_message<T: SessionTransport>(
                         println!("probe_state=system_audio_channel_start_received");
                         println!("system_audio_channel_session_id={session_id}");
                         println!("system_audio_channel_configuration_index={configuration_index}");
-                        *state = SystemAudioChannel::Ready;
+                    }
+                    AudioSetupAction::MediaDataReceived {
+                        timestamp,
+                        byte_len,
+                    } => {
+                        println!("probe_state=system_audio_media_data_received");
+                        println!("system_audio_media_data_timestamp={timestamp}");
+                        println!("system_audio_media_data_bytes={byte_len}");
+                    }
+                    AudioSetupAction::CodecConfigReceived { byte_len } => {
+                        println!("probe_state=system_audio_media_codec_config_received");
+                        println!("system_audio_media_codec_config_bytes={byte_len}");
                     }
                 }
             }
             Ok(())
         }
-        SystemAudioChannel::Ready => Err(CliError::Protocol(
-            "unexpected message on system-audio channel after Start".into(),
-        )),
     }
 }
 
@@ -1127,13 +1271,13 @@ fn handle_speech_audio_channel_message<T: SessionTransport>(
                 )?;
             }
             println!("probe_state=speech_audio_channel_open");
-            *state = SpeechAudioChannel::AwaitingSetup(AudioSetupStateMachine::new());
+            *state = SpeechAudioChannel::Open(AudioSetupStateMachine::new());
             Ok(())
         }
-        SpeechAudioChannel::AwaitingSetup(machine) => {
+        SpeechAudioChannel::Open(machine) => {
             if message.message_type != MessageType::Specific {
                 return Err(CliError::Protocol(
-                    "expected Setup/Start on speech-audio channel".into(),
+                    "expected a speech-audio-channel media message".into(),
                 ));
             }
             let actions = machine
@@ -1145,6 +1289,7 @@ fn handle_speech_audio_channel_message<T: SessionTransport>(
                         let payload = response
                             .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
                             .map_err(|error| CliError::Protocol(error.to_string()))?;
+                        let response_id = response.id;
                         send_encrypted(
                             transport,
                             tls,
@@ -1153,7 +1298,14 @@ fn handle_speech_audio_channel_message<T: SessionTransport>(
                             &payload,
                             limits,
                         )?;
-                        println!("probe_state=speech_audio_channel_setup_config_sent");
+                        match response_id {
+                            MediaMessageId::Ack => {
+                                println!("probe_state=speech_audio_channel_ack_sent");
+                            }
+                            _ => {
+                                println!("probe_state=speech_audio_channel_setup_config_sent");
+                            }
+                        }
                     }
                     AudioSetupAction::Ready {
                         session_id,
@@ -1162,15 +1314,23 @@ fn handle_speech_audio_channel_message<T: SessionTransport>(
                         println!("probe_state=speech_audio_channel_start_received");
                         println!("speech_audio_channel_session_id={session_id}");
                         println!("speech_audio_channel_configuration_index={configuration_index}");
-                        *state = SpeechAudioChannel::Ready;
+                    }
+                    AudioSetupAction::MediaDataReceived {
+                        timestamp,
+                        byte_len,
+                    } => {
+                        println!("probe_state=speech_audio_media_data_received");
+                        println!("speech_audio_media_data_timestamp={timestamp}");
+                        println!("speech_audio_media_data_bytes={byte_len}");
+                    }
+                    AudioSetupAction::CodecConfigReceived { byte_len } => {
+                        println!("probe_state=speech_audio_media_codec_config_received");
+                        println!("speech_audio_media_codec_config_bytes={byte_len}");
                     }
                 }
             }
             Ok(())
         }
-        SpeechAudioChannel::Ready => Err(CliError::Protocol(
-            "unexpected message on speech-audio channel after Start".into(),
-        )),
     }
 }
 
@@ -1355,7 +1515,7 @@ fn handle_input_channel_message<T: SessionTransport>(
                 .map_err(|error| CliError::Protocol(error.to_string()))?;
             println!("probe_state=key_binding_requested");
             println!("key_binding_requested_count={}", keycodes.len());
-            let status = evaluate_key_binding_request(&keycodes);
+            let status = evaluate_key_binding_request();
             let response = encode_key_binding_response(status);
             let payload = response
                 .encode(DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE)
@@ -1378,18 +1538,18 @@ fn handle_input_channel_message<T: SessionTransport>(
     }
 }
 
-/// This project's `ServiceDiscoveryResponse` advertises zero supported
-/// keycodes today (no button hardware wired up yet), so the only honest
-/// response is `KeycodeNotBound` for any non-empty request — matching that
-/// declared capability exactly, not a guess (mirrors `OpenAuto`'s
-/// `InputService::onBindingRequest` validation against its own advertised
-/// list). An empty request trivially has nothing unsupported in it.
-const fn evaluate_key_binding_request(keycodes: &[i32]) -> KeyBindingStatus {
-    if keycodes.is_empty() {
-        KeyBindingStatus::Success
-    } else {
-        KeyBindingStatus::KeycodeNotBound
-    }
+/// Always answers `Success`, matching `f-io/LIVI`'s own `KeyBindingResponse`
+/// handling (`Session.ts`: unconditional `[0x08,0x00]`/`STATUS_OK`,
+/// regardless of which keycodes were requested). This project previously
+/// validated the request against its own advertised (empty) keycode
+/// capability list, replying `KeycodeNotBound` for any non-empty request —
+/// matching `OpenAuto`'s older, stricter `InputService::onBindingRequest`
+/// behavior. Every real request observed so far has been empty, so this
+/// hadn't mattered in practice, but LIVI (a confirmed-working modern
+/// client) never does this validation, so the stricter behavior is now a
+/// known-wrong deviation, corrected here.
+const fn evaluate_key_binding_request() -> KeyBindingStatus {
+    KeyBindingStatus::Success
 }
 
 /// Encrypts `plaintext_payload` and sends it framed on `channel_id`.

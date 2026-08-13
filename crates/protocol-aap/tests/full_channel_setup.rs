@@ -418,4 +418,73 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
             configuration_index: 0,
         }]
     );
+
+    // --- Video channel: Ready stays Ready and decodes real media data ---
+    let mut data_body = 99_u64.to_be_bytes().to_vec();
+    data_body.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    let data_payload = MediaMessage {
+        id: MediaMessageId::Data,
+        body: data_body,
+    }
+    .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+    .expect("encode data");
+    phone_sends_encrypted(
+        &phone,
+        &mut phone_tls,
+        VIDEO_CHANNEL_ID,
+        MessageType::Specific,
+        &data_payload,
+    );
+    let message = read_and_decrypt_message(
+        &mut transport,
+        &mut assembler,
+        &mut client_tls,
+        handshake.state(),
+    )
+    .expect("read data");
+    let actions = video_setup
+        .advance(VideoSetupEvent::InboundMedia(&message.payload))
+        .expect("advance data");
+    assert_eq!(actions.len(), 2);
+    assert_eq!(
+        actions[0],
+        VideoSetupAction::MediaDataReceived {
+            timestamp: 99,
+            byte_len: 4,
+        }
+    );
+    let VideoSetupAction::SendMedia(ack) = &actions[1] else {
+        panic!("expected SendMedia");
+    };
+    assert_eq!(ack.id, MediaMessageId::Ack);
+    assert_eq!(ack.body, vec![0x08, 0x07, 0x10, 0x01]);
+
+    // --- Send the Ack and confirm the phone receives it, proving the flow-control reply end to end ---
+    let ack_payload = ack
+        .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+        .expect("encode ack");
+    let ciphertext = client_tls
+        .encrypt_application_data(&ack_payload)
+        .expect("client encrypt ack");
+    let frame = encode_frame(
+        FrameHeader {
+            channel_id: VIDEO_CHANNEL_ID,
+            frame_type: FrameType::Bulk,
+            encryption: Encryption::Encrypted,
+            message_type: MessageType::Specific,
+        },
+        None,
+        &ciphertext,
+        limits(),
+    )
+    .expect("encode ack frame");
+    transport.send_all(&frame).expect("send ack");
+
+    let (channel_id, message_type, plaintext) = phone_receives_encrypted(&phone, &mut phone_tls);
+    assert_eq!(channel_id, VIDEO_CHANNEL_ID);
+    assert_eq!(message_type, MessageType::Specific);
+    let decoded_ack =
+        MediaMessage::decode(&plaintext, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE).expect("decode ack");
+    assert_eq!(decoded_ack.id, MediaMessageId::Ack);
+    assert_eq!(decoded_ack.body, vec![0x08, 0x07, 0x10, 0x01]);
 }

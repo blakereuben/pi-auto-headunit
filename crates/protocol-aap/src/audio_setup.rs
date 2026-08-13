@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::media_message::{
     DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE, MediaMessage, MediaMessageError, MediaMessageId,
+    decode_media_data, encode_media_ack,
 };
 use crate::protobuf::{self, ProtobufDecodeError};
 
@@ -58,11 +59,27 @@ pub enum AudioSetupEvent<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AudioSetupAction {
     SendMedia(MediaMessage),
-    /// Terminal: `Start` was received and accepted. This is where this
-    /// increment stops — no `MEDIA_MESSAGE_DATA` byte is ever parsed.
+    /// `Start` was received and accepted — the channel is now `Ready` and
+    /// stays `Ready`; further `InboundMedia` events keep flowing to
+    /// `handle_media` rather than being rejected.
     Ready {
         session_id: i32,
         configuration_index: u32,
+    },
+    /// A `Data` message arrived while `Ready` — the phone (a
+    /// `MediaSinkService`'s source) sending actual encoded audio to the
+    /// head unit. `byte_len` is the payload length with the 8-byte
+    /// timestamp prefix already stripped; bytes are never retained or
+    /// logged.
+    MediaDataReceived {
+        timestamp: u64,
+        byte_len: usize,
+    },
+    /// A `CodecConfig` message arrived while `Ready` — out-of-band codec
+    /// initialization data, no timestamp prefix. `byte_len` is the raw
+    /// body length; bytes are never retained or logged.
+    CodecConfigReceived {
+        byte_len: usize,
     },
 }
 
@@ -84,6 +101,9 @@ pub enum AudioSetupError {
     MissingCodecType,
     MissingSessionId,
     MissingConfigurationIndex,
+    TruncatedMediaData {
+        available: usize,
+    },
     UnexpectedWireType {
         field: u32,
         wire_type: u8,
@@ -123,6 +143,10 @@ impl fmt::Display for AudioSetupError {
             Self::MissingConfigurationIndex => {
                 formatter.write_str("Start is missing its required configuration_index field")
             }
+            Self::TruncatedMediaData { available } => write!(
+                formatter,
+                "Data requires an 8-byte timestamp prefix, {available} available"
+            ),
             Self::UnexpectedWireType { field, wire_type } => write!(
                 formatter,
                 "audio-setup field {field} has unexpected wire type {wire_type}"
@@ -171,6 +195,10 @@ impl ProtobufDecodeError for AudioSetupError {
 #[derive(Debug)]
 pub struct AudioSetupStateMachine {
     state: AudioSetupState,
+    /// Captured from `Start`; needed to echo back in `Ack` once `Ready`.
+    /// Always `Some` once `state` is `Ready` — the only path into `Ready`
+    /// is `handle_start`, which sets both in the same step.
+    session_id: Option<i32>,
 }
 
 impl Default for AudioSetupStateMachine {
@@ -184,6 +212,7 @@ impl AudioSetupStateMachine {
     pub const fn new() -> Self {
         Self {
             state: AudioSetupState::AwaitingSetup,
+            session_id: None,
         }
     }
 
@@ -213,9 +242,8 @@ impl AudioSetupStateMachine {
         match self.state {
             AudioSetupState::AwaitingSetup => self.handle_setup(&message),
             AudioSetupState::AwaitingStart => self.handle_start(&message),
-            AudioSetupState::Ready | AudioSetupState::Failed => {
-                Err(AudioSetupError::UnexpectedEvent { state: self.state })
-            }
+            AudioSetupState::Ready => self.handle_media(&message),
+            AudioSetupState::Failed => Err(AudioSetupError::UnexpectedEvent { state: self.state }),
         }
     }
 
@@ -268,10 +296,52 @@ impl AudioSetupStateMachine {
             });
         }
         self.state = AudioSetupState::Ready;
+        self.session_id = Some(session_id);
         Ok(vec![AudioSetupAction::Ready {
             session_id,
             configuration_index,
         }])
+    }
+
+    /// Handles traffic once `Ready` — the phone (as `MediaSinkService`
+    /// source) streaming actual encoded audio to the head unit. Not a
+    /// state transition: stays `Ready` either way. Every `Data`/
+    /// `CodecConfig` gets an unconditional `Ack` right back (flow control —
+    /// see `encode_media_ack`'s doc comment for why). Fails closed on
+    /// anything else, matching every other decoder in this crate.
+    fn handle_media(
+        &mut self,
+        message: &MediaMessage,
+    ) -> Result<Vec<AudioSetupAction>, AudioSetupError> {
+        let session_id = self
+            .session_id
+            .expect("session_id is set once Ready, the only state handle_media runs in");
+        match message.id {
+            MediaMessageId::Data => {
+                let Some((timestamp, byte_len)) = decode_media_data(&message.body) else {
+                    return Err(AudioSetupError::TruncatedMediaData {
+                        available: message.body.len(),
+                    });
+                };
+                Ok(vec![
+                    AudioSetupAction::MediaDataReceived {
+                        timestamp,
+                        byte_len,
+                    },
+                    AudioSetupAction::SendMedia(encode_media_ack(session_id)),
+                ])
+            }
+            MediaMessageId::CodecConfig => Ok(vec![
+                AudioSetupAction::CodecConfigReceived {
+                    byte_len: message.body.len(),
+                },
+                AudioSetupAction::SendMedia(encode_media_ack(session_id)),
+            ]),
+            other => Err(AudioSetupError::UnexpectedMediaMessage {
+                state: self.state,
+                id: other,
+            }),
+        }
     }
 }
 
@@ -389,6 +459,90 @@ mod tests {
                 configuration_index: 0,
             }]
         );
+
+        // --- Ready stays Ready and keeps decoding media traffic ---
+        let mut data_body = 42_u64.to_be_bytes().to_vec();
+        data_body.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        let actions = machine
+            .advance(AudioSetupEvent::InboundMedia(&media_message(
+                MediaMessageId::Data,
+                data_body,
+            )))
+            .expect("data");
+        assert_eq!(machine.state(), AudioSetupState::Ready);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions[0],
+            AudioSetupAction::MediaDataReceived {
+                timestamp: 42,
+                byte_len: 3,
+            }
+        );
+        let AudioSetupAction::SendMedia(ack) = &actions[1] else {
+            panic!("expected SendMedia");
+        };
+        assert_eq!(ack.id, MediaMessageId::Ack);
+        assert_eq!(ack.body, vec![0x08, 0x07, 0x10, 0x01]);
+
+        let actions = machine
+            .advance(AudioSetupEvent::InboundMedia(&media_message(
+                MediaMessageId::CodecConfig,
+                vec![0x01, 0x02, 0x03, 0x04],
+            )))
+            .expect("codec config");
+        assert_eq!(machine.state(), AudioSetupState::Ready);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions[0],
+            AudioSetupAction::CodecConfigReceived { byte_len: 4 }
+        );
+        let AudioSetupAction::SendMedia(ack) = &actions[1] else {
+            panic!("expected SendMedia");
+        };
+        assert_eq!(ack.id, MediaMessageId::Ack);
+        assert_eq!(ack.body, vec![0x08, 0x07, 0x10, 0x01]);
+    }
+
+    #[test]
+    fn rejects_truncated_media_data() {
+        let mut machine = AudioSetupStateMachine::new();
+        machine
+            .advance(AudioSetupEvent::InboundMedia(&setup_payload(
+                MEDIA_CODEC_AUDIO_PCM,
+            )))
+            .expect("setup");
+        machine
+            .advance(AudioSetupEvent::InboundMedia(&start_payload(7, 0)))
+            .expect("start");
+        assert_eq!(
+            machine.advance(AudioSetupEvent::InboundMedia(&media_message(
+                MediaMessageId::Data,
+                vec![0x00, 0x00, 0x00],
+            ))),
+            Err(AudioSetupError::TruncatedMediaData { available: 3 })
+        );
+        assert_eq!(machine.state(), AudioSetupState::Failed);
+    }
+
+    #[test]
+    fn rejects_unexpected_message_while_ready() {
+        let mut machine = AudioSetupStateMachine::new();
+        machine
+            .advance(AudioSetupEvent::InboundMedia(&setup_payload(
+                MEDIA_CODEC_AUDIO_PCM,
+            )))
+            .expect("setup");
+        machine
+            .advance(AudioSetupEvent::InboundMedia(&start_payload(7, 0)))
+            .expect("start");
+        assert_eq!(
+            machine.advance(AudioSetupEvent::InboundMedia(&start_payload(7, 0))),
+            Err(AudioSetupError::UnexpectedMediaMessage {
+                state: AudioSetupState::Ready,
+                id: MediaMessageId::Start,
+            })
+        );
+        assert_eq!(machine.state(), AudioSetupState::Failed);
     }
 
     #[test]
