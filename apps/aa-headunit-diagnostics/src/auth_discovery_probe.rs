@@ -235,6 +235,40 @@
 //! same minimal, reversible technique already proven safe for the earlier
 //! 10s→30s experiment (see `docs/protocol/error-2-investigation.md`,
 //! "Suggested next steps").
+//!
+//! Real-hardware result for the 30s window: the full window elapsed
+//! cleanly (no local error), one more `SensorRequest` arrived and was
+//! answered mid-window, but `Data`/`CodecConfig` still never arrived, and
+//! Error 2 still appeared. This refutes "the window was too short" —
+//! see `docs/protocol/error-2-investigation.md`, "30-second observation
+//! window".
+//!
+//! Separately, checking the AOA (Android Open Accessory) transport layer
+//! itself surfaced one untested variable, isolated as its own single-change
+//! experiment: `usb_auth_discovery_probe` (`main.rs`) now presents
+//! `AoaIdentification::aasdk_compatibility_probe()` (the exact pinned-AASDK
+//! reference `uri`/`serial` strings) instead of `receiver_probe()` (this
+//! project's own `uri`/`serial`) — `manufacturer`/`model`/`description`/
+//! `version` are unchanged and already identical between the two presets.
+//! This combination (exact reference AOA identity + the real
+//! operator-authorized TLS credential) was never tried before — the one
+//! prior use of `aasdk_compatibility_probe()` was paired with a temporary
+//! generated TLS credential and got Error 7, a TLS-trust rejection
+//! unrelated to these strings (see `aasdk_compatibility_probe()`'s doc
+//! comment, `crates/transport-api/src/lib.rs`). Stated honestly, this is a
+//! low-confidence, cheap elimination, not a leading theory: Error 2 fires
+//! well past the point (service discovery, all channels open, `Start`)
+//! where AOA-level identity would plausibly matter. `PING_INTERVAL` stays
+//! neutralized (`3600s`) for this trial too, so the still-unresolved ping
+//! write-timeout confound doesn't contaminate this variable's result.
+//!
+//! Real-hardware result (two trials): still Error 2 both times. Neither
+//! trial reached video `Start` (recent `receiver_probe()` trials had
+//! reached it) — suggestive, but this investigation's own already-recorded
+//! run-to-run variability (identical code, different message sequences
+//! across runs) means two non-`Start` runs isn't strong evidence of a
+//! regression, only that this identity showed no benefit. Reverted back to
+//! `AoaIdentification::receiver_probe()`.
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{

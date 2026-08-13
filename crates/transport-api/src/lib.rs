@@ -105,8 +105,28 @@ impl AoaIdentification {
         }
     }
 
-    /// Compatibility identity from the owner-approved AASDK revision. This is
-    /// reserved for an explicit Android Auto interoperability probe.
+    /// Compatibility identity from the owner-approved AASDK revision:
+    /// these are AOA/USB accessory identification strings only (the same
+    /// six fields any AOA host sends before `START_ACCESSORY`), not a TLS
+    /// credential. Was first used, once, paired with a temporary
+    /// project-generated TLS credential (the now-permanently-disabled
+    /// `usb_generated_identity_probe` path) and rejected with Android Auto
+    /// error 7 — a TLS-trust rejection fully explained by that untrusted
+    /// credential, not by these strings (see
+    /// `docs/protocol/tls-credential-policy.md`). Reused here, combined
+    /// with a real operator-authorized credential loaded through
+    /// `credential_store` (`usb_auth_discovery_probe`), to isolate this
+    /// specific AOA-identity variable — this reuse does not touch, weaken,
+    /// or reopen that permanent lockout. Real-hardware result (two trials):
+    /// still Error 2 both times, and neither trial reached video `Start`
+    /// (recent `receiver_probe()` trials had reached it) — inconclusive
+    /// given this investigation's own well-documented run-to-run
+    /// variability with identical code, but no evidence this identity
+    /// helps either. `usb_auth_discovery_probe` has reverted to
+    /// `receiver_probe()`; this preset is no longer called from any live
+    /// probe path, kept only as a record of what was tried (see
+    /// `docs/protocol/error-2-investigation.md`, "AOA identity
+    /// experiment").
     #[must_use]
     pub fn aasdk_compatibility_probe() -> Self {
         Self {
