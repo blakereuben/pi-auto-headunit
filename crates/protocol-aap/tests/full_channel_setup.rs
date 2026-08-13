@@ -316,7 +316,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
     let actions = video_setup
         .advance(VideoSetupEvent::InboundMedia(&message.payload))
         .expect("advance setup");
-    assert_eq!(actions.len(), 1);
+    assert_eq!(actions.len(), 2);
     let VideoSetupAction::SendMedia(config) = &actions[0] else {
         panic!("expected SendMedia action, got {actions:?}");
     };
@@ -351,6 +351,44 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
         decoded_config.body,
         vec![0x08, 0x02, 0x10, 0x01, 0x18, 0x00]
     );
+
+    // --- Video channel: unsolicited VideoFocusNotification, sent right after Config ---
+    let VideoSetupAction::SendMedia(video_focus) = &actions[1] else {
+        panic!("expected SendMedia action, got {actions:?}");
+    };
+    assert_eq!(video_focus.id, MediaMessageId::VideoFocusNotification);
+    let video_focus_payload = video_focus
+        .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+        .expect("encode video focus notification");
+    let ciphertext = client_tls
+        .encrypt_application_data(&video_focus_payload)
+        .expect("client encrypt video focus notification");
+    let frame = encode_frame(
+        FrameHeader {
+            channel_id: VIDEO_CHANNEL_ID,
+            frame_type: FrameType::Bulk,
+            encryption: Encryption::Encrypted,
+            message_type: MessageType::Specific,
+        },
+        None,
+        &ciphertext,
+        limits(),
+    )
+    .expect("encode video focus notification frame");
+    transport
+        .send_all(&frame)
+        .expect("send video focus notification");
+
+    let (channel_id, message_type, plaintext) = phone_receives_encrypted(&phone, &mut phone_tls);
+    assert_eq!(channel_id, VIDEO_CHANNEL_ID);
+    assert_eq!(message_type, MessageType::Specific);
+    let decoded_video_focus = MediaMessage::decode(&plaintext, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+        .expect("decode video focus notification");
+    assert_eq!(
+        decoded_video_focus.id,
+        MediaMessageId::VideoFocusNotification
+    );
+    assert_eq!(decoded_video_focus.body, vec![0x08, 0x01]);
 
     // --- Video channel: Start -> Ready (this is where the whole increment stops) ---
     let start_payload = start_message(7)

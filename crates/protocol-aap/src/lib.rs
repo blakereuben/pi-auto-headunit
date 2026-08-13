@@ -82,7 +82,8 @@ pub use service_discovery_response::{
 };
 pub use tls::{TlsClient, TlsProgress};
 pub use video_setup::{
-    VideoSetupAction, VideoSetupError, VideoSetupEvent, VideoSetupState, VideoSetupStateMachine,
+    VideoFocusMode, VideoSetupAction, VideoSetupError, VideoSetupEvent, VideoSetupState,
+    VideoSetupStateMachine, encode_video_focus_notification,
 };
 
 pub const AASDK_MAX_FRAME_PAYLOAD_SIZE: usize = 0x4000;

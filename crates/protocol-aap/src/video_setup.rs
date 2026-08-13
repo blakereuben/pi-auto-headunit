@@ -5,14 +5,26 @@ use crate::media_message::{
 };
 use crate::protobuf::{self, ProtobufDecodeError};
 
-// Portions derived from AASDK's Setup/Config/Start protobuf schema
-// (protobuf/aap_protobuf/service/media/shared/message/) and the video
+// Portions derived from AASDK's Setup/Config/Start and
+// VideoFocusNotification/VideoFocusMode protobuf schema
+// (protobuf/aap_protobuf/service/media/shared/message/,
+// protobuf/aap_protobuf/service/media/video/message/) and the video
 // channel's setup dispatch behaviour in VideoMediaSinkService.cpp, at the
 // pinned project revision (9bf6adf933665dee26532201719fac14a047ccf1): the
 // phone sends Setup, the head unit replies Config, the phone sends Start —
 // confirmed against that source, not any public specification (none is
 // known to exist for this wire protocol). See the channel-setup design
 // record for the full provenance trail.
+//
+// The proactive, unsolicited VideoFocusNotification send after Config is
+// not derived from AASDK/OpenAuto (neither sends it) — it's motivated by
+// independently observing that behaviour in a separate, independently
+// implemented, GPL-3.0-or-later Android Auto client (`f-io/LIVI`,
+// `src/main/services/projection/driver/aa/stack/session/Session.ts`, not
+// AASDK-derived). No LIVI code is reproduced here; only the wire
+// message/field shape, itself confirmed byte-for-byte against this
+// project's own pinned AASDK schema above, and the idea of sending it
+// unconditionally after Config.
 // Copyright (C) 2018 f1x.studio (Michal Szwaj)
 // Copyright (C) 2024 CubeOne (Simon Dean)
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -35,6 +47,34 @@ const DEFAULT_VIDEO_MAX_UNACKED: i32 = 1;
 /// The only `VideoConfiguration` entry `ServiceDiscoveryResponse` ever
 /// advertised, so it's the only configuration index `Start` may reference.
 const ADVERTISED_CONFIGURATION_INDEX: u32 = 0;
+
+/// `aap_protobuf.service.media.video.message.VideoFocusMode`. Only
+/// `Projected` is ever sent this increment (the head unit proactively
+/// grants the phone video focus, matching `f-io/LIVI`'s
+/// `Session.ts`/`VideoFocusIndication` behavior — confirmed against this
+/// project's own pinned AASDK source too,
+/// `service/media/video/message/VideoFocusMode.proto`), but the enum is
+/// modeled fully since it's small and nothing here decodes it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoFocusMode {
+    Projected,
+    Native,
+    NativeTransient,
+    ProjectedNoInputFocus,
+    Unknown(i32),
+}
+
+impl VideoFocusMode {
+    const fn wire_value(self) -> i32 {
+        match self {
+            Self::Projected => 1,
+            Self::Native => 2,
+            Self::NativeTransient => 3,
+            Self::ProjectedNoInputFocus => 4,
+            Self::Unknown(value) => value,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoSetupState {
@@ -241,10 +281,16 @@ impl VideoSetupStateMachine {
         #[allow(clippy::cast_possible_wrap)]
         let advertised_index = ADVERTISED_CONFIGURATION_INDEX as i32;
         protobuf::write_int32_field(&mut body, 3, advertised_index);
-        Ok(vec![VideoSetupAction::SendMedia(MediaMessage {
-            id: MediaMessageId::Config,
-            body,
-        })])
+        Ok(vec![
+            VideoSetupAction::SendMedia(MediaMessage {
+                id: MediaMessageId::Config,
+                body,
+            }),
+            // Proactive, unsolicited video-focus grant — not a reply to
+            // anything the phone sent. See this file's module doc comment
+            // and `encode_video_focus_notification` for provenance.
+            VideoSetupAction::SendMedia(encode_video_focus_notification(VideoFocusMode::Projected)),
+        ])
     }
 
     fn handle_start(
@@ -268,6 +314,22 @@ impl VideoSetupStateMachine {
             session_id,
             configuration_index,
         }])
+    }
+}
+
+/// Encodes `VideoFocusNotification`, proactively granting the phone video
+/// focus. `focus` (field 1, optional enum) is the only field ever written —
+/// `unsolicited` (field 2, optional bool) is left unset, matching `f-io/LIVI`'s
+/// own exact wire bytes for this send (`[0x08, 0x01]` for `Projected`), not
+/// a reply to any `VideoFocusRequest` from the phone (this project has
+/// never received one — see this crate's module boundary notes).
+#[must_use]
+pub fn encode_video_focus_notification(focus: VideoFocusMode) -> MediaMessage {
+    let mut body = Vec::new();
+    protobuf::write_int32_field(&mut body, 1, focus.wire_value());
+    MediaMessage {
+        id: MediaMessageId::VideoFocusNotification,
+        body,
     }
 }
 
@@ -367,12 +429,17 @@ mod tests {
             )))
             .expect("setup");
         assert_eq!(machine.state(), VideoSetupState::AwaitingStart);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
         let VideoSetupAction::SendMedia(config) = &actions[0] else {
             panic!("expected SendMedia");
         };
         assert_eq!(config.id, MediaMessageId::Config);
         assert_eq!(config.body, vec![0x08, 0x02, 0x10, 0x01, 0x18, 0x00]);
+        let VideoSetupAction::SendMedia(video_focus) = &actions[1] else {
+            panic!("expected SendMedia");
+        };
+        assert_eq!(video_focus.id, MediaMessageId::VideoFocusNotification);
+        assert_eq!(video_focus.body, vec![0x08, 0x01]);
 
         let actions = machine
             .advance(VideoSetupEvent::InboundMedia(&start_payload(7, 0)))
@@ -385,6 +452,13 @@ mod tests {
                 configuration_index: 0,
             }]
         );
+    }
+
+    #[test]
+    fn encodes_video_focus_notification_with_exact_bytes() {
+        let message = encode_video_focus_notification(VideoFocusMode::Projected);
+        assert_eq!(message.id, MediaMessageId::VideoFocusNotification);
+        assert_eq!(message.body, vec![0x08, 0x01]);
     }
 
     #[test]

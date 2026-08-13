@@ -11,17 +11,20 @@ use std::fmt;
 pub const DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE: usize = 1024 * 1024;
 const MESSAGE_ID_SIZE: usize = 2;
 
-/// `aap_protobuf.service.media.sink.MediaMessageId`. Only the three values
-/// this increment's video-channel setup handshake needs are named; the
-/// rest (`MEDIA_MESSAGE_DATA`, `_STOP`, `_ACK`, video focus, microphone,
-/// UI config, audio underflow) are out of scope until something decodes or
-/// sends them, matching `Unknown` surviving round-trip the same way
-/// `ControlMessageId::Unknown` already does.
+/// `aap_protobuf.service.media.sink.MediaMessageId`. `Setup`/`Start`/`Config`
+/// are the video-channel setup handshake; `VideoFocusRequest`/
+/// `VideoFocusNotification` are the head-unit-initiated video-focus grant
+/// (`protocol_aap::video_setup`). The rest (`MEDIA_MESSAGE_DATA`, `_STOP`,
+/// `_ACK`, microphone, UI config, audio underflow) are out of scope until
+/// something decodes or sends them, matching `Unknown` surviving round-trip
+/// the same way `ControlMessageId::Unknown` already does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaMessageId {
     Setup,
     Start,
     Config,
+    VideoFocusRequest,
+    VideoFocusNotification,
     Unknown(u16),
 }
 
@@ -32,6 +35,8 @@ impl MediaMessageId {
             Self::Setup => 32768,
             Self::Start => 32769,
             Self::Config => 32771,
+            Self::VideoFocusRequest => 32775,
+            Self::VideoFocusNotification => 32776,
             Self::Unknown(value) => value,
         }
     }
@@ -41,6 +46,8 @@ impl MediaMessageId {
             32768 => Self::Setup,
             32769 => Self::Start,
             32771 => Self::Config,
+            32775 => Self::VideoFocusRequest,
+            32776 => Self::VideoFocusNotification,
             value => Self::Unknown(value),
         }
     }
@@ -137,6 +144,8 @@ mod tests {
             MediaMessageId::Setup,
             MediaMessageId::Start,
             MediaMessageId::Config,
+            MediaMessageId::VideoFocusRequest,
+            MediaMessageId::VideoFocusNotification,
         ] {
             let message = MediaMessage {
                 id,

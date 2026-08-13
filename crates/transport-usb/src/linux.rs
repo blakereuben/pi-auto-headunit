@@ -13,6 +13,17 @@ const REQUEST_START_ACCESSORY: u8 = 53;
 const REQUEST_TYPE_IN_VENDOR: u8 = 0xc0;
 const REQUEST_TYPE_OUT_VENDOR: u8 = 0x40;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Matches AASDK's own reference bulk-OUT write timeout exactly
+/// (`include/f1x/aasdk/Transport/USBTransport.hpp`'s
+/// `cSendTimeoutMs = 10000`, pinned revision
+/// `9bf6adf933665dee26532201719fac14a047ccf1` — used for every bulk-OUT
+/// transfer in that implementation, no message-type special-casing). This
+/// project's own bulk-OUT writes previously used a much tighter 2-second
+/// timeout for the same operation; see
+/// `docs/protocol/error-2-investigation.md` for why that mismatch is the
+/// leading suspect for a real-hardware USB write timeout observed when
+/// this crate's probe sends an unsolicited message (`PingRequest`).
+const BULK_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct LibUsbAoaBackend {
     context: Context,
@@ -184,7 +195,7 @@ impl SessionTransport for LibUsbBulkTransport {
     }
 
     fn send_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        self.write_all(bytes, Duration::from_secs(2))
+        self.write_all(bytes, BULK_SEND_TIMEOUT)
             .map_err(map_transport_error)
     }
 }

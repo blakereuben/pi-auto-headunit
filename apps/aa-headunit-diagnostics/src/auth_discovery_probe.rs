@@ -92,19 +92,25 @@
 //! (`AndroidAutoEntityFactory.cpp`'s hard-coded `Pinger` interval),
 //! independent of handshake/channel-setup progress, starting immediately at
 //! session start. This probe now does the same (`PING_INTERVAL`,
-//! `send_ping_request`, sent unencrypted on the control channel matching
-//! AASDK's `sendPingRequest`) and handles an incoming `PingResponse`
+//! `send_ping_request`) and handles an incoming `PingResponse`
 //! (`protocol_aap::ping`). Matching `OpenAuto`'s own scope exactly, an
 //! incoming `PingRequest` from the phone is not handled — `OpenAuto` itself
 //! only overrides `onPingResponse`, never `onPingRequest` — so one would
 //! continue to fail closed via the existing catch-all in
 //! `handle_post_discovery_control_message`, which is itself useful
-//! information if it happens. The Ping increment's own real-hardware trial
-//! was inconclusive: both runs hit a new, reproducible local USB bulk-OUT
-//! write timeout right around when the first ping fired, before the
-//! hypothesis could be fairly observed (`PING_INTERVAL` is temporarily
-//! neutralized — see its doc comment — for the Sensors trial below, to
-//! isolate that trial's variable from this still-open confound).
+//! information if it happens. The Ping increment's own real-hardware trials
+//! were inconclusive at first: multiple runs hit a new, reproducible local
+//! USB bulk-OUT write timeout right around when the first ping fired,
+//! before the hypothesis could be fairly observed — reproduced twice more
+//! later (Sensors and `NavFocusRequest`/`ByeByeRequest` trials, both
+//! present-with-ping/absent-without-ping), strongly implicating the ping
+//! write itself. The leading root-cause theory, now being tested: this
+//! probe sent `PingRequest` **unencrypted**, the only post-handshake
+//! message it ever sent that way (matching AASDK's own `sendPingRequest`,
+//! accurate for the pinned `1.6` source — but this phone speaks
+//! undocumented `1.7`). `send_ping_request` now sends it TLS-encrypted
+//! instead, a deliberate, reversible deviation to test against the real
+//! phone (see `PING_INTERVAL`'s doc comment).
 //!
 //! A systematic diff against `OpenAuto`'s full post-`ServiceDiscoveryResponse`
 //! session lifecycle and service set (rather than continuing to test one
@@ -150,6 +156,23 @@
 //! `triggerQuit()`-after-response behavior; its `reason` value is printed
 //! since, if a real phone ever sends this, it could be directly diagnostic
 //! about *why* it considers this head unit incompatible.
+//!
+//! Every real-hardware run through this session has stalled at the exact
+//! same point regardless of which increment was under test: `Config` sent
+//! on every channel, `Start` never received on any of them. A deep,
+//! targeted comparison against `f-io/LIVI` (a separate, independently
+//! implemented, GPL-3.0-or-later Android Auto client, not AASDK-derived,
+//! confirmed working against modern phones) found `Config`'s own field
+//! values already match exactly, but found one concrete gap: LIVI
+//! proactively sends an **unsolicited** `VideoFocusNotification` granting
+//! `Projected` video focus immediately after `Config`, before ever
+//! expecting `Start` — not a reply to anything the phone sent. This
+//! message pair (`MEDIA_MESSAGE_VIDEO_FOCUS_REQUEST`/`_NOTIFICATION`,
+//! wire 32775/32776) is confirmed to already exist in this project's own
+//! pinned AASDK schema (`protocol_aap::video_setup`,
+//! `encode_video_focus_notification`) — a real, pre-existing part of the
+//! protocol this project had simply never sent. `handle_video_channel_message`
+//! now sends it right after `Config`, in the same `Setup` response.
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{
@@ -160,14 +183,14 @@ use protocol_aap::{
     DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
     DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE, DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption,
     FrameError, FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
-    HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus, Message,
-    MessageAssembler, MessageType, MicrophoneCapability, NavFocusType, ProtocolLimits,
-    SensorCapability, SensorMessage, SensorMessageId, SensorType, ServiceAvailability,
-    ServiceCandidate, ServiceCapabilities, ServiceCatalogue, ServiceDiscoveryRequestSummary,
-    ServiceKind, TlsClient, TlsProgress, TouchCapability, TouchScreenType, VideoCapability,
-    VideoCodecResolution, VideoFrameRate, VideoSetupAction, VideoSetupEvent,
-    VideoSetupStateMachine, decode_audio_focus_request, decode_byebye_request, decode_frame,
-    decode_key_binding_request, decode_nav_focus_request, decode_ping_response,
+    HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus,
+    MediaMessageId, Message, MessageAssembler, MessageType, MicrophoneCapability, NavFocusType,
+    ProtocolLimits, SensorCapability, SensorMessage, SensorMessageId, SensorType,
+    ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue,
+    ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress, TouchCapability,
+    TouchScreenType, VideoCapability, VideoCodecResolution, VideoFrameRate, VideoSetupAction,
+    VideoSetupEvent, VideoSetupStateMachine, decode_audio_focus_request, decode_byebye_request,
+    decode_frame, decode_key_binding_request, decode_nav_focus_request, decode_ping_response,
     decode_sensor_request, encode_audio_focus_notification, encode_byebye_response,
     encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
     encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
@@ -199,6 +222,18 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// "Ping/liveness experiment"). Reverted back to 5s now that both trials
 /// are recorded; the write-timeout root cause itself remains a separate,
 /// still-open follow-up.
+///
+/// Leading root-cause hypothesis, now being tested: `PingRequest` is the
+/// *only* message this probe sends unencrypted after the TLS handshake
+/// completes (`send_ping_request` previously used `Encryption::Plain`,
+/// matching AASDK's own `sendPingRequest` — accurate for the pinned `1.6`
+/// source, but this phone speaks undocumented `1.7`). A real client's
+/// post-handshake frame parser may expect an unbroken all-encrypted
+/// bytestream and desync badly enough on a stray plain frame that it stops
+/// draining its own USB OUT buffer — which would manifest exactly as our
+/// bulk-OUT write eventually timing out. `send_ping_request` now sends
+/// `PingRequest` TLS-encrypted instead, as a deliberate, reversible
+/// deviation from the pinned source to test against this real phone.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
 /// Head-unit-assigned channel ids advertised in `ServiceDiscoveryResponse`.
@@ -362,7 +397,7 @@ pub fn run<T: SessionTransport>(
             Err(error) => return Err(CliError::Transport(error)),
         };
         if last_ping.elapsed() >= PING_INTERVAL {
-            send_ping_request(transport, limits)?;
+            send_ping_request(transport, &mut tls, limits)?;
             last_ping = Instant::now();
         }
         if received.len() + size > MAX_ACCUMULATED_BYTES {
@@ -598,16 +633,19 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
     }
 }
 
-/// Sends `PingRequest` on the control channel, unencrypted like AASDK's own
-/// `sendPingRequest` (`EncryptionType::PLAIN`, `MessageType::SPECIFIC`) —
-/// see `PING_INTERVAL`'s doc comment for why this is sent proactively at
-/// all. `timestamp` is epoch milliseconds — a reasonable but unconfirmed
-/// assumption about the field's units (`PingRequest.proto` only declares
-/// `required int64 timestamp = 1`, no unit); not load-bearing for this
-/// experiment, since the phone only needs *a* consistent value it can echo
-/// back in `PingResponse`.
+/// Sends `PingRequest` on the control channel. See `PING_INTERVAL`'s doc
+/// comment for why this is sent proactively at all, and for why it's sent
+/// TLS-encrypted here — a deliberate deviation from AASDK's own
+/// `sendPingRequest` (`EncryptionType::PLAIN`), being tested against the
+/// real phone's undocumented protocol `1.7`. `timestamp` is epoch
+/// milliseconds — a reasonable but unconfirmed assumption about the
+/// field's units (`PingRequest.proto` only declares `required int64
+/// timestamp = 1`, no unit); not load-bearing for this experiment, since
+/// the phone only needs *a* consistent value it can echo back in
+/// `PingResponse`.
 fn send_ping_request<T: SessionTransport>(
     transport: &mut T,
+    tls: &mut OpenSslTlsClient,
     limits: ProtocolLimits,
 ) -> Result<(), CliError> {
     let timestamp_millis = i64::try_from(
@@ -617,7 +655,11 @@ fn send_ping_request<T: SessionTransport>(
             .as_millis(),
     )
     .unwrap_or(i64::MAX);
-    send_control(transport, &encode_ping_request(timestamp_millis), limits)?;
+    let payload = encode_ping_request(timestamp_millis)
+        .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    println!("probe_state=ping_request_send_attempt");
+    send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits)?;
     println!("probe_state=ping_request_sent");
     Ok(())
 }
@@ -823,6 +865,7 @@ fn handle_video_channel_message<T: SessionTransport>(
                         let payload = response
                             .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
                             .map_err(|error| CliError::Protocol(error.to_string()))?;
+                        let response_id = response.id;
                         send_encrypted(
                             transport,
                             tls,
@@ -831,7 +874,14 @@ fn handle_video_channel_message<T: SessionTransport>(
                             &payload,
                             limits,
                         )?;
-                        println!("probe_state=video_channel_setup_config_sent");
+                        match response_id {
+                            MediaMessageId::VideoFocusNotification => {
+                                println!("probe_state=video_channel_video_focus_notification_sent");
+                            }
+                            _ => {
+                                println!("probe_state=video_channel_setup_config_sent");
+                            }
+                        }
                     }
                     VideoSetupAction::Ready {
                         session_id,
