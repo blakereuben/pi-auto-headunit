@@ -12,18 +12,21 @@
 //! channel (`protocol_aap::audio_focus`), then drives each channel's
 //! `ChannelOpenRequest`/`ChannelOpenResponse` handshake
 //! (`protocol_aap::channel_open`), then the video channel's
-//! `Setup`→`Config`→`Start` handshake (`protocol_aap::video_setup`) and the
+//! `Setup`→`Config`→`Start` handshake (`protocol_aap::video_setup`), the
 //! input channel's `KeyBindingRequest`/`KeyBindingResponse` exchange
-//! (`protocol_aap::input_message`). It stops the instant the video channel
-//! receives `Start` and the input channel has opened — no
-//! `MEDIA_MESSAGE_DATA` byte is ever parsed, no video decode/render/UI work
-//! happens here, and none of the other six channels are driven past open.
-//! See the channel-setup design record for the full scope boundary and
-//! provenance trail.
+//! (`protocol_aap::input_message`), and the `MediaAudio` channel's own
+//! `Setup`→`Config`→`Start` handshake (`protocol_aap::audio_setup` — same
+//! message shape as video's, accepting `MEDIA_CODEC_AUDIO_PCM` instead of
+//! H.264). It stops the instant the video channel receives `Start` and the
+//! input channel has opened — no `MEDIA_MESSAGE_DATA` byte is ever parsed,
+//! no video decode/render/UI work happens here, and none of the other five
+//! channels are driven past open. See the channel-setup design record for
+//! the full scope boundary and provenance trail.
 //!
 //! Every non-video channel, the populated `HeadUnitInfo`, `AudioFocusRequest`
-//! handling, and `KeyBindingRequest` handling are all experiments toward the
-//! same real-phone finding: Android Auto's "phone and car are running
+//! handling, `KeyBindingRequest` handling, and the `MediaAudio` channel's
+//! `Setup`/`Config`/`Start` handling are all experiments toward the same
+//! real-phone finding: Android Auto's "phone and car are running
 //! incompatible software" (Error 2). Advertising one audio channel, offering
 //! the phone's own reported protocol version (`1.7`, versus the pinned
 //! source's `1.6`), and populating `HeadUnitInfo` were each tried
@@ -40,20 +43,21 @@
 //! rejecting `ServiceDiscoveryResponse` and progressed into the session,
 //! first requesting audio focus, then opening every channel and driving
 //! video through `Setup`→`Config`, then requesting key bindings on the input
-//! channel. Error 2 still appears at each new point reached (confirmed on
-//! the phone screen, not inferred from probe output), but the failure
-//! boundary keeps moving further into the session as each new message is
-//! handled — see `docs/protocol/error-2-investigation.md` for the full,
-//! still-open history. Every non-video channel besides input is driven only
-//! to `ChannelOpenState::Open` — no further handshake (sensor data,
-//! Bluetooth pairing, microphone capture, audio playback) exists yet; that
-//! is separate follow-on scope once a hypothesis is confirmed. The input
-//! channel's `KeyBindingRequest` is answered `KeycodeNotBound` for any
-//! non-empty request, matching this project's own `ServiceDiscoveryResponse`
-//! exactly (it advertises zero supported keycodes — no button hardware
-//! exists yet), mirroring `OpenAuto`'s `InputService::onBindingRequest`
-//! validation-against-declared-capability behavior rather than fabricating
-//! success.
+//! channel, then sending `Setup` on the `MediaAudio` channel. Error 2 still
+//! appears at each new point reached (confirmed on the phone screen, not
+//! inferred from probe output), but the failure boundary keeps moving
+//! further into the session as each new message is handled — see
+//! `docs/protocol/error-2-investigation.md` for the full, still-open
+//! history. Every non-video, non-`MediaAudio` channel besides input is
+//! driven only to `ChannelOpenState::Open` — no further handshake (sensor
+//! data, Bluetooth pairing, microphone capture, `SystemAudio`/`SpeechAudio`
+//! playback) exists yet; that is separate follow-on scope once a hypothesis
+//! is confirmed. The input channel's `KeyBindingRequest` is answered
+//! `KeycodeNotBound` for any non-empty request, matching this project's own
+//! `ServiceDiscoveryResponse` exactly (it advertises zero supported
+//! keycodes — no button hardware exists yet), mirroring `OpenAuto`'s
+//! `InputService::onBindingRequest` validation-against-declared-capability
+//! behavior rather than fabricating success.
 //!
 //! Once TLS completes, a real phone sends `AuthComplete`/
 //! `ServiceDiscoveryRequest` as TLS-encrypted application data at the AAP
@@ -75,7 +79,8 @@
 use credential_store::CredentialMaterial;
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
-    AudioStreamType, BluetoothCapability, ChannelOpenAction, ChannelOpenEvent, ChannelOpenState,
+    AudioSetupAction, AudioSetupEvent, AudioSetupStateMachine, AudioStreamType,
+    BluetoothCapability, ChannelOpenAction, ChannelOpenEvent, ChannelOpenState,
     ChannelOpenStateMachine, ControlMessage, ControlMessageId, DEFAULT_MAX_CONTROL_BODY_SIZE,
     DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
     DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption, FrameError, FrameHeader, FrameType,
@@ -131,6 +136,16 @@ enum VideoChannel {
     Ready,
 }
 
+/// Per-channel progress for the `MediaAudio` channel, driven once
+/// `ServiceDiscoveryResponse` has been sent. Same shape as `VideoChannel`
+/// (see `protocol_aap::audio_setup` for why this is a separate type rather
+/// than a shared one).
+enum MediaAudioChannel {
+    AwaitingOpen(ChannelOpenStateMachine),
+    AwaitingSetup(AudioSetupStateMachine),
+    Ready,
+}
+
 pub fn run<T: SessionTransport>(
     transport: &mut T,
     tls12_compatibility: bool,
@@ -173,16 +188,19 @@ pub fn run<T: SessionTransport>(
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let mut received = Vec::new();
     let mut read_buffer = vec![0_u8; AASDK_MAX_FRAME_PAYLOAD_SIZE + 8];
-    // Control channel (0) + video channel + input channel can each
-    // independently be mid-fragmentation once channel setup starts.
+    // Control channel (0) + video channel + input channel + MediaAudio
+    // channel can each independently be mid-fragmentation once channel
+    // setup starts.
     let mut assembler =
-        MessageAssembler::new(3).map_err(|error| CliError::Protocol(error.to_string()))?;
+        MessageAssembler::new(4).map_err(|error| CliError::Protocol(error.to_string()))?;
 
     let mut video_channel: Option<VideoChannel> = None;
+    let mut media_audio_channel: Option<MediaAudioChannel> = None;
     // Every channel that only ever needs to reach ChannelOpenState::Open —
-    // input/touch plus all six non-video channels this experiment adds.
-    // None until ServiceDiscoveryResponse is sent, then populated with one
-    // entry per advertised channel_id.
+    // input/touch plus five of the six non-video channels this experiment
+    // adds (MediaAudio now has its own dedicated Setup/Config/Start state
+    // machine above, like video). None until ServiceDiscoveryResponse is
+    // sent, then populated with one entry per advertised channel_id.
     let mut simple_channels: HashMap<u8, ChannelOpenStateMachine> = HashMap::new();
 
     while Instant::now() < deadline {
@@ -215,6 +233,7 @@ pub fn run<T: SessionTransport>(
                 &message,
                 &mut handshake,
                 &mut video_channel,
+                &mut media_audio_channel,
                 &mut simple_channels,
                 &mut tls,
                 transport,
@@ -242,6 +261,7 @@ fn handle_message<T: SessionTransport>(
     message: &Message,
     handshake: &mut HandshakeStateMachine,
     video_channel: &mut Option<VideoChannel>,
+    media_audio_channel: &mut Option<MediaAudioChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
@@ -259,9 +279,11 @@ fn handle_message<T: SessionTransport>(
             *video_channel = Some(VideoChannel::AwaitingOpen(ChannelOpenStateMachine::new(
                 VIDEO_CHANNEL_ID,
             )));
+            *media_audio_channel = Some(MediaAudioChannel::AwaitingOpen(
+                ChannelOpenStateMachine::new(MEDIA_AUDIO_CHANNEL_ID),
+            ));
             for channel_id in [
                 INPUT_CHANNEL_ID,
-                MEDIA_AUDIO_CHANNEL_ID,
                 SYSTEM_AUDIO_CHANNEL_ID,
                 SPEECH_AUDIO_CHANNEL_ID,
                 SENSORS_CHANNEL_ID,
@@ -276,6 +298,8 @@ fn handle_message<T: SessionTransport>(
 
     if message.channel_id == VIDEO_CHANNEL_ID {
         handle_video_channel_message(message, video_channel, tls, transport, limits)?;
+    } else if message.channel_id == MEDIA_AUDIO_CHANNEL_ID {
+        handle_media_audio_channel_message(message, media_audio_channel, tls, transport, limits)?;
     } else if message.channel_id == INPUT_CHANNEL_ID
         && simple_channels
             .get(&INPUT_CHANNEL_ID)
@@ -567,12 +591,103 @@ fn handle_video_channel_message<T: SessionTransport>(
     }
 }
 
+/// Drives the `MediaAudio` channel's `ChannelOpenStateMachine` then
+/// `AudioSetupStateMachine`, sending each state machine's response actions
+/// as TLS-encrypted application data. Mirrors `handle_video_channel_message`
+/// exactly — same message shape, different channel id and accepted codec
+/// (see `protocol_aap::audio_setup`).
+fn handle_media_audio_channel_message<T: SessionTransport>(
+    message: &Message,
+    media_audio_channel: &mut Option<MediaAudioChannel>,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let state = media_audio_channel.as_mut().ok_or_else(|| {
+        CliError::Protocol(
+            "media-audio channel message before ServiceDiscoveryResponse was sent".into(),
+        )
+    })?;
+    match state {
+        MediaAudioChannel::AwaitingOpen(machine) => {
+            if message.message_type != MessageType::Control {
+                return Err(CliError::Protocol(
+                    "expected ChannelOpenRequest on media-audio channel".into(),
+                ));
+            }
+            let actions = machine
+                .advance(ChannelOpenEvent::InboundControl(&message.payload))
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            for action in actions {
+                let ChannelOpenAction::SendControl(response) = action;
+                let payload = response
+                    .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+                send_encrypted(
+                    transport,
+                    tls,
+                    MEDIA_AUDIO_CHANNEL_ID,
+                    MessageType::Control,
+                    &payload,
+                    limits,
+                )?;
+            }
+            println!("probe_state=media_audio_channel_open");
+            *state = MediaAudioChannel::AwaitingSetup(AudioSetupStateMachine::new());
+            Ok(())
+        }
+        MediaAudioChannel::AwaitingSetup(machine) => {
+            if message.message_type != MessageType::Specific {
+                return Err(CliError::Protocol(
+                    "expected Setup/Start on media-audio channel".into(),
+                ));
+            }
+            let actions = machine
+                .advance(AudioSetupEvent::InboundMedia(&message.payload))
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            for action in actions {
+                match action {
+                    AudioSetupAction::SendMedia(response) => {
+                        let payload = response
+                            .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+                            .map_err(|error| CliError::Protocol(error.to_string()))?;
+                        send_encrypted(
+                            transport,
+                            tls,
+                            MEDIA_AUDIO_CHANNEL_ID,
+                            MessageType::Specific,
+                            &payload,
+                            limits,
+                        )?;
+                        println!("probe_state=media_audio_channel_setup_config_sent");
+                    }
+                    AudioSetupAction::Ready {
+                        session_id,
+                        configuration_index,
+                    } => {
+                        println!("probe_state=media_audio_channel_start_received");
+                        println!("media_audio_channel_session_id={session_id}");
+                        println!("media_audio_channel_configuration_index={configuration_index}");
+                        *state = MediaAudioChannel::Ready;
+                    }
+                }
+            }
+            Ok(())
+        }
+        MediaAudioChannel::Ready => Err(CliError::Protocol(
+            "unexpected message on media-audio channel after Start".into(),
+        )),
+    }
+}
+
 /// Drives one "advertise → open → nothing further" channel's
-/// `ChannelOpenStateMachine` — covers `Input` and all six new non-video
-/// channels this experiment adds. Generalizes what used to be two
-/// near-identical per-channel functions, since this shape now repeats
-/// seven times; `VideoChannel`'s `Setup`/`Config`/`Start` follow-through is
-/// genuinely different and stays separate.
+/// `ChannelOpenStateMachine` — covers `Input` and five other non-video
+/// channels this experiment adds (`MediaAudio` now has its own dedicated
+/// Setup/Config/Start state machine above, like video). Generalizes what
+/// used to be two near-identical per-channel functions, since this shape
+/// now repeats six times; `VideoChannel`/`MediaAudioChannel`'s
+/// `Setup`/`Config`/`Start` follow-through is genuinely different and stays
+/// separate.
 fn handle_simple_channel_message<T: SessionTransport>(
     channel_id: u8,
     message: &Message,

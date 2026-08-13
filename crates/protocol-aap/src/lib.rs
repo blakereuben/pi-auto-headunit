@@ -15,6 +15,7 @@ use std::fmt;
 
 mod assembly;
 mod audio_focus;
+mod audio_setup;
 mod channel_open;
 mod control;
 mod input_message;
@@ -30,6 +31,9 @@ pub use assembly::{AssemblyError, Message, MessageAssembler};
 pub use audio_focus::{
     AudioFocusError, AudioFocusRequestType, AudioFocusStateType, decode_audio_focus_request,
     encode_audio_focus_notification,
+};
+pub use audio_setup::{
+    AudioSetupAction, AudioSetupError, AudioSetupEvent, AudioSetupState, AudioSetupStateMachine,
 };
 pub use channel_open::{
     ChannelOpenAction, ChannelOpenError, ChannelOpenEvent, ChannelOpenState,
