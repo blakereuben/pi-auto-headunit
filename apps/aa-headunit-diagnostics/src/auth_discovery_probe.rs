@@ -335,14 +335,14 @@ use protocol_aap::{
     PingConfiguration, ProtocolLimits, SensorCapability, SensorMessage, SensorMessageId,
     SensorType, ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue,
     ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress, TouchCapability,
-    TouchScreenType, UiConfig, VideoCapability, VideoCodecResolution, VideoFrameRate,
-    VideoSetupAction, VideoSetupEvent, VideoSetupState, VideoSetupStateMachine,
+    TouchScreenType, UiConfig, VideoCapability, VideoCodecResolution, VideoFocusMode,
+    VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupState, VideoSetupStateMachine,
     decode_audio_focus_request, decode_byebye_request, decode_frame, decode_key_binding_request,
     decode_nav_focus_request, decode_ping_response, decode_sensor_request,
     encode_audio_focus_notification, encode_byebye_response,
     encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
     encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
-    encode_sensor_response, encode_service_discovery_response,
+    encode_sensor_response, encode_service_discovery_response, encode_video_focus_notification,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::{HashMap, VecDeque};
@@ -425,6 +425,19 @@ const PING_INTERVAL: Duration = Duration::from_millis(1500);
 /// does the same rather than silently drifting out of sync with what a
 /// real head unit would do.
 const PING_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
+/// `AA_HEADUNIT_PING_ISOLATION` (any value, checked via `env::var_os` so an
+/// empty value still enables it) — an opt-in, real-hardware experiment
+/// isolating *why* the second scheduled proactive send (real-hardware-
+/// confirmed to hit a USB bulk-OUT write timeout in every trial so far,
+/// `docs/protocol/error-2-investigation.md`) fails. The first scheduled
+/// send always stays a real `PingRequest` (already proven to succeed and
+/// get a real `PingResponse`); every send after that substitutes a
+/// harmless, already-proven-safe duplicate `VideoFocusNotification`
+/// instead (`send_control_probe_frame`). If that also hangs, the failure
+/// is about proactive-write *position* in the session, not `Ping` content;
+/// if it succeeds, the failure is specifically about a second
+/// `PingRequest`. Off by default — normal probe runs are unaffected.
+const PING_ISOLATION_ENV_VAR: &str = "AA_HEADUNIT_PING_ISOLATION";
 /// Advertised in `ServiceDiscoveryResponse.connection_configuration.ping_configuration`
 /// (`build_service_capabilities`). All four `PingConfiguration` sub-fields
 /// are now populated with LIVI's own confirmed values
@@ -538,6 +551,13 @@ enum ProbeOutcome {
 struct PingState {
     last_sent: Instant,
     last_pong: Instant,
+    /// How many scheduled proactive sends have fired since arming (the
+    /// first real `PingRequest`, sent immediately on arm, counts as send
+    /// 1). Used only by the `AA_HEADUNIT_PING_ISOLATION` experiment (see
+    /// `service_ping`) to identify the *second* scheduled send — the one
+    /// that has hit the USB write timeout in every real-hardware trial so
+    /// far — without touching the first, already-proven-to-succeed send.
+    sends_since_arm: u32,
 }
 
 pub fn run<T: SessionTransport>(
@@ -571,6 +591,11 @@ pub fn run<T: SessionTransport>(
     drop(credentials);
 
     let limits = ProtocolLimits::default();
+    // See PING_ISOLATION_ENV_VAR's doc comment near PING_INTERVAL.
+    let ping_isolation = std::env::var_os(PING_ISOLATION_ENV_VAR).is_some();
+    if ping_isolation {
+        println!("probe_state=ping_isolation_experiment_enabled");
+    }
     let mut handshake = HandshakeStateMachine::default();
     let mut actions: VecDeque<_> = handshake
         .advance(HandshakeEvent::Start)
@@ -615,7 +640,7 @@ pub fn run<T: SessionTransport>(
             Err(TransportError::TimedOut) => continue,
             Err(error) => return Err(CliError::Transport(error)),
         };
-        service_ping(&mut ping_state, transport, &mut tls, limits)?;
+        service_ping(&mut ping_state, ping_isolation, transport, &mut tls, limits)?;
         if received.len() + size > MAX_ACCUMULATED_BYTES {
             return Err(CliError::Protocol(
                 "incoming frame buffer exceeded the probe limit".into(),
@@ -729,6 +754,7 @@ fn handle_message<T: SessionTransport>(
             *ping_state = Some(PingState {
                 last_sent: now,
                 last_pong: now,
+                sends_since_arm: 1,
             });
             println!("probe_state=ping_armed");
             *video_channel = Some(VideoChannel::AwaitingOpen(ChannelOpenStateMachine::new(
@@ -880,11 +906,22 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
 
 /// Checks `ping_state` on every receive-loop iteration: closes the session
 /// via the LIVI-derived watchdog if `PingResponse` has gone stale past
-/// `PING_WATCHDOG_TIMEOUT`, otherwise sends a new `PingRequest` once
+/// `PING_WATCHDOG_TIMEOUT`, otherwise sends a new proactive message once
 /// `PING_INTERVAL` has elapsed since the last one. A no-op before
 /// `ping_state` is armed (see `PingState`'s doc comment).
+///
+/// `ping_isolation` selects the `AA_HEADUNIT_PING_ISOLATION` experiment
+/// (see its doc comment below): when set, every scheduled send *after* the
+/// first (which always stays a real `PingRequest` — real-hardware-confirmed
+/// to succeed and get a real `PingResponse`, see
+/// `docs/protocol/error-2-investigation.md`, "LIVI formally adopted; real
+/// ping-timing trial") substitutes a harmless, already-proven-safe
+/// unsolicited message instead of a second `PingRequest`, to distinguish
+/// "a second `PingRequest` specifically fails" from "any second proactive,
+/// timer-fired write at that point in the session fails."
 fn service_ping<T: SessionTransport>(
     ping_state: &mut Option<PingState>,
+    ping_isolation: bool,
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
     limits: ProtocolLimits,
@@ -901,10 +938,50 @@ fn service_ping<T: SessionTransport>(
         )));
     }
     if state.last_sent.elapsed() >= PING_INTERVAL {
-        send_ping_request(transport, tls, limits)?;
+        if ping_isolation && state.sends_since_arm >= 1 {
+            println!("probe_state=ping_isolation_control_frame_send_attempt");
+            send_control_probe_frame(transport, tls, limits)?;
+            println!("probe_state=ping_isolation_control_frame_sent");
+        } else {
+            send_ping_request(transport, tls, limits)?;
+        }
         state.last_sent = Instant::now();
+        state.sends_since_arm += 1;
     }
     Ok(())
+}
+
+/// The `AA_HEADUNIT_PING_ISOLATION` experiment's substitute message: a
+/// duplicate, unsolicited `VideoFocusNotification(Projected)` on the video
+/// channel — the same message/value this probe already sends exactly once,
+/// unconditionally, right after video `Config`
+/// (`protocol_aap::video_setup::encode_video_focus_notification`,
+/// real-hardware-confirmed safe and load-bearing, see
+/// `docs/protocol/error-2-investigation.md`, "`VideoFocusNotification`
+/// breakthrough"). Re-sending it a second time, unsolicited, is the
+/// harmless-non-ping control frame an external analysis suggested: if the
+/// phone tolerates a redundant focus grant the same way it tolerated the
+/// first one, this write should succeed exactly like every other write in
+/// this probe — if it hangs the same way a second `PingRequest` does, the
+/// failure is about proactive-write *position* in the session, not `Ping`
+/// content specifically.
+fn send_control_probe_frame<T: SessionTransport>(
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let message = encode_video_focus_notification(VideoFocusMode::Projected);
+    let payload = message
+        .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    send_encrypted(
+        transport,
+        tls,
+        VIDEO_CHANNEL_ID,
+        MessageType::Specific,
+        &payload,
+        limits,
+    )
 }
 
 /// Sends `PingRequest` on the control channel. See `PING_INTERVAL`'s doc
