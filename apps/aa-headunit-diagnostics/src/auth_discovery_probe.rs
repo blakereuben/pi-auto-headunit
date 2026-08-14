@@ -493,8 +493,35 @@ const PING_ISOLATION_ENV_VAR: &str = "AA_HEADUNIT_PING_ISOLATION";
 /// `PROACTIVE_WRITE_SURVIVAL_TIMEOUT` budget instead of `PROBE_TIMEOUT` so
 /// there's room for several spaced-out attempts. Off by default — normal
 /// probe runs (including the ping-isolation experiment above) are
-/// unaffected.
+/// unaffected. Real-hardware-confirmed: the phone's endpoint never
+/// recovered across 11 consecutive attempts spanning ~110s (see
+/// `docs/protocol/error-2-investigation.md`, "Proactive-write survival
+/// experiment") — the remaining open question is *why*, not *whether it
+/// ever recovers on this timescale*.
 const PROACTIVE_WRITE_RESILIENCE_ENV_VAR: &str = "AA_HEADUNIT_SURVIVE_PROACTIVE_WRITE_TIMEOUT";
+/// `AA_HEADUNIT_REACTIVE_TRIGGERED_PROACTIVE_SEND` (same `env::var_os`
+/// convention) — an opt-in, real-hardware experiment testing the other half
+/// of suggested next step 2: is the write-timeout really about a write
+/// being *proactive* (head-unit-initiated, no phone activity prompting it),
+/// or is it actually about elapsed idle time on the OUT endpoint,
+/// regardless of who initiates? Every proactive send in every prior trial
+/// fired on a bare periodic schedule (`service_ping` runs on essentially
+/// every ~500ms loop tick — `LibUsbBulkTransport::read`'s `rusb::Error::
+/// Timeout` maps to `Ok(0)`, not `Err(TransportError::TimedOut)`, so the
+/// `receive()` timeout branch in `run()`'s loop is effectively dead for the
+/// real USB transport and `service_ping` runs whether or not anything
+/// actually arrived that tick), never deliberately coupled to genuine
+/// phone-initiated traffic. With this set, a due proactive send is held
+/// back until the same loop iteration where a real message from the phone
+/// was just decoded and dispatched (see `drain_and_dispatch_frames`'s
+/// `processed_any` return value) — a real reactive round trip, not just a
+/// nonzero byte count or a routine idle tick. Implies
+/// `survive_proactive_write_timeout` (see that constant's doc comment)
+/// regardless of whether the other flag is also set, since this experiment
+/// is only informative if the session survives long enough to compare
+/// multiple reactive-triggered attempts. Off by default.
+const REACTIVE_TRIGGERED_PROACTIVE_SEND_ENV_VAR: &str =
+    "AA_HEADUNIT_REACTIVE_TRIGGERED_PROACTIVE_SEND";
 /// Advertised in `ServiceDiscoveryResponse.connection_configuration.ping_configuration`
 /// (`build_service_capabilities`). All four `PingConfiguration` sub-fields
 /// are now populated with LIVI's own confirmed values
@@ -644,17 +671,35 @@ struct PingState {
 /// flags (see `PING_ISOLATION_ENV_VAR`/`PROACTIVE_WRITE_RESILIENCE_ENV_VAR`'s
 /// doc comments) as `(ping_isolation, survive_proactive_write_timeout)`.
 /// Extracted from `run()` to keep it under the project's line-count lint.
-fn read_experiment_flags() -> (bool, bool) {
+struct ExperimentFlags {
+    ping_isolation: bool,
+    survive_proactive_write_timeout: bool,
+    reactive_triggered_proactive_send: bool,
+}
+
+fn read_experiment_flags() -> ExperimentFlags {
     let ping_isolation = std::env::var_os(PING_ISOLATION_ENV_VAR).is_some();
     if ping_isolation {
         println!("probe_state=ping_isolation_experiment_enabled");
     }
-    let survive_proactive_write_timeout =
-        std::env::var_os(PROACTIVE_WRITE_RESILIENCE_ENV_VAR).is_some();
+    let reactive_triggered_proactive_send =
+        std::env::var_os(REACTIVE_TRIGGERED_PROACTIVE_SEND_ENV_VAR).is_some();
+    if reactive_triggered_proactive_send {
+        println!("probe_state=reactive_triggered_proactive_send_experiment_enabled");
+    }
+    // See REACTIVE_TRIGGERED_PROACTIVE_SEND_ENV_VAR's doc comment: this
+    // experiment implies resilience, since it's only informative if the
+    // session survives long enough to compare multiple attempts.
+    let survive_proactive_write_timeout = reactive_triggered_proactive_send
+        || std::env::var_os(PROACTIVE_WRITE_RESILIENCE_ENV_VAR).is_some();
     if survive_proactive_write_timeout {
         println!("probe_state=proactive_write_resilience_experiment_enabled");
     }
-    (ping_isolation, survive_proactive_write_timeout)
+    ExperimentFlags {
+        ping_isolation,
+        survive_proactive_write_timeout,
+        reactive_triggered_proactive_send,
+    }
 }
 
 pub fn run<T: SessionTransport>(
@@ -688,7 +733,7 @@ pub fn run<T: SessionTransport>(
     drop(credentials);
 
     let limits = ProtocolLimits::default();
-    let (ping_isolation, survive_proactive_write_timeout) = read_experiment_flags();
+    let experiment_flags = read_experiment_flags();
     let mut handshake = HandshakeStateMachine::default();
     let mut actions: VecDeque<_> = handshake
         .advance(HandshakeEvent::Start)
@@ -698,7 +743,7 @@ pub fn run<T: SessionTransport>(
     println!("probe_state=version_request_sent");
 
     let deadline = Instant::now()
-        + if survive_proactive_write_timeout {
+        + if experiment_flags.survive_proactive_write_timeout {
             PROACTIVE_WRITE_SURVIVAL_TIMEOUT
         } else {
             PROBE_TIMEOUT
@@ -739,14 +784,6 @@ pub fn run<T: SessionTransport>(
             Err(TransportError::TimedOut) => continue,
             Err(error) => return Err(CliError::Transport(error)),
         };
-        service_ping(
-            &mut ping_state,
-            ping_isolation,
-            survive_proactive_write_timeout,
-            transport,
-            &mut tls,
-            limits,
-        )?;
         if received.len() + size > MAX_ACCUMULATED_BYTES {
             return Err(CliError::Protocol(
                 "incoming frame buffer exceeded the probe limit".into(),
@@ -754,7 +791,7 @@ pub fn run<T: SessionTransport>(
         }
         received.extend_from_slice(&read_buffer[..size]);
 
-        if drain_and_dispatch_frames(
+        let (stop, reactive_frame_processed) = drain_and_dispatch_frames(
             &mut received,
             &mut assembler,
             &mut handshake,
@@ -770,9 +807,18 @@ pub fn run<T: SessionTransport>(
             &mut tls,
             transport,
             limits,
-        )? {
+        )?;
+        if stop {
             return Ok(());
         }
+        service_ping(
+            &mut ping_state,
+            &experiment_flags,
+            reactive_frame_processed,
+            transport,
+            &mut tls,
+            limits,
+        )?;
     }
 
     if channel_setup_complete {
@@ -814,8 +860,12 @@ fn report_probe_outcome(outcome: &ProbeOutcome, channel_setup_complete: &mut boo
 /// Routes one assembled message by channel. See [`ProbeOutcome`].
 /// Decodes and dispatches every fully-assembled message currently sitting
 /// in `received` (there may be more than one per read), routing each
-/// through [`handle_message`]. Returns `Ok(true)` if `run()` should stop
-/// immediately (see [`report_probe_outcome`]).
+/// through [`handle_message`]. Returns `(stop, processed_any)`: `stop` is
+/// `true` if `run()` should stop immediately (see [`report_probe_outcome`]);
+/// `processed_any` is `true` if at least one message was actually decoded
+/// and dispatched this call — a genuine reactive round trip, not just a
+/// nonzero byte count — used by `service_ping` when
+/// `REACTIVE_TRIGGERED_PROACTIVE_SEND_ENV_VAR` is set.
 #[allow(clippy::too_many_arguments)]
 fn drain_and_dispatch_frames<T: SessionTransport>(
     received: &mut Vec<u8>,
@@ -833,11 +883,12 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
-) -> Result<bool, CliError> {
+) -> Result<(bool, bool), CliError> {
+    let mut processed_any = false;
     loop {
         let frame = match decode_frame(received, limits) {
             Ok(frame) => frame,
-            Err(FrameError::Incomplete { .. }) => return Ok(false),
+            Err(FrameError::Incomplete { .. }) => return Ok((false, processed_any)),
             Err(error) => return Err(CliError::Protocol(error.to_string())),
         };
         let consumed = frame.consumed;
@@ -846,6 +897,7 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
         let Some(message) = message else {
             continue;
         };
+        processed_any = true;
 
         let outcome = handle_message(
             &message,
@@ -863,7 +915,7 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
             limits,
         )?;
         if report_probe_outcome(&outcome, channel_setup_complete) {
-            return Ok(true);
+            return Ok((true, processed_any));
         }
     }
 }
@@ -1055,16 +1107,23 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
     }
 }
 
-/// Checks `ping_state` on every receive-loop iteration: closes the session
-/// via the LIVI-derived watchdog if `PingResponse` has gone stale past
-/// `PING_WATCHDOG_TIMEOUT`, otherwise sends a new proactive message once
-/// `PING_INTERVAL` has elapsed since the last one. A no-op before
-/// `ping_state` is armed (see `PingState`'s doc comment).
+/// Checks `ping_state` once per call: closes the session via the
+/// LIVI-derived watchdog if `PingResponse` has gone stale past
+/// `PING_WATCHDOG_TIMEOUT` (unless suppressed, see
+/// `PROACTIVE_WRITE_RESILIENCE_ENV_VAR`'s doc comment), otherwise sends a
+/// new proactive message once `PING_INTERVAL` has elapsed since the last
+/// one. A no-op before `ping_state` is armed (see `PingState`'s doc
+/// comment). Called from `run()`'s loop after `drain_and_dispatch_frames`
+/// rather than before it, so `reactive_frame_processed` reflects whether a
+/// real message was just decoded and dispatched this iteration (see
+/// `REACTIVE_TRIGGERED_PROACTIVE_SEND_ENV_VAR`'s doc comment) — when that
+/// experiment is off, this parameter is ignored and a due send fires
+/// unconditionally, matching every prior trial's behavior.
 ///
-/// `ping_isolation` selects the `AA_HEADUNIT_PING_ISOLATION` experiment
-/// (see its doc comment below): when set, every scheduled send *after* the
-/// first (which always stays a real `PingRequest` — real-hardware-confirmed
-/// to succeed and get a real `PingResponse`, see
+/// `flags.ping_isolation` selects the `AA_HEADUNIT_PING_ISOLATION`
+/// experiment (see its doc comment below): when set, every scheduled send
+/// *after* the first (which always stays a real `PingRequest` —
+/// real-hardware-confirmed to succeed and get a real `PingResponse`, see
 /// `docs/protocol/error-2-investigation.md`, "LIVI formally adopted; real
 /// ping-timing trial") substitutes a harmless, already-proven-safe
 /// unsolicited message instead of a second `PingRequest`, to distinguish
@@ -1072,8 +1131,8 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
 /// timer-fired write at that point in the session fails."
 fn service_ping<T: SessionTransport>(
     ping_state: &mut Option<PingState>,
-    ping_isolation: bool,
-    survive_proactive_write_timeout: bool,
+    flags: &ExperimentFlags,
+    reactive_frame_processed: bool,
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
     limits: ProtocolLimits,
@@ -1081,7 +1140,8 @@ fn service_ping<T: SessionTransport>(
     let Some(state) = ping_state else {
         return Ok(());
     };
-    if !survive_proactive_write_timeout && state.last_pong.elapsed() >= PING_WATCHDOG_TIMEOUT {
+    if !flags.survive_proactive_write_timeout && state.last_pong.elapsed() >= PING_WATCHDOG_TIMEOUT
+    {
         println!("probe_result=ping_watchdog_timeout");
         return Err(CliError::Protocol(format!(
             "no PingResponse within {}ms of the last one — closing session \
@@ -1089,9 +1149,12 @@ fn service_ping<T: SessionTransport>(
             PING_WATCHDOG_TIMEOUT.as_millis()
         )));
     }
-    if state.last_sent.elapsed() >= PING_INTERVAL {
+    let due = state.last_sent.elapsed() >= PING_INTERVAL;
+    let gated_by_reactive_trigger =
+        flags.reactive_triggered_proactive_send && !reactive_frame_processed;
+    if due && !gated_by_reactive_trigger {
         let attempt = state.sends_since_arm + 1;
-        let send_result = if ping_isolation && state.sends_since_arm >= 1 {
+        let send_result = if flags.ping_isolation && state.sends_since_arm >= 1 {
             println!("probe_state=ping_isolation_control_frame_send_attempt");
             send_control_probe_frame(transport, tls, limits)
         } else {
@@ -1099,11 +1162,11 @@ fn service_ping<T: SessionTransport>(
         };
         match send_result {
             Ok(()) => {
-                if ping_isolation && state.sends_since_arm >= 1 {
+                if flags.ping_isolation && state.sends_since_arm >= 1 {
                     println!("probe_state=ping_isolation_control_frame_sent");
                 }
             }
-            Err(error) if survive_proactive_write_timeout => {
+            Err(error) if flags.survive_proactive_write_timeout => {
                 println!("probe_state=proactive_write_timed_out attempt={attempt} error={error}");
             }
             Err(error) => return Err(error),
