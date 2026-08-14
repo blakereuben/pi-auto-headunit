@@ -387,6 +387,16 @@ use crate::CliError;
 /// earlier 10s→30s experiment already proven safe (no behavioral
 /// difference observed then, beyond the intended longer window).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Extended observation budget used only when
+/// `AA_HEADUNIT_SURVIVE_PROACTIVE_WRITE_TIMEOUT` is set (see that
+/// constant's doc comment below). Each failed proactive write already costs
+/// close to the full `BULK_SEND_TIMEOUT` (10s,
+/// `crates/transport-usb/src/linux.rs`) before this probe can even attempt
+/// a retry, so `PROBE_TIMEOUT`'s normal 30s budget only ever allows one or
+/// two attempts past `Start`. Long enough for several `PING_INTERVAL`-spaced
+/// attempts, to test whether the phone's endpoint ever answers a later
+/// proactive write after failing an earlier one.
+const PROACTIVE_WRITE_SURVIVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Matches `OpenAuto`'s `AndroidAutoEntityFactory.cpp`, which constructs its
 /// `Pinger` with a hard-coded 5000ms interval
 /// (`std::make_shared<Pinger>(ioService_, 5000)`), armed from
@@ -466,6 +476,25 @@ const PING_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
 /// if it succeeds, the failure is specifically about a second
 /// `PingRequest`. Off by default — normal probe runs are unaffected.
 const PING_ISOLATION_ENV_VAR: &str = "AA_HEADUNIT_PING_ISOLATION";
+/// `AA_HEADUNIT_SURVIVE_PROACTIVE_WRITE_TIMEOUT` (any value, same
+/// `env::var_os` convention as `PING_ISOLATION_ENV_VAR` above) — an opt-in,
+/// real-hardware experiment testing suggested next step 2 in
+/// `docs/protocol/error-2-investigation.md`: does the phone's endpoint
+/// *permanently* stop answering proactive writes once it starts, or does it
+/// eventually recover? Every prior real-hardware trial ended the whole
+/// probe on the first proactive-write timeout (`service_ping`'s `?`
+/// propagates it out of `run()`), so no trial has ever been able to observe
+/// a second attempt after a first one failed. With this set,
+/// `service_ping` logs and swallows a proactive-write timeout instead of
+/// returning it, and the LIVI-derived local watchdog (`PING_WATCHDOG_TIMEOUT`)
+/// is also suppressed — enforcing it here would close the session the
+/// moment the first attempt goes unanswered, defeating the point of this
+/// experiment. `run()` also switches to the longer
+/// `PROACTIVE_WRITE_SURVIVAL_TIMEOUT` budget instead of `PROBE_TIMEOUT` so
+/// there's room for several spaced-out attempts. Off by default — normal
+/// probe runs (including the ping-isolation experiment above) are
+/// unaffected.
+const PROACTIVE_WRITE_RESILIENCE_ENV_VAR: &str = "AA_HEADUNIT_SURVIVE_PROACTIVE_WRITE_TIMEOUT";
 /// Advertised in `ServiceDiscoveryResponse.connection_configuration.ping_configuration`
 /// (`build_service_capabilities`). All four `PingConfiguration` sub-fields
 /// are now populated with LIVI's own confirmed values
@@ -611,6 +640,23 @@ struct PingState {
     sends_since_arm: u32,
 }
 
+/// Reads and reports both opt-in, off-by-default real-hardware experiment
+/// flags (see `PING_ISOLATION_ENV_VAR`/`PROACTIVE_WRITE_RESILIENCE_ENV_VAR`'s
+/// doc comments) as `(ping_isolation, survive_proactive_write_timeout)`.
+/// Extracted from `run()` to keep it under the project's line-count lint.
+fn read_experiment_flags() -> (bool, bool) {
+    let ping_isolation = std::env::var_os(PING_ISOLATION_ENV_VAR).is_some();
+    if ping_isolation {
+        println!("probe_state=ping_isolation_experiment_enabled");
+    }
+    let survive_proactive_write_timeout =
+        std::env::var_os(PROACTIVE_WRITE_RESILIENCE_ENV_VAR).is_some();
+    if survive_proactive_write_timeout {
+        println!("probe_state=proactive_write_resilience_experiment_enabled");
+    }
+    (ping_isolation, survive_proactive_write_timeout)
+}
+
 pub fn run<T: SessionTransport>(
     transport: &mut T,
     tls12_compatibility: bool,
@@ -642,11 +688,7 @@ pub fn run<T: SessionTransport>(
     drop(credentials);
 
     let limits = ProtocolLimits::default();
-    // See PING_ISOLATION_ENV_VAR's doc comment near PING_INTERVAL.
-    let ping_isolation = std::env::var_os(PING_ISOLATION_ENV_VAR).is_some();
-    if ping_isolation {
-        println!("probe_state=ping_isolation_experiment_enabled");
-    }
+    let (ping_isolation, survive_proactive_write_timeout) = read_experiment_flags();
     let mut handshake = HandshakeStateMachine::default();
     let mut actions: VecDeque<_> = handshake
         .advance(HandshakeEvent::Start)
@@ -655,7 +697,12 @@ pub fn run<T: SessionTransport>(
     process_actions(&mut actions, &mut handshake, &mut tls, transport, limits)?;
     println!("probe_state=version_request_sent");
 
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let deadline = Instant::now()
+        + if survive_proactive_write_timeout {
+            PROACTIVE_WRITE_SURVIVAL_TIMEOUT
+        } else {
+            PROBE_TIMEOUT
+        };
     // Not armed at session start (see `PingState`'s doc comment) — this
     // probe never sends a `PingRequest` until `ServiceDiscoveryResponse`
     // has actually been sent.
@@ -692,7 +739,14 @@ pub fn run<T: SessionTransport>(
             Err(TransportError::TimedOut) => continue,
             Err(error) => return Err(CliError::Transport(error)),
         };
-        service_ping(&mut ping_state, ping_isolation, transport, &mut tls, limits)?;
+        service_ping(
+            &mut ping_state,
+            ping_isolation,
+            survive_proactive_write_timeout,
+            transport,
+            &mut tls,
+            limits,
+        )?;
         if received.len() + size > MAX_ACCUMULATED_BYTES {
             return Err(CliError::Protocol(
                 "incoming frame buffer exceeded the probe limit".into(),
@@ -1019,6 +1073,7 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
 fn service_ping<T: SessionTransport>(
     ping_state: &mut Option<PingState>,
     ping_isolation: bool,
+    survive_proactive_write_timeout: bool,
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
     limits: ProtocolLimits,
@@ -1026,7 +1081,7 @@ fn service_ping<T: SessionTransport>(
     let Some(state) = ping_state else {
         return Ok(());
     };
-    if state.last_pong.elapsed() >= PING_WATCHDOG_TIMEOUT {
+    if !survive_proactive_write_timeout && state.last_pong.elapsed() >= PING_WATCHDOG_TIMEOUT {
         println!("probe_result=ping_watchdog_timeout");
         return Err(CliError::Protocol(format!(
             "no PingResponse within {}ms of the last one — closing session \
@@ -1035,12 +1090,23 @@ fn service_ping<T: SessionTransport>(
         )));
     }
     if state.last_sent.elapsed() >= PING_INTERVAL {
-        if ping_isolation && state.sends_since_arm >= 1 {
+        let attempt = state.sends_since_arm + 1;
+        let send_result = if ping_isolation && state.sends_since_arm >= 1 {
             println!("probe_state=ping_isolation_control_frame_send_attempt");
-            send_control_probe_frame(transport, tls, limits)?;
-            println!("probe_state=ping_isolation_control_frame_sent");
+            send_control_probe_frame(transport, tls, limits)
         } else {
-            send_ping_request(transport, tls, limits)?;
+            send_ping_request(transport, tls, limits)
+        };
+        match send_result {
+            Ok(()) => {
+                if ping_isolation && state.sends_since_arm >= 1 {
+                    println!("probe_state=ping_isolation_control_frame_sent");
+                }
+            }
+            Err(error) if survive_proactive_write_timeout => {
+                println!("probe_state=proactive_write_timed_out attempt={attempt} error={error}");
+            }
+            Err(error) => return Err(error),
         }
         state.last_sent = Instant::now();
         state.sends_since_arm += 1;
