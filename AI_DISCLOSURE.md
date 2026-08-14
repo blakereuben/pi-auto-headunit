@@ -1,8 +1,10 @@
 # AI Authorship Disclosure
 
-The current code, project structure, planning documents, technical documentation, tests, packaging files, and GitHub README in this repository were created by OpenAI Codex through an AI-assisted development process.
+The code, project structure, planning documents, technical documentation, tests, packaging files, and GitHub README in this repository were created through an AI-assisted development process, using more than one AI coding tool over the project's history.
 
-Blake Reuben is the project owner and has acted as the orchestrator rather than the direct author of the current code and documentation. His contributions have included:
+The project was originated with OpenAI Codex. Ongoing development, including the current protocol/session work and this documentation, has continued using Claude (Anthropic), acting as Claude Code. The git history reflects this: commits carry `Co-Authored-By` trailers for whichever AI tool produced them.
+
+Blake Reuben is the project owner and has acted as the orchestrator rather than the direct author of the current code and documentation, across both tools. His contributions have included:
 
 - defining the product idea, goals, priorities, and hardware requirements;
 - choosing the supported Raspberry Pi and Compute Module targets;
@@ -12,7 +14,7 @@ Blake Reuben is the project owner and has acted as the orchestrator rather than 
 - reviewing results and deciding what the project should do next; and
 - maintaining the GitHub account and overall project direction.
 
-Codex has translated that direction into the repository's present plans, source code, tests, documentation, and packaging foundation.
+The AI tools in use have translated that direction into the repository's present plans, source code, tests, documentation, and packaging foundation.
 
 ## Review status
 
