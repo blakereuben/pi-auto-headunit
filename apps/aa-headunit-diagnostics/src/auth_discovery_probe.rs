@@ -269,6 +269,39 @@
 //! across runs) means two non-`Start` runs isn't strong evidence of a
 //! regression, only that this identity showed no benefit. Reverted back to
 //! `AoaIdentification::receiver_probe()`.
+//!
+//! **Ping cadence advertisement experiment.** The comprehensive LIVI audit
+//! above found one gap it deliberately left out of that batch: LIVI
+//! advertises its ping cadence (1500ms) in
+//! `ServiceDiscoveryResponse.connection_configuration.ping_configuration`;
+//! this project has never populated that field at all
+//! (`crates/protocol-aap/src/service_discovery_response.rs`). This is a
+//! single-variable, minimal, reversible test of whether the phone cares
+//! that this field is present — distinct from, and not contingent on,
+//! actually re-enabling ping sends (`PING_INTERVAL` stays neutralized at
+//! `3600s`; only the advertised value, `ADVERTISED_PING_INTERVAL_MS`
+//! below, changes). Stated honestly: low-to-moderate confidence — this is
+//! the one concrete gap the comprehensive audit found and left untested,
+//! but a missing optional advertisement field is a plausible-not-certain
+//! cause for a phone to reject a session this late (after `Start`).
+//!
+//! **LIVI ping-model adoption.** At the user's explicit direction, LIVI was
+//! formally adopted as a GPL-3.0-or-later source
+//! (`docs/protocol/livi-adoption.md`) and its full session lifecycle
+//! researched directly (not just the advertisement field above). This
+//! found LIVI's actual ping *behavior* differs from the OpenAuto-derived
+//! model this probe has used in every prior ping trial in two ways at
+//! once: arm timing (immediately after `ServiceDiscoveryResponse`, not
+//! before `VersionRequest`) and cadence (1500ms, not 5000ms) — plus a
+//! local 5000ms watchdog `OpenAuto`'s `Pinger` has no equivalent of. No real
+//! ping has ever reached the phone at this timing in this investigation.
+//! Higher confidence than the advertisement-only experiment above: this
+//! reframes the still-unresolved USB bulk-OUT write timeout (see "Ping
+//! write-timeout diagnosis") as a possible *symptom* of the wrong ping
+//! timing, not an independent confound that must be routed around by
+//! neutralizing ping entirely. `PING_INTERVAL`/`PING_WATCHDOG_TIMEOUT`
+//! below now implement this model; ping is armed in `handle_message` right
+//! after `send_service_discovery_response` (see `PingState`).
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{
@@ -281,8 +314,8 @@ use protocol_aap::{
     FrameError, FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
     HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus,
     MediaMessageId, Message, MessageAssembler, MessageType, MicrophoneCapability, NavFocusType,
-    ProtocolLimits, SensorCapability, SensorMessage, SensorMessageId, SensorType,
-    ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue,
+    PingConfiguration, ProtocolLimits, SensorCapability, SensorMessage, SensorMessageId,
+    SensorType, ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue,
     ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress, TouchCapability,
     TouchScreenType, VideoCapability, VideoCodecResolution, VideoFrameRate, VideoSetupAction,
     VideoSetupEvent, VideoSetupState, VideoSetupStateMachine, decode_audio_focus_request,
@@ -350,7 +383,39 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// trial (the 30s `PROBE_TIMEOUT` observation-window experiment) — still
 /// unresolved, so raised past `PROBE_TIMEOUT` (3600s) once more to isolate
 /// that trial's own variable (window length) from this still-open confound.
-const PING_INTERVAL: Duration = Duration::from_secs(3600);
+///
+/// **Superseded by the formally-adopted LIVI ping model**
+/// (`docs/protocol/livi-adoption.md`, "Adopted scope" item 5). LIVI's own
+/// `Session.ts` arms its ping timer immediately after
+/// `ServiceDiscoveryResponse` (not before `VersionRequest`, unlike the
+/// OpenAuto-derived model above) and sends at exactly 1500ms — materially
+/// different in both timing *and* cadence from every ping trial run so
+/// far, all of which used the OpenAuto-derived 5000ms/session-start model.
+/// No real ping has ever actually reached the phone at this timing; the
+/// leading theory going into this trial is that the still-unresolved USB
+/// write-timeout bug may itself be a symptom of the phone expecting this
+/// exact cadence and never receiving it, not an independent confound to
+/// route around. Value changed from the neutralized `3600s` to the real
+/// `1500ms`, and arming moved from session-start to `ServiceDiscoveryResponse`
+/// (see `PingState`).
+const PING_INTERVAL: Duration = Duration::from_millis(1500);
+/// LIVI's own local session watchdog (`Session.ts`): if no `PingResponse`
+/// arrives within this long of the last one, LIVI closes the session
+/// itself. Adopted alongside `PING_INTERVAL` above
+/// (`docs/protocol/livi-adoption.md`, "Adopted scope" item 5) — this probe
+/// does the same rather than silently drifting out of sync with what a
+/// real head unit would do.
+const PING_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
+/// Advertised in `ServiceDiscoveryResponse.connection_configuration.ping_configuration`
+/// (`build_service_capabilities`). All four `PingConfiguration` sub-fields
+/// are now populated with LIVI's own confirmed values
+/// (`docs/protocol/livi-adoption.md`, "Adopted scope" items 4-5) — no
+/// longer just `interval_ms` alone, now that the other three are backed by
+/// an adopted, cited source rather than being unresearched guesses.
+const ADVERTISED_PING_TIMEOUT_MS: u32 = 5000;
+const ADVERTISED_PING_INTERVAL_MS: u32 = 1500;
+const ADVERTISED_PING_HIGH_LATENCY_THRESHOLD_MS: u32 = 500;
+const ADVERTISED_PING_TRACKED_COUNT: u32 = 5;
 const MAX_ACCUMULATED_BYTES: usize = 64 * 1024;
 /// Head-unit-assigned channel ids advertised in `ServiceDiscoveryResponse`.
 /// These are this probe's own choice, not AASDK's internal `ChannelId`
@@ -444,6 +509,18 @@ enum ProbeOutcome {
     PhoneEndedSession(ByeByeReason),
 }
 
+/// Ping/pong timing, armed only once `ServiceDiscoveryResponse` is sent —
+/// matching LIVI's `Session.ts` (`docs/protocol/livi-adoption.md`, "Adopted
+/// scope" item 5), not the earlier OpenAuto-derived "armed at session
+/// start, before even `VersionRequest`" model. `last_pong` doubles as the
+/// watchdog baseline: if it goes stale past `PING_WATCHDOG_TIMEOUT`, this
+/// probe closes the session itself, matching LIVI's own local watchdog
+/// behavior.
+struct PingState {
+    last_sent: Instant,
+    last_pong: Instant,
+}
+
 pub fn run<T: SessionTransport>(
     transport: &mut T,
     tls12_compatibility: bool,
@@ -484,9 +561,10 @@ pub fn run<T: SessionTransport>(
     println!("probe_state=version_request_sent");
 
     let deadline = Instant::now() + PROBE_TIMEOUT;
-    // Armed at session start, matching OpenAuto's AndroidAutoEntity::start()
-    // (see PING_INTERVAL's doc comment) — decoupled from handshake progress.
-    let mut last_ping = Instant::now();
+    // Not armed at session start (see `PingState`'s doc comment) — this
+    // probe never sends a `PingRequest` until `ServiceDiscoveryResponse`
+    // has actually been sent.
+    let mut ping_state: Option<PingState> = None;
     let mut received = Vec::new();
     let mut read_buffer = vec![0_u8; AASDK_MAX_FRAME_PAYLOAD_SIZE + 8];
     // Control channel (0) + video channel + input channel + MediaAudio
@@ -518,10 +596,7 @@ pub fn run<T: SessionTransport>(
             Err(TransportError::TimedOut) => continue,
             Err(error) => return Err(CliError::Transport(error)),
         };
-        if last_ping.elapsed() >= PING_INTERVAL {
-            send_ping_request(transport, &mut tls, limits)?;
-            last_ping = Instant::now();
-        }
+        service_ping(&mut ping_state, transport, &mut tls, limits)?;
         if received.len() + size > MAX_ACCUMULATED_BYTES {
             return Err(CliError::Protocol(
                 "incoming frame buffer exceeded the probe limit".into(),
@@ -551,6 +626,7 @@ pub fn run<T: SessionTransport>(
                 &mut speech_audio_channel,
                 &mut sensors_channel,
                 &mut simple_channels,
+                &mut ping_state,
                 &mut tls,
                 transport,
                 limits,
@@ -608,6 +684,7 @@ fn handle_message<T: SessionTransport>(
     speech_audio_channel: &mut Option<SpeechAudioChannel>,
     sensors_channel: &mut Option<SensorsChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
+    ping_state: &mut Option<PingState>,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
@@ -615,7 +692,7 @@ fn handle_message<T: SessionTransport>(
     if message.channel_id == 0 {
         if handshake.state() == HandshakeState::ServiceDiscoveryReceived {
             if let Some(reason) =
-                handle_post_discovery_control_message(message, tls, transport, limits)?
+                handle_post_discovery_control_message(message, ping_state, tls, transport, limits)?
             {
                 return Ok(ProbeOutcome::PhoneEndedSession(reason));
             }
@@ -625,6 +702,16 @@ fn handle_message<T: SessionTransport>(
             print_summary(&summary);
             println!("probe_result=service_discovery_summary_received");
             send_service_discovery_response(tls, transport, limits)?;
+            // Arm ping/pong here, matching LIVI's own timing exactly (see
+            // `PingState`'s doc comment) — not before, not after channel
+            // setup starts.
+            send_ping_request(transport, tls, limits)?;
+            let now = Instant::now();
+            *ping_state = Some(PingState {
+                last_sent: now,
+                last_pong: now,
+            });
+            println!("probe_state=ping_armed");
             *video_channel = Some(VideoChannel::AwaitingOpen(ChannelOpenStateMachine::new(
                 VIDEO_CHANNEL_ID,
             )));
@@ -703,6 +790,7 @@ fn handle_message<T: SessionTransport>(
 /// session-end signal, which `run()` treats as a clean stop, not an error.
 fn handle_post_discovery_control_message<T: SessionTransport>(
     message: &Message,
+    ping_state: &mut Option<PingState>,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
@@ -734,6 +822,9 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
                 .map_err(|error| CliError::Protocol(error.to_string()))?;
             println!("probe_state=ping_response_received");
             println!("ping_response_echoed_timestamp={echoed_timestamp}");
+            if let Some(state) = ping_state.as_mut() {
+                state.last_pong = Instant::now();
+            }
             Ok(None)
         }
         ControlMessageId::NavFocusRequest => {
@@ -766,6 +857,35 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
             "unexpected control message {other:?} after service discovery"
         ))),
     }
+}
+
+/// Checks `ping_state` on every receive-loop iteration: closes the session
+/// via the LIVI-derived watchdog if `PingResponse` has gone stale past
+/// `PING_WATCHDOG_TIMEOUT`, otherwise sends a new `PingRequest` once
+/// `PING_INTERVAL` has elapsed since the last one. A no-op before
+/// `ping_state` is armed (see `PingState`'s doc comment).
+fn service_ping<T: SessionTransport>(
+    ping_state: &mut Option<PingState>,
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let Some(state) = ping_state else {
+        return Ok(());
+    };
+    if state.last_pong.elapsed() >= PING_WATCHDOG_TIMEOUT {
+        println!("probe_result=ping_watchdog_timeout");
+        return Err(CliError::Protocol(format!(
+            "no PingResponse within {}ms of the last one — closing session \
+             (LIVI-derived watchdog, docs/protocol/livi-adoption.md)",
+            PING_WATCHDOG_TIMEOUT.as_millis()
+        )));
+    }
+    if state.last_sent.elapsed() >= PING_INTERVAL {
+        send_ping_request(transport, tls, limits)?;
+        state.last_sent = Instant::now();
+    }
+    Ok(())
 }
 
 /// Sends `PingRequest` on the control channel. See `PING_INTERVAL`'s doc
@@ -940,6 +1060,12 @@ fn build_service_capabilities() -> ServiceCapabilities {
             head_unit_model: "aa-headunit-diagnostics".into(),
             head_unit_software_build: env!("CARGO_PKG_VERSION").into(),
             head_unit_software_version: env!("CARGO_PKG_VERSION").into(),
+        }),
+        ping_configuration: Some(PingConfiguration {
+            timeout_ms: ADVERTISED_PING_TIMEOUT_MS,
+            interval_ms: ADVERTISED_PING_INTERVAL_MS,
+            high_latency_threshold_ms: ADVERTISED_PING_HIGH_LATENCY_THRESHOLD_MS,
+            tracked_ping_count: ADVERTISED_PING_TRACKED_COUNT,
         }),
     }
 }

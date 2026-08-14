@@ -143,6 +143,22 @@ pub struct HeadUnitInfo {
     pub head_unit_software_version: String,
 }
 
+/// `aap_protobuf.service.control.message.PingConfiguration`, the phone-
+/// visible advertisement of the head unit's ping cadence
+/// (`ConnectionConfiguration`'s only implemented field —
+/// `wireless_tcp_configuration`, `ConnectionConfiguration`'s other field, is
+/// wired-only scope and stays unmodeled). All four fields are populated
+/// with values confirmed against a formally-adopted working reference
+/// (`f-io/LIVI`, `docs/protocol/livi-adoption.md`, "Adopted scope" items
+/// 4-5) rather than unresearched guesses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PingConfiguration {
+    pub timeout_ms: u32,
+    pub interval_ms: u32,
+    pub high_latency_threshold_ms: u32,
+    pub tracked_ping_count: u32,
+}
+
 /// `aap_protobuf.service.bluetooth.BluetoothService`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BluetoothCapability {
@@ -182,6 +198,7 @@ pub struct ServiceCapabilities {
     pub microphone: Option<MicrophoneCapability>,
     pub sensors: Option<SensorCapability>,
     pub head_unit_info: Option<HeadUnitInfo>,
+    pub ping_configuration: Option<PingConfiguration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +234,11 @@ pub fn encode_service_discovery_response(
         // ServiceDiscoveryResponse.channels (field 1, repeated Service).
         protobuf::write_length_delimited_field(&mut body, 1, &service_bytes);
     }
+    if let Some(ping_configuration) = capabilities.ping_configuration {
+        let connection_configuration_bytes = encode_connection_configuration(ping_configuration);
+        // ServiceDiscoveryResponse.connection_configuration (field 16).
+        protobuf::write_length_delimited_field(&mut body, 16, &connection_configuration_bytes);
+    }
     if let Some(head_unit_info) = &capabilities.head_unit_info {
         let head_unit_info_bytes = encode_head_unit_info(head_unit_info);
         // ServiceDiscoveryResponse.headunit_info (field 17).
@@ -226,6 +248,26 @@ pub fn encode_service_discovery_response(
         id: ControlMessageId::ServiceDiscoveryResponse,
         body,
     })
+}
+
+fn encode_connection_configuration(ping_configuration: PingConfiguration) -> Vec<u8> {
+    let mut ping_bytes = Vec::new();
+    // PingConfiguration.timeout_ms (field 1, optional uint32).
+    protobuf::write_uint32_field(&mut ping_bytes, 1, ping_configuration.timeout_ms);
+    // PingConfiguration.interval_ms (field 2, optional uint32).
+    protobuf::write_uint32_field(&mut ping_bytes, 2, ping_configuration.interval_ms);
+    // PingConfiguration.high_latency_threshold_ms (field 3, optional uint32).
+    protobuf::write_uint32_field(
+        &mut ping_bytes,
+        3,
+        ping_configuration.high_latency_threshold_ms,
+    );
+    // PingConfiguration.tracked_ping_count (field 4, optional uint32).
+    protobuf::write_uint32_field(&mut ping_bytes, 4, ping_configuration.tracked_ping_count);
+    let mut out = Vec::new();
+    // ConnectionConfiguration.ping_configuration (field 1, optional PingConfiguration).
+    protobuf::write_length_delimited_field(&mut out, 1, &ping_bytes);
+    out
 }
 
 fn encode_head_unit_info(info: &HeadUnitInfo) -> Vec<u8> {
@@ -491,6 +533,7 @@ mod tests {
             microphone: None,
             sensors: None,
             head_unit_info: None,
+            ping_configuration: None,
         };
 
         let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
@@ -530,6 +573,7 @@ mod tests {
             microphone: None,
             sensors: None,
             head_unit_info: None,
+            ping_configuration: None,
         };
 
         let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
@@ -569,6 +613,7 @@ mod tests {
             microphone: None,
             sensors: None,
             head_unit_info: None,
+            ping_configuration: None,
         };
 
         let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
@@ -622,6 +667,7 @@ mod tests {
             microphone: None,
             sensors: None,
             head_unit_info: None,
+            ping_configuration: None,
         };
 
         let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
@@ -670,6 +716,34 @@ mod tests {
                 0x32, 0x01, b'f', // head_unit_model
                 0x3a, 0x01, b'g', // head_unit_software_build
                 0x42, 0x01, b'h', // head_unit_software_version
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_ping_configuration_when_present() {
+        let catalogue = catalogue(&[]);
+        let capabilities = ServiceCapabilities {
+            ping_configuration: Some(PingConfiguration {
+                timeout_ms: 5000,
+                interval_ms: 1500,
+                high_latency_threshold_ms: 500,
+                tracked_ping_count: 5,
+            }),
+            ..ServiceCapabilities::default()
+        };
+
+        let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
+        assert_eq!(
+            message.body,
+            vec![
+                0x82, 0x01, 0x0d, // connection_configuration (field 16), length 13
+                0x0a, 0x0b, // ConnectionConfiguration.ping_configuration (field 1), length 11
+                0x08, 0x88, 0x27, // PingConfiguration.timeout_ms (field 1) = 5000
+                0x10, 0xdc, 0x0b, // PingConfiguration.interval_ms (field 2) = 1500
+                0x18, 0xf4,
+                0x03, // PingConfiguration.high_latency_threshold_ms (field 3) = 500
+                0x20, 0x05, // PingConfiguration.tracked_ping_count (field 4) = 5
             ]
         );
     }
@@ -839,6 +913,7 @@ mod tests {
                 sensor_types: vec![SensorType::DrivingStatusData, SensorType::NightMode],
             }),
             head_unit_info: None,
+            ping_configuration: None,
         };
 
         let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");

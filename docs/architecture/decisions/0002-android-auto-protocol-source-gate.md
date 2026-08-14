@@ -1,6 +1,6 @@
 # ADR-0002: Android Auto Protocol Source Gate
 
-- Status: superseded in part by the owner-approved AASDK adoption on 4 August 2026 and OpenAuto adoption on 5 August 2026
+- Status: superseded in part by the owner-approved AASDK adoption on 4 August 2026, OpenAuto adoption on 5 August 2026, and LIVI adoption on 14 August 2026
 - Date: 4 August 2026
 
 ## Context

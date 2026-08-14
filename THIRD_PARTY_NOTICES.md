@@ -31,6 +31,7 @@ These projects are provenance-tracked sources for selected Rust behaviour; they 
 |---|---|---|---|
 | [AASDK](https://github.com/opencardev/aasdk) | `9bf6adf933665dee26532201719fac14a047ccf1` | GPL-3.0-or-later | Framing, control-handshake, and bounded TLS-engine behaviour listed in `docs/protocol/aasdk-adoption.md`; all shared credentials excluded. |
 | [OpenAuto](https://github.com/f1xpl/openauto) | `aa90412bf93b5a5078495ea85ac9270c6297d369` | GPL-3.0-or-later in relevant source headers; README declares GPLv3 | Source for the attributed service-discovery event transition and bounded internal service catalogue, and an approved candidate for later file-attributed service behaviour listed in `docs/protocol/openauto-adoption.md`. Credentials, identities, trademarks, proprietary material, and assets excluded. |
+| [LIVI](https://github.com/f-io/LIVI) | `9000f308eec423c5c56ac0a14491a7c95ce5762d` | GPL-3.0-or-later (`package.json`, `README.md`, per-file SPDX headers) | Source for video-focus timing, per-frame media ack, unconditional key-binding response, ping cadence advertisement, and ping arm-timing/watchdog behaviour listed in `docs/protocol/livi-adoption.md`. Credentials (including `native/crypto/**`), branding, assets, and unmodeled channels excluded. |
 
 ## Build-only dependencies
 

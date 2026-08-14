@@ -234,6 +234,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
         microphone: None,
         sensors: None,
         head_unit_info: None,
+        ping_configuration: None,
     };
     let response =
         encode_service_discovery_response(&catalogue, &capabilities).expect("encode response");
