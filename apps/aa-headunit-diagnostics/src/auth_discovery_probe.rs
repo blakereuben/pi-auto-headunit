@@ -27,15 +27,15 @@
 //! channel is a `MediaSinkService`: the phone sends real video data to the
 //! head unit, not the reverse (confirmed from AASDK's own
 //! `IVideoServiceChannelEventHandler` — no head-unit-side "send video"
-//! method exists), so this only ever *receives* and byte-counts `Data`
+//! method exists), so this only ever *receives* `Data`
 //! (`MEDIA_MESSAGE_DATA`, an 8-byte timestamp prefix plus raw encoded-frame
 //! bytes) or `CodecConfig` (`MEDIA_MESSAGE_CODEC_CONFIG`, raw bytes, no
-//! prefix) — never any actual frame content, matching this project's
-//! no-raw-payload-logging rule. No video decode/render/UI work happens
-//! here, no `MEDIA_MESSAGE_ACK` is ever sent (so the phone may only send a
-//! single unacknowledged frame given `Config.max_unacked = 1`), and none of
-//! the other three channels are driven past open. See the channel-setup
-//! design record for the full scope boundary and provenance trail.
+//! prefix) — the payload itself is never logged whole, only its length
+//! (matching this project's no-raw-payload-logging rule), though as of the
+//! real decode/render pipeline described below it is now handed to
+//! `media_gstreamer::VideoRenderPipeline` in memory, never persisted. See
+//! the channel-setup design record for the full scope boundary and
+//! provenance trail.
 //!
 //! Every non-video channel, the populated `HeadUnitInfo`, `AudioFocusRequest`
 //! handling, `KeyBindingRequest` handling, and the
@@ -303,6 +303,32 @@
 //! below now implement this model; ping is armed in `handle_message` right
 //! after `send_service_discovery_response` (see `PingState`).
 //!
+//! No real phone has ever sent `Data`/`CodecConfig` on the video channel in
+//! any trial to date (Error 2 fires first), so the leading remaining
+//! theory is that this project has only ever diagnosed the wire protocol —
+//! it has never actually decoded or rendered anything, which a real phone
+//! may require before committing to a session. `video_render` (a
+//! `VideoRenderState`, alongside `video_channel`) now builds a real
+//! `media_gstreamer::VideoRenderPipeline` (`appsrc ! h264parse !
+//! avdec_h264 ! videoconvert ! waylandsink`) lazily once `Start` is
+//! received, and pushes every subsequent `Data`/`CodecConfig` payload into
+//! it. A pipeline construction, start, or push/bus failure (most commonly:
+//! no reachable Wayland compositor, e.g. an SSH session without
+//! `WAYLAND_DISPLAY` forwarded) is logged and demotes `video_render` to
+//! `Failed` — it never aborts the probe or affects `Ack`-sending, which
+//! stays entirely protocol-driven. This cannot yet be exercised against a
+//! real phone for the reason above; it's proven with a self-generated
+//! synthetic H.264 fixture instead (`media_gstreamer::render`'s tests) and
+//! wired in so a future trial that gets past `Start` exercises it for
+//! real. Two framing details are genuine, explicitly-flagged assumptions,
+//! not confirmed facts: `Data`/`CodecConfig` are assumed Annex-B
+//! byte-stream H.264 (start-code-delimited NAL units, `CodecConfig` pushed
+//! through the same `appsrc` ahead of frame data so `h264parse` can
+//! extract in-band SPS/PPS), and `Data`'s 8-byte timestamp is assumed
+//! microseconds for PTS purposes. Both fail closed (a pipeline bus error,
+//! not corrupted output) if wrong, and neither has been confirmable
+//! against real phone bytes yet.
+//!
 //! **Attribution.** This probe's overall session-orchestration shape
 //! (version → TLS → auth → service discovery → channel setup → running)
 //! follows AASDK revision `9bf6adf933665dee26532201719fac14a047ccf1` and
@@ -322,6 +348,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use credential_store::CredentialMaterial;
+use media_api::{DecoderCapability, DecoderKind, VideoCodec};
+use media_gstreamer::{GstreamerBackend, RenderSink, VideoRenderPipeline};
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
     AudioSetupAction, AudioSetupEvent, AudioSetupStateMachine, AudioStreamType,
@@ -486,6 +514,29 @@ enum VideoChannel {
     Open(VideoSetupStateMachine),
 }
 
+/// Lifecycle of the real decode/render pipeline for the video channel,
+/// independent of `VideoChannel`'s own protocol state — a pipeline failure
+/// (no compositor reachable, decode error, etc.) must never affect
+/// protocol-level correctness (acking keeps happening regardless). Built
+/// lazily on `VideoSetupAction::Ready`, since only then is the negotiated
+/// configuration known (in practice always the single advertised
+/// 800x480@30 H.264 configuration this probe ever offers).
+enum VideoRenderState {
+    /// `GstreamerBackend::new()` itself failed (`GStreamer` unusable on this
+    /// host at all) — never attempted again this run. The error is
+    /// printed at the point of failure, not retained here.
+    Unavailable,
+    /// Backend is ready; pipeline not yet built (waiting for `Ready`).
+    NotStarted(GstreamerBackend),
+    /// Pipeline built and playing.
+    Running(VideoRenderPipeline),
+    /// Construction, start, or a later push/bus error occurred — no
+    /// further attempts are made this run, but the probe (and acking)
+    /// keeps going. The error is printed at the point of failure, not
+    /// retained here.
+    Failed,
+}
+
 /// Per-channel progress for the `MediaAudio` channel, driven once
 /// `ServiceDiscoveryResponse` has been sent. Same shape as `VideoChannel`
 /// (see `protocol_aap::audio_setup` for why this is a separate type rather
@@ -622,6 +673,7 @@ pub fn run<T: SessionTransport>(
     // whatever the phone sends after video Start, until PROBE_TIMEOUT.
     let mut channel_setup_complete = false;
     let mut video_channel: Option<VideoChannel> = None;
+    let mut video_render = new_video_render_state();
     let mut media_audio_channel: Option<MediaAudioChannel> = None;
     let mut system_audio_channel: Option<SystemAudioChannel> = None;
     let mut speech_audio_channel: Option<SpeechAudioChannel> = None;
@@ -648,36 +700,24 @@ pub fn run<T: SessionTransport>(
         }
         received.extend_from_slice(&read_buffer[..size]);
 
-        loop {
-            let frame = match decode_frame(&received, limits) {
-                Ok(frame) => frame,
-                Err(FrameError::Incomplete { .. }) => break,
-                Err(error) => return Err(CliError::Protocol(error.to_string())),
-            };
-            let consumed = frame.consumed;
-            let message = push_decoded_frame(frame, &mut assembler, &mut tls, handshake.state())?;
-            received.drain(..consumed);
-            let Some(message) = message else {
-                continue;
-            };
-
-            let outcome = handle_message(
-                &message,
-                &mut handshake,
-                &mut video_channel,
-                &mut media_audio_channel,
-                &mut system_audio_channel,
-                &mut speech_audio_channel,
-                &mut sensors_channel,
-                &mut simple_channels,
-                &mut ping_state,
-                &mut tls,
-                transport,
-                limits,
-            )?;
-            if report_probe_outcome(&outcome, &mut channel_setup_complete) {
-                return Ok(());
-            }
+        if drain_and_dispatch_frames(
+            &mut received,
+            &mut assembler,
+            &mut handshake,
+            &mut video_channel,
+            &mut video_render,
+            &mut media_audio_channel,
+            &mut system_audio_channel,
+            &mut speech_audio_channel,
+            &mut sensors_channel,
+            &mut simple_channels,
+            &mut ping_state,
+            &mut channel_setup_complete,
+            &mut tls,
+            transport,
+            limits,
+        )? {
+            return Ok(());
         }
     }
 
@@ -718,11 +758,68 @@ fn report_probe_outcome(outcome: &ProbeOutcome, channel_setup_complete: &mut boo
 }
 
 /// Routes one assembled message by channel. See [`ProbeOutcome`].
+/// Decodes and dispatches every fully-assembled message currently sitting
+/// in `received` (there may be more than one per read), routing each
+/// through [`handle_message`]. Returns `Ok(true)` if `run()` should stop
+/// immediately (see [`report_probe_outcome`]).
+#[allow(clippy::too_many_arguments)]
+fn drain_and_dispatch_frames<T: SessionTransport>(
+    received: &mut Vec<u8>,
+    assembler: &mut MessageAssembler,
+    handshake: &mut HandshakeStateMachine,
+    video_channel: &mut Option<VideoChannel>,
+    video_render: &mut VideoRenderState,
+    media_audio_channel: &mut Option<MediaAudioChannel>,
+    system_audio_channel: &mut Option<SystemAudioChannel>,
+    speech_audio_channel: &mut Option<SpeechAudioChannel>,
+    sensors_channel: &mut Option<SensorsChannel>,
+    simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
+    ping_state: &mut Option<PingState>,
+    channel_setup_complete: &mut bool,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<bool, CliError> {
+    loop {
+        let frame = match decode_frame(received, limits) {
+            Ok(frame) => frame,
+            Err(FrameError::Incomplete { .. }) => return Ok(false),
+            Err(error) => return Err(CliError::Protocol(error.to_string())),
+        };
+        let consumed = frame.consumed;
+        let message = push_decoded_frame(frame, assembler, tls, handshake.state())?;
+        received.drain(..consumed);
+        let Some(message) = message else {
+            continue;
+        };
+
+        let outcome = handle_message(
+            &message,
+            handshake,
+            video_channel,
+            video_render,
+            media_audio_channel,
+            system_audio_channel,
+            speech_audio_channel,
+            sensors_channel,
+            simple_channels,
+            ping_state,
+            tls,
+            transport,
+            limits,
+        )?;
+        if report_probe_outcome(&outcome, channel_setup_complete) {
+            return Ok(true);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_message<T: SessionTransport>(
     message: &Message,
     handshake: &mut HandshakeStateMachine,
     video_channel: &mut Option<VideoChannel>,
+    video_render: &mut VideoRenderState,
     media_audio_channel: &mut Option<MediaAudioChannel>,
     system_audio_channel: &mut Option<SystemAudioChannel>,
     speech_audio_channel: &mut Option<SpeechAudioChannel>,
@@ -784,7 +881,7 @@ fn handle_message<T: SessionTransport>(
     }
 
     if message.channel_id == VIDEO_CHANNEL_ID {
-        handle_video_channel_message(message, video_channel, tls, transport, limits)?;
+        handle_video_channel_message(message, video_channel, video_render, tls, transport, limits)?;
     } else if message.channel_id == MEDIA_AUDIO_CHANNEL_ID {
         handle_media_audio_channel_message(message, media_audio_channel, tls, transport, limits)?;
     } else if message.channel_id == SYSTEM_AUDIO_CHANNEL_ID {
@@ -1176,6 +1273,7 @@ fn build_service_capabilities() -> ServiceCapabilities {
 fn handle_video_channel_message<T: SessionTransport>(
     message: &Message,
     video_channel: &mut Option<VideoChannel>,
+    video_render: &mut VideoRenderState,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
@@ -1254,22 +1352,112 @@ fn handle_video_channel_message<T: SessionTransport>(
                         println!("probe_state=video_channel_start_received");
                         println!("video_channel_session_id={session_id}");
                         println!("video_channel_configuration_index={configuration_index}");
+                        start_video_render_pipeline(video_render);
                     }
-                    VideoSetupAction::MediaDataReceived {
-                        timestamp,
-                        byte_len,
-                    } => {
+                    VideoSetupAction::MediaDataReceived { timestamp, payload } => {
                         println!("probe_state=video_media_data_received");
                         println!("video_media_data_timestamp={timestamp}");
-                        println!("video_media_data_bytes={byte_len}");
+                        println!("video_media_data_bytes={}", payload.len());
+                        apply_to_running_pipeline(video_render, |pipeline| {
+                            pipeline.push_frame(&payload, timestamp)
+                        });
                     }
-                    VideoSetupAction::CodecConfigReceived { byte_len } => {
+                    VideoSetupAction::CodecConfigReceived { payload } => {
                         println!("probe_state=video_media_codec_config_received");
-                        println!("video_media_codec_config_bytes={byte_len}");
+                        println!("video_media_codec_config_bytes={}", payload.len());
+                        apply_to_running_pipeline(video_render, |pipeline| {
+                            pipeline.push_codec_config(&payload)
+                        });
                     }
                 }
             }
             Ok(())
+        }
+    }
+}
+
+/// Runs `push` against the pipeline only if `video_render` is currently
+/// `Running`; a no-op otherwise (e.g. no compositor was ever reachable this
+/// run). A push error or a bus error observed right after demotes
+/// `video_render` to `Failed` — never returns an error, since rendering is
+/// independent of protocol correctness (see `VideoRenderState`'s doc
+/// comment).
+fn apply_to_running_pipeline(
+    video_render: &mut VideoRenderState,
+    push: impl FnOnce(&VideoRenderPipeline) -> Result<(), media_gstreamer::GstreamerError>,
+) {
+    let failure = match video_render {
+        VideoRenderState::Running(pipeline) => match push(pipeline) {
+            Err(error) => Some(("video_render_push_failed", error)),
+            Ok(()) => pipeline
+                .poll_bus_error()
+                .map(|error| ("video_render_pipeline_error", error)),
+        },
+        _ => None,
+    };
+    if let Some((state, error)) = failure {
+        println!("probe_state={state}");
+        println!("video_render_error={error}");
+        *video_render = VideoRenderState::Failed;
+    }
+}
+
+/// Initializes `GStreamer` once at probe startup, independent of session
+/// progress (the pipeline itself is still built lazily, on `Start` — see
+/// `start_video_render_pipeline`). Failure here (e.g. `GStreamer` unusable
+/// on this host at all) is logged and never retried this run.
+fn new_video_render_state() -> VideoRenderState {
+    match GstreamerBackend::new() {
+        Ok(backend) => VideoRenderState::NotStarted(backend),
+        Err(error) => {
+            println!("probe_state=video_render_backend_unavailable");
+            println!("video_render_error={error}");
+            VideoRenderState::Unavailable
+        }
+    }
+}
+
+/// Lazily builds and starts the real decode/render pipeline once (on the
+/// first `Start`, i.e. while `video_render` is still `NotStarted`) for the
+/// single advertised 800x480@30 H.264 configuration — this probe never
+/// advertises any other. Construction/start failure (most commonly: no
+/// reachable Wayland compositor) demotes `video_render` to `Failed` and is
+/// logged; it never returns an error or aborts the probe, since rendering
+/// is independent of protocol correctness (see `VideoRenderState`'s doc
+/// comment).
+fn start_video_render_pipeline(video_render: &mut VideoRenderState) {
+    if !matches!(video_render, VideoRenderState::NotStarted(_)) {
+        return;
+    }
+    let VideoRenderState::NotStarted(backend) =
+        std::mem::replace(video_render, VideoRenderState::Failed)
+    else {
+        unreachable!("just matched NotStarted above");
+    };
+    let capability = DecoderCapability {
+        id: "gstreamer:avdec_h264".into(),
+        codec: VideoCodec::H264,
+        kind: DecoderKind::Software,
+        maximum_width: 800,
+        maximum_height: 480,
+        maximum_frames_per_second: 30,
+    };
+    match backend.build_video_render_pipeline(&capability, RenderSink::Wayland) {
+        Ok(pipeline) => match pipeline.start() {
+            Ok(()) => {
+                println!("probe_state=video_render_pipeline_started");
+                *video_render = VideoRenderState::Running(pipeline);
+            }
+            Err(error) => {
+                println!("probe_state=video_render_pipeline_start_failed");
+                println!("video_render_error={error}");
+                *video_render = VideoRenderState::Failed;
+            }
+        },
+        Err(error) => {
+            println!("probe_state=video_render_pipeline_build_failed");
+            println!("video_render_error={error}");
+            *video_render = VideoRenderState::Failed;
         }
     }
 }
@@ -1360,17 +1548,14 @@ fn handle_media_audio_channel_message<T: SessionTransport>(
                         println!("media_audio_channel_session_id={session_id}");
                         println!("media_audio_channel_configuration_index={configuration_index}");
                     }
-                    AudioSetupAction::MediaDataReceived {
-                        timestamp,
-                        byte_len,
-                    } => {
+                    AudioSetupAction::MediaDataReceived { timestamp, payload } => {
                         println!("probe_state=media_audio_media_data_received");
                         println!("media_audio_media_data_timestamp={timestamp}");
-                        println!("media_audio_media_data_bytes={byte_len}");
+                        println!("media_audio_media_data_bytes={}", payload.len());
                     }
-                    AudioSetupAction::CodecConfigReceived { byte_len } => {
+                    AudioSetupAction::CodecConfigReceived { payload } => {
                         println!("probe_state=media_audio_media_codec_config_received");
-                        println!("media_audio_media_codec_config_bytes={byte_len}");
+                        println!("media_audio_media_codec_config_bytes={}", payload.len());
                     }
                 }
             }
@@ -1467,17 +1652,14 @@ fn handle_system_audio_channel_message<T: SessionTransport>(
                         println!("system_audio_channel_session_id={session_id}");
                         println!("system_audio_channel_configuration_index={configuration_index}");
                     }
-                    AudioSetupAction::MediaDataReceived {
-                        timestamp,
-                        byte_len,
-                    } => {
+                    AudioSetupAction::MediaDataReceived { timestamp, payload } => {
                         println!("probe_state=system_audio_media_data_received");
                         println!("system_audio_media_data_timestamp={timestamp}");
-                        println!("system_audio_media_data_bytes={byte_len}");
+                        println!("system_audio_media_data_bytes={}", payload.len());
                     }
-                    AudioSetupAction::CodecConfigReceived { byte_len } => {
+                    AudioSetupAction::CodecConfigReceived { payload } => {
                         println!("probe_state=system_audio_media_codec_config_received");
-                        println!("system_audio_media_codec_config_bytes={byte_len}");
+                        println!("system_audio_media_codec_config_bytes={}", payload.len());
                     }
                 }
             }
@@ -1575,17 +1757,14 @@ fn handle_speech_audio_channel_message<T: SessionTransport>(
                         println!("speech_audio_channel_session_id={session_id}");
                         println!("speech_audio_channel_configuration_index={configuration_index}");
                     }
-                    AudioSetupAction::MediaDataReceived {
-                        timestamp,
-                        byte_len,
-                    } => {
+                    AudioSetupAction::MediaDataReceived { timestamp, payload } => {
                         println!("probe_state=speech_audio_media_data_received");
                         println!("speech_audio_media_data_timestamp={timestamp}");
-                        println!("speech_audio_media_data_bytes={byte_len}");
+                        println!("speech_audio_media_data_bytes={}", payload.len());
                     }
-                    AudioSetupAction::CodecConfigReceived { byte_len } => {
+                    AudioSetupAction::CodecConfigReceived { payload } => {
                         println!("probe_state=speech_audio_media_codec_config_received");
-                        println!("speech_audio_media_codec_config_bytes={byte_len}");
+                        println!("speech_audio_media_codec_config_bytes={}", payload.len());
                     }
                 }
             }

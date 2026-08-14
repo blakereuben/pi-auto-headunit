@@ -14,7 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libgstreamer1.0-dev libssl-dev
+        run: |
+          sudo apt-get update && sudo apt-get install --yes \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-bad gstreamer1.0-libav \
+            libssl-dev
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy

@@ -11,6 +11,7 @@ media-api = { path = "../media-api" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gstreamer = "=0.24.2"
+gstreamer-app = "=0.24.2"
 
 [lints]
 workspace = true

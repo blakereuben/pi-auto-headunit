@@ -68,18 +68,19 @@ pub enum AudioSetupAction {
     },
     /// A `Data` message arrived while `Ready` — the phone (a
     /// `MediaSinkService`'s source) sending actual encoded audio to the
-    /// head unit. `byte_len` is the payload length with the 8-byte
-    /// timestamp prefix already stripped; bytes are never retained or
-    /// logged.
+    /// head unit. `payload` is the payload with the 8-byte timestamp
+    /// prefix already stripped; owned so it can outlive the message that
+    /// carried it. Callers must never log it whole — only its length.
     MediaDataReceived {
         timestamp: u64,
-        byte_len: usize,
+        payload: Vec<u8>,
     },
     /// A `CodecConfig` message arrived while `Ready` — out-of-band codec
-    /// initialization data, no timestamp prefix. `byte_len` is the raw
-    /// body length; bytes are never retained or logged.
+    /// initialization data, no timestamp prefix. `payload` is the raw
+    /// body, owned for the same reason as `MediaDataReceived`. Callers
+    /// must never log it whole — only its length.
     CodecConfigReceived {
-        byte_len: usize,
+        payload: Vec<u8>,
     },
 }
 
@@ -318,7 +319,7 @@ impl AudioSetupStateMachine {
             .expect("session_id is set once Ready, the only state handle_media runs in");
         match message.id {
             MediaMessageId::Data => {
-                let Some((timestamp, byte_len)) = decode_media_data(&message.body) else {
+                let Some((timestamp, payload)) = decode_media_data(&message.body) else {
                     return Err(AudioSetupError::TruncatedMediaData {
                         available: message.body.len(),
                     });
@@ -326,14 +327,14 @@ impl AudioSetupStateMachine {
                 Ok(vec![
                     AudioSetupAction::MediaDataReceived {
                         timestamp,
-                        byte_len,
+                        payload: payload.to_vec(),
                     },
                     AudioSetupAction::SendMedia(encode_media_ack(session_id)),
                 ])
             }
             MediaMessageId::CodecConfig => Ok(vec![
                 AudioSetupAction::CodecConfigReceived {
-                    byte_len: message.body.len(),
+                    payload: message.body.clone(),
                 },
                 AudioSetupAction::SendMedia(encode_media_ack(session_id)),
             ]),
@@ -475,7 +476,7 @@ mod tests {
             actions[0],
             AudioSetupAction::MediaDataReceived {
                 timestamp: 42,
-                byte_len: 3,
+                payload: vec![0xaa, 0xbb, 0xcc],
             }
         );
         let AudioSetupAction::SendMedia(ack) = &actions[1] else {
@@ -494,7 +495,9 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert_eq!(
             actions[0],
-            AudioSetupAction::CodecConfigReceived { byte_len: 4 }
+            AudioSetupAction::CodecConfigReceived {
+                payload: vec![0x01, 0x02, 0x03, 0x04],
+            }
         );
         let AudioSetupAction::SendMedia(ack) = &actions[1] else {
             panic!("expected SendMedia");

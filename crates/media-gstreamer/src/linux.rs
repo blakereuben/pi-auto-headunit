@@ -8,6 +8,10 @@ use crate::{PipelineElements, capability_for_request, decoder_element, pipeline_
 pub enum GstreamerError {
     Initialization(String),
     MissingElement(&'static str),
+    PipelineConstruction(String),
+    StateChange(String),
+    PushBuffer(String),
+    Pipeline(String),
 }
 
 impl fmt::Display for GstreamerError {
@@ -21,6 +25,21 @@ impl fmt::Display for GstreamerError {
                     formatter,
                     "required GStreamer element is missing: {element}"
                 )
+            }
+            Self::PipelineConstruction(message) => {
+                write!(formatter, "failed to construct render pipeline: {message}")
+            }
+            Self::StateChange(message) => {
+                write!(formatter, "render pipeline state change failed: {message}")
+            }
+            Self::PushBuffer(message) => {
+                write!(
+                    formatter,
+                    "failed to push buffer into render pipeline: {message}"
+                )
+            }
+            Self::Pipeline(message) => {
+                write!(formatter, "render pipeline reported an error: {message}")
             }
         }
     }
@@ -64,5 +83,13 @@ impl GstreamerBackend {
             }
         }
         Ok(elements)
+    }
+
+    pub fn build_video_render_pipeline(
+        &self,
+        capability: &DecoderCapability,
+        sink: crate::RenderSink,
+    ) -> Result<crate::VideoRenderPipeline, GstreamerError> {
+        crate::VideoRenderPipeline::new(pipeline_elements(capability), sink)
     }
 }

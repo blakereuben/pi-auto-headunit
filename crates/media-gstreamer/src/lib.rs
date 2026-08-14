@@ -2,9 +2,13 @@
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod render;
 
 #[cfg(target_os = "linux")]
 pub use linux::{GstreamerBackend, GstreamerError};
+#[cfg(target_os = "linux")]
+pub use render::{RenderSink, VideoRenderPipeline};
 
 #[cfg(any(target_os = "linux", test))]
 use media_api::VideoRequest;

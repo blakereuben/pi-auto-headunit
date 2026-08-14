@@ -106,18 +106,20 @@ pub enum VideoSetupAction {
     },
     /// A `Data` message arrived while `Ready` — the phone (a
     /// `MediaSinkService`'s source) sending an actual encoded video frame
-    /// to the head unit. `byte_len` is the encoded-frame payload length
-    /// with the 8-byte timestamp prefix already stripped; the bytes
-    /// themselves are never retained or logged.
+    /// to the head unit. `payload` is the encoded-frame payload with the
+    /// 8-byte timestamp prefix already stripped; owned so it can outlive
+    /// the message that carried it (e.g. to hand it to a decode/render
+    /// pipeline). Callers must never log it whole — only its length.
     MediaDataReceived {
         timestamp: u64,
-        byte_len: usize,
+        payload: Vec<u8>,
     },
     /// A `CodecConfig` message arrived while `Ready` — out-of-band codec
-    /// initialization data (e.g. SPS/PPS), no timestamp prefix. `byte_len`
-    /// is the raw body length; bytes are never retained or logged.
+    /// initialization data (e.g. SPS/PPS), no timestamp prefix. `payload`
+    /// is the raw body, owned for the same reason as `MediaDataReceived`.
+    /// Callers must never log it whole — only its length.
     CodecConfigReceived {
-        byte_len: usize,
+        payload: Vec<u8>,
     },
 }
 
@@ -362,7 +364,7 @@ impl VideoSetupStateMachine {
             .expect("session_id is set once Ready, the only state handle_media runs in");
         match message.id {
             MediaMessageId::Data => {
-                let Some((timestamp, byte_len)) = decode_media_data(&message.body) else {
+                let Some((timestamp, payload)) = decode_media_data(&message.body) else {
                     return Err(VideoSetupError::TruncatedMediaData {
                         available: message.body.len(),
                     });
@@ -370,14 +372,14 @@ impl VideoSetupStateMachine {
                 Ok(vec![
                     VideoSetupAction::MediaDataReceived {
                         timestamp,
-                        byte_len,
+                        payload: payload.to_vec(),
                     },
                     VideoSetupAction::SendMedia(encode_media_ack(session_id)),
                 ])
             }
             MediaMessageId::CodecConfig => Ok(vec![
                 VideoSetupAction::CodecConfigReceived {
-                    byte_len: message.body.len(),
+                    payload: message.body.clone(),
                 },
                 VideoSetupAction::SendMedia(encode_media_ack(session_id)),
             ]),
@@ -540,7 +542,7 @@ mod tests {
             actions[0],
             VideoSetupAction::MediaDataReceived {
                 timestamp: 42,
-                byte_len: 3,
+                payload: vec![0xaa, 0xbb, 0xcc],
             }
         );
         let VideoSetupAction::SendMedia(ack) = &actions[1] else {
@@ -559,7 +561,9 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert_eq!(
             actions[0],
-            VideoSetupAction::CodecConfigReceived { byte_len: 4 }
+            VideoSetupAction::CodecConfigReceived {
+                payload: vec![0x01, 0x02, 0x03, 0x04],
+            }
         );
         let VideoSetupAction::SendMedia(ack) = &actions[1] else {
             panic!("expected SendMedia");

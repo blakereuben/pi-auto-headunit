@@ -157,8 +157,10 @@ impl MediaMessage {
 /// channel, since the wire shape is identical regardless of media type: an
 /// 8-byte big-endian timestamp prefix followed by the raw encoded payload.
 /// Returns `None` if the body is shorter than the prefix; callers map that
-/// to their own channel-specific `TruncatedMediaData` error variant.
-pub(crate) fn decode_media_data(body: &[u8]) -> Option<(u64, usize)> {
+/// to their own channel-specific `TruncatedMediaData` error variant. The
+/// returned slice borrows from `body`; callers that need to keep it beyond
+/// the borrow's scope (to hand the frame to a decoder) must copy it.
+pub(crate) fn decode_media_data(body: &[u8]) -> Option<(u64, &[u8])> {
     const TIMESTAMP_SIZE: usize = 8;
     if body.len() < TIMESTAMP_SIZE {
         return None;
@@ -166,10 +168,7 @@ pub(crate) fn decode_media_data(body: &[u8]) -> Option<(u64, usize)> {
     let timestamp_bytes: [u8; TIMESTAMP_SIZE] = body[..TIMESTAMP_SIZE]
         .try_into()
         .expect("length checked above");
-    Some((
-        u64::from_be_bytes(timestamp_bytes),
-        body.len() - TIMESTAMP_SIZE,
-    ))
+    Some((u64::from_be_bytes(timestamp_bytes), &body[TIMESTAMP_SIZE..]))
 }
 
 /// Encodes `Ack` (`aap_protobuf.service.media.source.message.Ack`) — sent
@@ -204,10 +203,13 @@ mod tests {
     }
 
     #[test]
-    fn decodes_media_data_timestamp_and_length() {
+    fn decodes_media_data_timestamp_and_payload() {
         let mut body = 42_u64.to_be_bytes().to_vec();
         body.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
-        assert_eq!(decode_media_data(&body), Some((42, 3)));
+        assert_eq!(
+            decode_media_data(&body),
+            Some((42, [0xaa, 0xbb, 0xcc].as_slice()))
+        );
     }
 
     #[test]

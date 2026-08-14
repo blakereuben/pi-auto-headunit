@@ -452,7 +452,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
         actions[0],
         VideoSetupAction::MediaDataReceived {
             timestamp: 99,
-            byte_len: 4,
+            payload: vec![0xde, 0xad, 0xbe, 0xef],
         }
     );
     let VideoSetupAction::SendMedia(ack) = &actions[1] else {
