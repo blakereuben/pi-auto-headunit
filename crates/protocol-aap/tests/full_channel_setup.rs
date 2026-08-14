@@ -221,6 +221,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
         video: Some(VideoCapability {
             resolution: VideoCodecResolution::Video800x480,
             frame_rate: VideoFrameRate::Fps30,
+            ui_config: None,
         }),
         touch: Some(TouchCapability {
             width: 800,

@@ -77,8 +77,8 @@ pub use service_discovery::{
 pub use service_discovery_response::{
     AudioCapability, AudioStreamType, BluetoothCapability, HeadUnitInfo, MicrophoneCapability,
     PingConfiguration, SensorCapability, ServiceCapabilities, ServiceDiscoveryResponseError,
-    TouchCapability, TouchScreenType, VideoCapability, VideoCodecResolution, VideoFrameRate,
-    encode_service_discovery_response,
+    TouchCapability, TouchScreenType, UiConfig, VideoCapability, VideoCodecResolution,
+    VideoFrameRate, encode_service_discovery_response,
 };
 pub use tls::{TlsClient, TlsProgress};
 pub use video_setup::{

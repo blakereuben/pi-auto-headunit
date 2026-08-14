@@ -75,10 +75,40 @@ impl VideoFrameRate {
 /// addition to [`VideoCapability`], not a redesign.
 const MEDIA_CODEC_VIDEO_H264_BP: i32 = 3;
 
+/// `aap_protobuf.service.media.shared.message.Insets` — four `uint32`
+/// pixel-offset fields (`docs/protocol/aasdk-adoption.md`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Insets {
+    pub top: u32,
+    pub bottom: u32,
+    pub left: u32,
+    pub right: u32,
+}
+
+/// `aap_protobuf.service.media.shared.message.UiConfig` — `VideoConfiguration`
+/// field 11 (`docs/protocol/aasdk-adoption.md`). `ui_theme` (`UiConfig`'s
+/// fourth field) is left unmodeled rather than filled with an unresearched
+/// value. Populating this at all, and specifically with all-zero insets
+/// when no custom display geometry is configured, is derived from `f-io/LIVI`
+/// (`docs/protocol/livi-adoption.md`, "Adopted scope" item 6): LIVI computes
+/// non-zero `margins`/`content_insets` only when its own configured display
+/// size diverges in aspect ratio from the negotiated video tier, and always
+/// sets `stable_content_insets` equal to `content_insets`. This project
+/// advertises a single fixed 800x480 tier with no display-specific
+/// customization implemented yet, so LIVI's own default (all-zero) case
+/// applies directly — not a guess at an unresearched value.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UiConfig {
+    pub margins: Insets,
+    pub content_insets: Insets,
+    pub stable_content_insets: Insets,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VideoCapability {
     pub resolution: VideoCodecResolution,
     pub frame_rate: VideoFrameRate,
+    pub ui_config: Option<UiConfig>,
 }
 
 /// `aap_protobuf.service.inputsource.message.TouchScreenType`.
@@ -395,11 +425,43 @@ fn encode_media_sink_service(capability: VideoCapability) -> Vec<u8> {
     );
     // VideoConfiguration.video_codec_type (field 10, optional enum).
     protobuf::write_int32_field(&mut video_configuration, 10, MEDIA_CODEC_VIDEO_H264_BP);
+    if let Some(ui_config) = capability.ui_config {
+        let ui_config_bytes = encode_ui_config(ui_config);
+        // VideoConfiguration.ui_config (field 11, optional UiConfig).
+        protobuf::write_length_delimited_field(&mut video_configuration, 11, &ui_config_bytes);
+    }
 
     let mut media_sink_service = Vec::new();
     // MediaSinkService.video_configs (field 4, repeated VideoConfiguration).
     protobuf::write_length_delimited_field(&mut media_sink_service, 4, &video_configuration);
     media_sink_service
+}
+
+fn encode_insets(insets: Insets) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Insets.top (field 1, optional uint32).
+    protobuf::write_uint32_field(&mut out, 1, insets.top);
+    // Insets.bottom (field 2, optional uint32).
+    protobuf::write_uint32_field(&mut out, 2, insets.bottom);
+    // Insets.left (field 3, optional uint32).
+    protobuf::write_uint32_field(&mut out, 3, insets.left);
+    // Insets.right (field 4, optional uint32).
+    protobuf::write_uint32_field(&mut out, 4, insets.right);
+    out
+}
+
+fn encode_ui_config(ui_config: UiConfig) -> Vec<u8> {
+    let mut out = Vec::new();
+    let margins_bytes = encode_insets(ui_config.margins);
+    // UiConfig.margins (field 1, optional Insets).
+    protobuf::write_length_delimited_field(&mut out, 1, &margins_bytes);
+    let content_insets_bytes = encode_insets(ui_config.content_insets);
+    // UiConfig.content_insets (field 2, optional Insets).
+    protobuf::write_length_delimited_field(&mut out, 2, &content_insets_bytes);
+    let stable_content_insets_bytes = encode_insets(ui_config.stable_content_insets);
+    // UiConfig.stable_content_insets (field 3, optional Insets).
+    protobuf::write_length_delimited_field(&mut out, 3, &stable_content_insets_bytes);
+    out
 }
 
 fn encode_audio_configuration(
@@ -533,6 +595,7 @@ mod tests {
             video: Some(VideoCapability {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
+                ui_config: None,
             }),
             touch: None,
             media_audio: None,
@@ -559,6 +622,40 @@ mod tests {
                 0x50, 0x03, // VideoConfiguration.video_codec_type = 3 (H264 BP)
             ]
         );
+    }
+
+    #[test]
+    fn encodes_insets_with_exact_bytes() {
+        let insets = Insets {
+            top: 1,
+            bottom: 2,
+            left: 3,
+            right: 4,
+        };
+        assert_eq!(
+            encode_insets(insets),
+            vec![
+                0x08, 0x01, // top = 1
+                0x10, 0x02, // bottom = 2
+                0x18, 0x03, // left = 3
+                0x20, 0x04, // right = 4
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_ui_config_with_all_zero_insets() {
+        let zero_insets_bytes = [0x08, 0x00, 0x10, 0x00, 0x18, 0x00, 0x20, 0x00];
+        let expected: Vec<u8> = [
+            &[0x0a, 0x08][..],      // margins (field 1), length 8
+            &zero_insets_bytes[..], // Insets.{top,bottom,left,right} = 0
+            &[0x12, 0x08][..],      // content_insets (field 2), length 8
+            &zero_insets_bytes[..],
+            &[0x1a, 0x08][..], // stable_content_insets (field 3), length 8
+            &zero_insets_bytes[..],
+        ]
+        .concat();
+        assert_eq!(encode_ui_config(UiConfig::default()), expected);
     }
 
     #[test]
@@ -663,6 +760,7 @@ mod tests {
             video: Some(VideoCapability {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
+                ui_config: None,
             }),
             touch: Some(TouchCapability {
                 width: 800,
@@ -886,6 +984,7 @@ mod tests {
             video: Some(VideoCapability {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
+                ui_config: None,
             }),
             touch: Some(TouchCapability {
                 width: 800,

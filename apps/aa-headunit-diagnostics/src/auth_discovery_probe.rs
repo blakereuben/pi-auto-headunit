@@ -335,13 +335,14 @@ use protocol_aap::{
     PingConfiguration, ProtocolLimits, SensorCapability, SensorMessage, SensorMessageId,
     SensorType, ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue,
     ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress, TouchCapability,
-    TouchScreenType, VideoCapability, VideoCodecResolution, VideoFrameRate, VideoSetupAction,
-    VideoSetupEvent, VideoSetupState, VideoSetupStateMachine, decode_audio_focus_request,
-    decode_byebye_request, decode_frame, decode_key_binding_request, decode_nav_focus_request,
-    decode_ping_response, decode_sensor_request, encode_audio_focus_notification,
-    encode_byebye_response, encode_driving_status_unrestricted_batch, encode_frame,
-    encode_key_binding_response, encode_nav_focus_notification, encode_night_mode_batch,
-    encode_ping_request, encode_sensor_response, encode_service_discovery_response,
+    TouchScreenType, UiConfig, VideoCapability, VideoCodecResolution, VideoFrameRate,
+    VideoSetupAction, VideoSetupEvent, VideoSetupState, VideoSetupStateMachine,
+    decode_audio_focus_request, decode_byebye_request, decode_frame, decode_key_binding_request,
+    decode_nav_focus_request, decode_ping_response, decode_sensor_request,
+    encode_audio_focus_notification, encode_byebye_response,
+    encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
+    encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
+    encode_sensor_response, encode_service_discovery_response,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::{HashMap, VecDeque};
@@ -1034,6 +1035,10 @@ fn build_service_capabilities() -> ServiceCapabilities {
         video: Some(VideoCapability {
             resolution: VideoCodecResolution::Video800x480,
             frame_rate: VideoFrameRate::Fps30,
+            // All-zero: matches LIVI's own default when no custom display
+            // geometry is configured (see UiConfig's doc comment,
+            // `service_discovery_response.rs`).
+            ui_config: Some(UiConfig::default()),
         }),
         touch: Some(TouchCapability {
             width: REFERENCE_DISPLAY_WIDTH,

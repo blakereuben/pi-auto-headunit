@@ -32,6 +32,19 @@ pub struct LibUsbAoaBackend {
 pub struct LibUsbBulkTransport {
     handle: DeviceHandle<Context>,
     info: BulkTransportInfo,
+    /// Monotonically increasing per-transport counter, incremented once per
+    /// `write_all` call. Printed alongside each write's timing/outcome
+    /// below — diagnostic instrumentation added for the still-unresolved
+    /// USB bulk-OUT write timeout (`docs/protocol/error-2-investigation.md`,
+    /// "Ping cadence"/"LIVI ping-model" sections). This crate has exactly
+    /// one `SessionTransport` consumer today (`aa-headunit-diagnostics`);
+    /// `write_all`/`read` are only ever called from that single-threaded
+    /// probe's own receive loop, one bulk transfer at a time — there is no
+    /// concurrent/overlapping write in this crate's own code. If writes are
+    /// nonetheless overlapping or blocked, the cause is below this layer
+    /// (kernel USB stack, libusb's own internal state, or the phone's own
+    /// USB peer), not a concurrency bug in this Rust code.
+    write_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +164,11 @@ impl LibUsbAoaBackend {
         device: &UsbDeviceId,
     ) -> Result<LibUsbBulkTransport, AoaError> {
         let (handle, info) = self.open_claimed_bulk_transport(device)?;
-        Ok(LibUsbBulkTransport { handle, info })
+        Ok(LibUsbBulkTransport {
+            handle,
+            info,
+            write_id: 0,
+        })
     }
 }
 
@@ -162,28 +179,80 @@ impl LibUsbBulkTransport {
     }
 
     pub fn write_all(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), AoaError> {
+        self.write_id += 1;
+        let write_id = self.write_id;
+        let total_len = bytes.len();
+        let leading_byte = bytes.first().copied();
+        let start = Instant::now();
+        println!(
+            "usb_write_start write_id={write_id} bytes={total_len} \
+             channel_id={leading_byte:?} timeout_ms={}",
+            timeout.as_millis()
+        );
         let mut offset = 0;
         while offset < bytes.len() {
-            let written = self
-                .handle
-                .write_bulk(self.info.bulk_out_endpoint, &bytes[offset..], timeout)
-                .map_err(map_usb_error)?;
+            let chunk_start = Instant::now();
+            let written =
+                match self
+                    .handle
+                    .write_bulk(self.info.bulk_out_endpoint, &bytes[offset..], timeout)
+                {
+                    Ok(written) => written,
+                    Err(error) => {
+                        println!(
+                            "usb_write_error write_id={write_id} offset={offset} \
+                         elapsed_ms={} error={error}",
+                            start.elapsed().as_millis()
+                        );
+                        return Err(map_usb_error(error));
+                    }
+                };
             if written == 0 {
+                println!(
+                    "usb_write_error write_id={write_id} offset={offset} \
+                     elapsed_ms={} error=zero_bytes_written",
+                    start.elapsed().as_millis()
+                );
                 return Err(AoaError::Usb("bulk transfer wrote zero bytes".into()));
             }
+            println!(
+                "usb_write_chunk write_id={write_id} offset={offset} written={written} \
+                 chunk_elapsed_ms={}",
+                chunk_start.elapsed().as_millis()
+            );
             offset += written;
         }
+        println!(
+            "usb_write_complete write_id={write_id} bytes={total_len} \
+             elapsed_ms={}",
+            start.elapsed().as_millis()
+        );
         Ok(())
     }
 
     pub fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<usize, AoaError> {
+        let start = Instant::now();
         match self
             .handle
             .read_bulk(self.info.bulk_in_endpoint, buffer, timeout)
         {
-            Ok(size) => Ok(size),
+            Ok(size) => {
+                if size > 0 {
+                    println!(
+                        "usb_read_complete bytes={size} elapsed_ms={}",
+                        start.elapsed().as_millis()
+                    );
+                }
+                Ok(size)
+            }
             Err(rusb::Error::Timeout) => Ok(0),
-            Err(error) => Err(map_usb_error(error)),
+            Err(error) => {
+                println!(
+                    "usb_read_error elapsed_ms={} error={error}",
+                    start.elapsed().as_millis()
+                );
+                Err(map_usb_error(error))
+            }
         }
     }
 }

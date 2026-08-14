@@ -104,7 +104,7 @@ Field numbers, labels, and types below are read directly from the same pinned AA
 
 The first five nested per-kind messages were selected because they are the only ones with a corresponding `ServiceKind` in `crates/protocol-aap/src/service_catalogue.rs` today (`Sensors`, `Video`/`MediaAudio`/`SpeechAudio`/`SystemAudio`, `Input`, `Microphone`, `Bluetooth`). The remaining eight — `radio_service`, `navigation_status_service`, `media_playback_service`, `phone_status_service`, `media_browser_service`, `vendor_extension_service`, `generic_notification_service`, `wifi_projection_service` — have no corresponding `ServiceKind` yet; they are mapped below purely as a provenance record, ahead of any catalogue or encoder work that would consume them. None of these proto files carry a per-file licence/copyright header at the pinned revision — the same posture already recorded above for `ServiceDiscoveryRequest.proto` and the other already-adopted proto files in this document, which rely on the repository-wide GPL-3.0-or-later notices found in the adopted `.hpp`/`.cpp` files rather than a per-proto notice.
 
-**Not yet mapped**: `UiConfig` (referenced by `VideoConfiguration`, itself referencing `UiTheme` and `Insets`), deliberately left unmapped as the next recursion boundary — the same one-hop-of-context policy already applied elsewhere in this section (e.g. mapping `SensorType` because it was `Sensor`'s sole field, or `PingConfiguration`/`WirelessTcpConfiguration` below because they are `ConnectionConfiguration`'s only two fields, without chasing what those in turn reference). These must each be mapped and recorded here before any encoder reads or writes them.
+**Not yet mapped**: `UiTheme` (referenced by `UiConfig`'s fourth field), deliberately left unmapped as the next recursion boundary — the same one-hop-of-context policy already applied elsewhere in this section (e.g. mapping `SensorType` because it was `Sensor`'s sole field, or `PingConfiguration`/`WirelessTcpConfiguration` below because they are `ConnectionConfiguration`'s only two fields, without chasing what those in turn reference). `UiConfig` and its own `Insets` field type are now mapped below. This must be mapped and recorded here before any encoder reads or writes it.
 
 ### `Service` (`aap_protobuf.service.Service`, proto2)
 
@@ -341,7 +341,7 @@ Every leaf type referenced as "not yet mapped" above is mapped here, read from i
 | 8 | `pixel_aspect_ratio_e4` | optional | `uint32` |
 | 9 | `real_density` | optional | `uint32` |
 | 10 | `video_codec_type` | optional | `shared.message.MediaCodecType` enum (mapped above) |
-| 11 | `ui_config` | optional | `shared.message.UiConfig` (not yet mapped) |
+| 11 | `ui_config` | optional | `shared.message.UiConfig` (mapped below) |
 
 `VideoCodecResolutionType` (`aap_protobuf.service.media.sink.message.VideoCodecResolutionType`, enum, `service/media/sink/message/VideoCodecResolutionType.proto`):
 
@@ -363,6 +363,24 @@ Every leaf type referenced as "not yet mapped" above is mapped here, read from i
 |---|---|
 | 1 | `VIDEO_FPS_60` |
 | 2 | `VIDEO_FPS_30` |
+
+`UiConfig` (`aap_protobuf.service.media.shared.message.UiConfig`, proto2, `service/media/shared/message/UiConfig.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `margins` | optional | `shared.message.Insets` (mapped below) |
+| 2 | `content_insets` | optional | `shared.message.Insets` (mapped below) |
+| 3 | `stable_content_insets` | optional | `shared.message.Insets` (mapped below) |
+| 4 | `ui_theme` | optional | `shared.message.UiTheme` (not yet mapped — next recursion boundary, same one-hop policy as elsewhere in this section) |
+
+`Insets` (`aap_protobuf.service.media.shared.message.Insets`, proto2, `service/media/shared/message/Insets.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `top` | optional | `uint32` |
+| 2 | `bottom` | optional | `uint32` |
+| 3 | `left` | optional | `uint32` |
+| 4 | `right` | optional | `uint32` |
 
 `DisplayType` (`aap_protobuf.service.media.sink.message.DisplayType`, enum, `service/media/sink/message/DisplayType.proto`):
 
@@ -569,7 +587,7 @@ Note the package deviation: `ItuRegion.proto` declares `package aap_protobuf.ser
 
 Every field in this section is `proto2`, and none of the five files carries a per-file licence/copyright header, consistent with every other proto file cited in this document.
 
-With this section, all three of `ServiceDiscoveryResponse`'s previously "not yet mapped" fields (`driver_position`, `connection_configuration`, `headunit_info`) are now mapped; `UiConfig` (and its own further references `UiTheme`/`Insets`) remains the only open leaf in the "not yet mapped" list above.
+With this section, all three of `ServiceDiscoveryResponse`'s previously "not yet mapped" fields (`driver_position`, `connection_configuration`, `headunit_info`) are now mapped, and `UiConfig`/`Insets` (referenced by `VideoConfiguration`) are now mapped above as well; `UiTheme` (`UiConfig`'s own further reference) remains the only open leaf in the "not yet mapped" list above.
 
 ### Contrast against OpenAuto's older schema
 
