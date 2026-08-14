@@ -1346,20 +1346,41 @@ fn build_service_capabilities() -> ServiceCapabilities {
         // offered — see `docs/protocol/error-2-investigation.md`, "LIVI
         // known-good capture" — but this probe's own render pipeline only
         // decodes H.264 so far (see `start_video_render_pipeline`).
+        //
+        // Resolution tier: `VideoCodecResolution::Video1280x720`, not the
+        // real Pi 5 reference display's actual 800x480
+        // (`REFERENCE_DISPLAY_WIDTH`/`REFERENCE_DISPLAY_HEIGHT`, still used
+        // unchanged for `TouchCapability` below). This is a deliberate,
+        // single-variable, reversible real-hardware experiment — LIVI
+        // advertised 1280x720, not 800x480, in the same known-good capture
+        // that first surfaced H.265 (`docs/protocol/error-2-investigation.md`,
+        // "H.265 advertisement implemented and tested"): H.265 alone at
+        // 800x480 didn't change the phone's codec choice, so resolution
+        // tier is now the variable under test, isolated from touch/display
+        // capability, which stays truthful to the real target hardware.
         video: Some(vec![
             VideoCapability {
-                resolution: VideoCodecResolution::Video800x480,
+                resolution: VideoCodecResolution::Video1280x720,
                 frame_rate: VideoFrameRate::Fps30,
                 codec: VideoCodecType::H264,
+                // 10000 = 1:1 (square-pixel) ratio, matching LIVI's own
+                // observed value (`PAR e4=10000`) — the only
+                // `VideoConfiguration` field difference left after both
+                // codec and resolution-tier advertisement were tried and
+                // refuted as sufficient alone. See
+                // `docs/protocol/error-2-investigation.md`, "1280×720
+                // resolution tested".
+                pixel_aspect_ratio_e4: Some(10000),
                 // All-zero: matches LIVI's own default when no custom
                 // display geometry is configured (see UiConfig's doc
                 // comment, `service_discovery_response.rs`).
                 ui_config: Some(UiConfig::default()),
             },
             VideoCapability {
-                resolution: VideoCodecResolution::Video800x480,
+                resolution: VideoCodecResolution::Video1280x720,
                 frame_rate: VideoFrameRate::Fps30,
                 codec: VideoCodecType::Hevc,
+                pixel_aspect_ratio_e4: Some(10000),
                 ui_config: Some(UiConfig::default()),
             },
         ]),
@@ -1469,6 +1490,10 @@ fn handle_video_channel_message<T: SessionTransport>(
                 .map_err(|error| CliError::Protocol(error.to_string()))?;
             for action in actions {
                 match action {
+                    VideoSetupAction::SetupRequested { codec_type } => {
+                        println!("probe_state=video_setup_requested");
+                        println!("video_setup_codec_type={codec_type}");
+                    }
                     VideoSetupAction::SendMedia(response) => {
                         let payload = response
                             .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
@@ -1607,8 +1632,12 @@ fn start_video_render_pipeline(video_render: &mut VideoRenderState) {
         id: "gstreamer:avdec_h264".into(),
         codec: DecoderVideoCodec::H264,
         kind: DecoderKind::Software,
-        maximum_width: 800,
-        maximum_height: 480,
+        // Descriptive only — the pipeline's own caps carry no explicit
+        // width/height (see `render.rs`'s module doc comment), so these
+        // fields aren't functionally enforced. Matches the resolution
+        // actually advertised in `build_service_capabilities`.
+        maximum_width: 1280,
+        maximum_height: 720,
         maximum_frames_per_second: 30,
     };
     match backend.build_video_render_pipeline(&capability, RenderSink::Wayland) {

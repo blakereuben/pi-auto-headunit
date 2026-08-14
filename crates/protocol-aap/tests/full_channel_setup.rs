@@ -222,6 +222,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
             resolution: VideoCodecResolution::Video800x480,
             frame_rate: VideoFrameRate::Fps30,
             codec: VideoCodecType::H264,
+            pixel_aspect_ratio_e4: None,
             ui_config: None,
         }]),
         touch: Some(TouchCapability {
@@ -319,8 +320,11 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
     let actions = video_setup
         .advance(VideoSetupEvent::InboundMedia(&message.payload))
         .expect("advance setup");
-    assert_eq!(actions.len(), 2);
-    let VideoSetupAction::SendMedia(config) = &actions[0] else {
+    assert_eq!(actions.len(), 3);
+    let VideoSetupAction::SetupRequested { .. } = &actions[0] else {
+        panic!("expected SetupRequested action, got {actions:?}");
+    };
+    let VideoSetupAction::SendMedia(config) = &actions[1] else {
         panic!("expected SendMedia action, got {actions:?}");
     };
     assert_eq!(config.id, MediaMessageId::Config);
@@ -356,7 +360,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
     );
 
     // --- Video channel: unsolicited VideoFocusNotification, sent right after Config ---
-    let VideoSetupAction::SendMedia(video_focus) = &actions[1] else {
+    let VideoSetupAction::SendMedia(video_focus) = &actions[2] else {
         panic!("expected SendMedia action, got {actions:?}");
     };
     assert_eq!(video_focus.id, MediaMessageId::VideoFocusNotification);

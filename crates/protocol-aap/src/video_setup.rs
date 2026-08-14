@@ -110,6 +110,17 @@ pub enum VideoSetupEvent<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VideoSetupAction {
+    /// `Setup` was received and accepted — reports the codec the phone
+    /// actually requested (`MEDIA_CODEC_VIDEO_H264_BP` or
+    /// `MEDIA_CODEC_VIDEO_H265`), so callers can log which codec/resolution
+    /// combination the phone picked even on a trial that stalls before
+    /// `Start` — the only other point this project observes the choice.
+    /// Always the first action in `handle_setup`'s return, immediately
+    /// followed by the `Config`/`VideoFocusNotification` `SendMedia`
+    /// actions.
+    SetupRequested {
+        codec_type: i32,
+    },
     SendMedia(MediaMessage),
     /// `Start` was received and accepted — the channel is now `Ready` and
     /// stays `Ready`; further `InboundMedia` events keep flowing to
@@ -341,6 +352,7 @@ impl VideoSetupStateMachine {
         let advertised_index = offered_index as i32;
         protobuf::write_int32_field(&mut body, 3, advertised_index);
         Ok(vec![
+            VideoSetupAction::SetupRequested { codec_type },
             VideoSetupAction::SendMedia(MediaMessage {
                 id: MediaMessageId::Config,
                 body,
@@ -530,13 +542,19 @@ mod tests {
             )))
             .expect("setup");
         assert_eq!(machine.state(), VideoSetupState::AwaitingStart);
-        assert_eq!(actions.len(), 2);
-        let VideoSetupAction::SendMedia(config) = &actions[0] else {
+        assert_eq!(actions.len(), 3);
+        assert_eq!(
+            actions[0],
+            VideoSetupAction::SetupRequested {
+                codec_type: MEDIA_CODEC_VIDEO_H264_BP,
+            }
+        );
+        let VideoSetupAction::SendMedia(config) = &actions[1] else {
             panic!("expected SendMedia");
         };
         assert_eq!(config.id, MediaMessageId::Config);
         assert_eq!(config.body, vec![0x08, 0x02, 0x10, 0x01, 0x18, 0x00]);
-        let VideoSetupAction::SendMedia(video_focus) = &actions[1] else {
+        let VideoSetupAction::SendMedia(video_focus) = &actions[2] else {
             panic!("expected SendMedia");
         };
         assert_eq!(video_focus.id, MediaMessageId::VideoFocusNotification);
@@ -607,7 +625,13 @@ mod tests {
                 MEDIA_CODEC_VIDEO_H265,
             )))
             .expect("setup");
-        let VideoSetupAction::SendMedia(config) = &actions[0] else {
+        assert_eq!(
+            actions[0],
+            VideoSetupAction::SetupRequested {
+                codec_type: MEDIA_CODEC_VIDEO_H265,
+            }
+        );
+        let VideoSetupAction::SendMedia(config) = &actions[1] else {
             panic!("expected SendMedia");
         };
         assert_eq!(config.id, MediaMessageId::Config);
