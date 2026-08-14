@@ -348,7 +348,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use credential_store::CredentialMaterial;
-use media_api::{DecoderCapability, DecoderKind, VideoCodec};
+use media_api::{DecoderCapability, DecoderKind, VideoCodec as DecoderVideoCodec};
 use media_gstreamer::{GstreamerBackend, RenderSink, VideoRenderPipeline};
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
@@ -363,11 +363,11 @@ use protocol_aap::{
     PingConfiguration, ProtocolLimits, SensorCapability, SensorMessage, SensorMessageId,
     SensorType, ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue,
     ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress, TouchCapability,
-    TouchScreenType, UiConfig, VideoCapability, VideoCodecResolution, VideoFocusMode,
-    VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupState, VideoSetupStateMachine,
-    decode_audio_focus_request, decode_byebye_request, decode_frame, decode_key_binding_request,
-    decode_nav_focus_request, decode_ping_response, decode_sensor_request,
-    encode_audio_focus_notification, encode_byebye_response,
+    TouchScreenType, UiConfig, VideoCapability, VideoCodecResolution, VideoCodecType,
+    VideoFocusMode, VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupState,
+    VideoSetupStateMachine, decode_audio_focus_request, decode_byebye_request, decode_frame,
+    decode_key_binding_request, decode_nav_focus_request, decode_ping_response,
+    decode_sensor_request, encode_audio_focus_notification, encode_byebye_response,
     encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
     encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
     encode_sensor_response, encode_service_discovery_response, encode_video_focus_notification,
@@ -575,8 +575,10 @@ enum VideoChannel {
 /// (no compositor reachable, decode error, etc.) must never affect
 /// protocol-level correctness (acking keeps happening regardless). Built
 /// lazily on `VideoSetupAction::Ready`, since only then is the negotiated
-/// configuration known (in practice always the single advertised
-/// 800x480@30 H.264 configuration this probe ever offers).
+/// configuration known — this probe advertises both an 800x480@30 H.264
+/// and an 800x480@30 H.265 configuration (`build_service_capabilities`),
+/// but only starts this pipeline when H.264 is the one actually selected;
+/// see `handle_video_channel_message`'s `Ready` arm.
 enum VideoRenderState {
     /// `GstreamerBackend::new()` itself failed (`GStreamer` unusable on this
     /// host at all) — never attempted again this run. The error is
@@ -1335,14 +1337,32 @@ fn build_service_catalogue() -> Result<ServiceCatalogue, CliError> {
 /// concern (unlike `ServiceDiscoveryRequestSummary`).
 fn build_service_capabilities() -> ServiceCapabilities {
     ServiceCapabilities {
-        video: Some(VideoCapability {
-            resolution: VideoCodecResolution::Video800x480,
-            frame_rate: VideoFrameRate::Fps30,
-            // All-zero: matches LIVI's own default when no custom display
-            // geometry is configured (see UiConfig's doc comment,
-            // `service_discovery_response.rs`).
-            ui_config: Some(UiConfig::default()),
-        }),
+        // Both entries share the same resolution/frame-rate tier and
+        // differ only in codec — position in this list is load-bearing:
+        // `video_setup.rs`'s `ADVERTISED_H264_CONFIGURATION_INDEX`/
+        // `ADVERTISED_H265_CONFIGURATION_INDEX` assume H.264 is index 0
+        // and H.265 is index 1. H.265 is advertised on real-hardware
+        // evidence that the same phone actively selects it over H.264 when
+        // offered — see `docs/protocol/error-2-investigation.md`, "LIVI
+        // known-good capture" — but this probe's own render pipeline only
+        // decodes H.264 so far (see `start_video_render_pipeline`).
+        video: Some(vec![
+            VideoCapability {
+                resolution: VideoCodecResolution::Video800x480,
+                frame_rate: VideoFrameRate::Fps30,
+                codec: VideoCodecType::H264,
+                // All-zero: matches LIVI's own default when no custom
+                // display geometry is configured (see UiConfig's doc
+                // comment, `service_discovery_response.rs`).
+                ui_config: Some(UiConfig::default()),
+            },
+            VideoCapability {
+                resolution: VideoCodecResolution::Video800x480,
+                frame_rate: VideoFrameRate::Fps30,
+                codec: VideoCodecType::Hevc,
+                ui_config: Some(UiConfig::default()),
+            },
+        ]),
         touch: Some(TouchCapability {
             width: REFERENCE_DISPLAY_WIDTH,
             height: REFERENCE_DISPLAY_HEIGHT,
@@ -1478,10 +1498,7 @@ fn handle_video_channel_message<T: SessionTransport>(
                         session_id,
                         configuration_index,
                     } => {
-                        println!("probe_state=video_channel_start_received");
-                        println!("video_channel_session_id={session_id}");
-                        println!("video_channel_configuration_index={configuration_index}");
-                        start_video_render_pipeline(video_render);
+                        handle_video_start_received(video_render, session_id, configuration_index);
                     }
                     VideoSetupAction::MediaDataReceived { timestamp, payload } => {
                         println!("probe_state=video_media_data_received");
@@ -1546,13 +1563,36 @@ fn new_video_render_state() -> VideoRenderState {
     }
 }
 
+/// Handles `VideoSetupAction::Ready` (video `Start` accepted). Index 0 is
+/// H.264 (`ADVERTISED_H264_CONFIGURATION_INDEX`, `video_setup.rs`) — the
+/// only codec this probe's render pipeline can actually decode so far.
+/// Index 1 (H.265) is accepted at the wire level but has no decode path
+/// yet; starting the existing H.264-typed pipeline against H.265 bytes
+/// would be a caps mismatch, not a real sink.
+fn handle_video_start_received(
+    video_render: &mut VideoRenderState,
+    session_id: i32,
+    configuration_index: u32,
+) {
+    println!("probe_state=video_channel_start_received");
+    println!("video_channel_session_id={session_id}");
+    println!("video_channel_configuration_index={configuration_index}");
+    if configuration_index == 0 {
+        start_video_render_pipeline(video_render);
+    } else {
+        println!("probe_state=video_render_pipeline_not_started");
+        println!("video_render_reason=h265_decode_not_yet_implemented");
+    }
+}
+
 /// Lazily builds and starts the real decode/render pipeline once (on the
-/// first `Start`, i.e. while `video_render` is still `NotStarted`) for the
-/// single advertised 800x480@30 H.264 configuration — this probe never
-/// advertises any other. Construction/start failure (most commonly: no
-/// reachable Wayland compositor) demotes `video_render` to `Failed` and is
-/// logged; it never returns an error or aborts the probe, since rendering
-/// is independent of protocol correctness (see `VideoRenderState`'s doc
+/// first `Start` that selects the H.264 configuration — see the caller in
+/// `handle_video_channel_message`, since `VideoSetupState::Ready`'s H.265
+/// path never calls this) for the advertised 800x480@30 H.264
+/// configuration. Construction/start failure (most commonly: no reachable
+/// Wayland compositor) demotes `video_render` to `Failed` and is logged; it
+/// never returns an error or aborts the probe, since rendering is
+/// independent of protocol correctness (see `VideoRenderState`'s doc
 /// comment).
 fn start_video_render_pipeline(video_render: &mut VideoRenderState) {
     if !matches!(video_render, VideoRenderState::NotStarted(_)) {
@@ -1565,7 +1605,7 @@ fn start_video_render_pipeline(video_render: &mut VideoRenderState) {
     };
     let capability = DecoderCapability {
         id: "gstreamer:avdec_h264".into(),
-        codec: VideoCodec::H264,
+        codec: DecoderVideoCodec::H264,
         kind: DecoderKind::Software,
         maximum_width: 800,
         maximum_height: 480,

@@ -32,10 +32,18 @@ use crate::protobuf::{self, ProtobufDecodeError};
 // Copyright (C) 2024-2026 Open Android Auto contributors (LIVI)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-/// `aap_protobuf.service.media.shared.message.MediaCodecType.MEDIA_CODEC_VIDEO_H264_BP`
-/// — the only codec `ServiceDiscoveryResponse` ever advertised for this
-/// increment, so it's the only one `Setup` may legitimately request.
+/// `aap_protobuf.service.media.shared.message.MediaCodecType.MEDIA_CODEC_VIDEO_H264_BP`.
+/// Matches `ADVERTISED_H264_CONFIGURATION_INDEX`'s position in
+/// `ServiceDiscoveryResponse.video_configs` — see
+/// `crates/protocol-aap/src/service_discovery_response.rs`'s
+/// `VideoCodecType`.
 const MEDIA_CODEC_VIDEO_H264_BP: i32 = 3;
+/// `aap_protobuf.service.media.shared.message.MediaCodecType.MEDIA_CODEC_VIDEO_H265`.
+/// Advertised alongside H.264 following real-hardware evidence that the
+/// same phone actively selects it when offered — see
+/// `docs/protocol/error-2-investigation.md`, "LIVI known-good capture".
+/// Matches `ADVERTISED_H265_CONFIGURATION_INDEX`'s position.
+const MEDIA_CODEC_VIDEO_H265: i32 = 7;
 
 /// `Config`'s nested `Status` enum, `STATUS_READY = 2`. `STATUS_WAIT` (1)
 /// is never sent this increment — there is no reason yet to ask the phone
@@ -47,9 +55,15 @@ const CONFIG_STATUS_READY: i32 = 2;
 /// increment; this only shapes what capacity is advertised.
 const DEFAULT_VIDEO_MAX_UNACKED: i32 = 1;
 
-/// The only `VideoConfiguration` entry `ServiceDiscoveryResponse` ever
-/// advertised, so it's the only configuration index `Start` may reference.
-const ADVERTISED_CONFIGURATION_INDEX: u32 = 0;
+/// Position of the H.264 `VideoConfiguration` entry in
+/// `ServiceDiscoveryResponse.video_configs` — this project's own advertised
+/// list order, not a protocol constant. Must stay in sync with how
+/// `build_service_capabilities()` (`auth_discovery_probe.rs`) orders its
+/// `Vec<VideoCapability>`.
+const ADVERTISED_H264_CONFIGURATION_INDEX: u32 = 0;
+/// Position of the H.265 `VideoConfiguration` entry — see
+/// `ADVERTISED_H264_CONFIGURATION_INDEX`'s doc comment.
+const ADVERTISED_H265_CONFIGURATION_INDEX: u32 = 1;
 
 /// `aap_protobuf.service.media.video.message.VideoFocusMode`. Only
 /// `Projected` is ever sent this increment (the head unit proactively
@@ -239,6 +253,11 @@ pub struct VideoSetupStateMachine {
     /// Always `Some` once `state` is `Ready` — the only path into `Ready`
     /// is `handle_start`, which sets both in the same step.
     session_id: Option<i32>,
+    /// The single configuration index `Config` offered back in response to
+    /// `Setup`'s requested codec — set by `handle_setup`, checked by
+    /// `handle_start` so a `Start` can only reference the exact index this
+    /// session was actually offered, not just any globally-known one.
+    offered_configuration_index: Option<u32>,
 }
 
 impl Default for VideoSetupStateMachine {
@@ -253,6 +272,7 @@ impl VideoSetupStateMachine {
         Self {
             state: VideoSetupState::AwaitingSetup,
             session_id: None,
+            offered_configuration_index: None,
         }
     }
 
@@ -298,20 +318,27 @@ impl VideoSetupStateMachine {
             });
         }
         let codec_type = decode_setup(&message.body)?;
-        if codec_type != MEDIA_CODEC_VIDEO_H264_BP {
-            return Err(VideoSetupError::UnsupportedCodec {
-                requested: codec_type,
-            });
-        }
+        let offered_index = match codec_type {
+            MEDIA_CODEC_VIDEO_H264_BP => ADVERTISED_H264_CONFIGURATION_INDEX,
+            MEDIA_CODEC_VIDEO_H265 => ADVERTISED_H265_CONFIGURATION_INDEX,
+            _ => {
+                return Err(VideoSetupError::UnsupportedCodec {
+                    requested: codec_type,
+                });
+            }
+        };
+        self.offered_configuration_index = Some(offered_index);
         self.state = VideoSetupState::AwaitingStart;
         let mut body = Vec::new();
         // Config.status (field 1, required nested Status enum).
         protobuf::write_int32_field(&mut body, 1, CONFIG_STATUS_READY);
         // Config.max_unacked (field 2, optional uint32).
         protobuf::write_int32_field(&mut body, 2, DEFAULT_VIDEO_MAX_UNACKED);
-        // Config.configuration_indices (field 3, repeated uint32, non-packed).
+        // Config.configuration_indices (field 3, repeated uint32, non-packed)
+        // — only the single index matching the requested codec, not every
+        // advertised index.
         #[allow(clippy::cast_possible_wrap)]
-        let advertised_index = ADVERTISED_CONFIGURATION_INDEX as i32;
+        let advertised_index = offered_index as i32;
         protobuf::write_int32_field(&mut body, 3, advertised_index);
         Ok(vec![
             VideoSetupAction::SendMedia(MediaMessage {
@@ -336,7 +363,7 @@ impl VideoSetupStateMachine {
             });
         }
         let (session_id, configuration_index) = decode_start(&message.body)?;
-        if configuration_index != ADVERTISED_CONFIGURATION_INDEX {
+        if Some(configuration_index) != self.offered_configuration_index {
             return Err(VideoSetupError::UnknownConfigurationIndex {
                 requested: configuration_index,
             });
@@ -570,6 +597,53 @@ mod tests {
         };
         assert_eq!(ack.id, MediaMessageId::Ack);
         assert_eq!(ack.body, vec![0x08, 0x07, 0x10, 0x01]);
+    }
+
+    #[test]
+    fn accepts_h265_setup_and_offers_the_h265_configuration_index() {
+        let mut machine = VideoSetupStateMachine::new();
+        let actions = machine
+            .advance(VideoSetupEvent::InboundMedia(&setup_payload(
+                MEDIA_CODEC_VIDEO_H265,
+            )))
+            .expect("setup");
+        let VideoSetupAction::SendMedia(config) = &actions[0] else {
+            panic!("expected SendMedia");
+        };
+        assert_eq!(config.id, MediaMessageId::Config);
+        // status=READY(2), max_unacked=1, configuration_indices=[1] (H.265's
+        // position, not H.264's) — same shape as the H.264 case except the
+        // last byte.
+        assert_eq!(config.body, vec![0x08, 0x02, 0x10, 0x01, 0x18, 0x01]);
+
+        let actions = machine
+            .advance(VideoSetupEvent::InboundMedia(&start_payload(7, 1)))
+            .expect("start");
+        assert_eq!(machine.state(), VideoSetupState::Ready);
+        assert_eq!(
+            actions,
+            vec![VideoSetupAction::Ready {
+                session_id: 7,
+                configuration_index: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_start_at_the_other_codecs_configuration_index() {
+        // A phone that requested H.264 (offered index 0) must not be able
+        // to Start against index 1 (H.265's position) instead — only the
+        // exact index this session was actually offered is valid.
+        let mut machine = VideoSetupStateMachine::new();
+        machine
+            .advance(VideoSetupEvent::InboundMedia(&setup_payload(
+                MEDIA_CODEC_VIDEO_H264_BP,
+            )))
+            .expect("setup");
+        assert_eq!(
+            machine.advance(VideoSetupEvent::InboundMedia(&start_payload(7, 1))),
+            Err(VideoSetupError::UnknownConfigurationIndex { requested: 1 })
+        );
     }
 
     #[test]

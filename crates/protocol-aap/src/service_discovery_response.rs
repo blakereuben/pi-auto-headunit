@@ -68,12 +68,26 @@ impl VideoFrameRate {
     }
 }
 
-/// `aap_protobuf.service.media.shared.message.MediaCodecType.MEDIA_CODEC_VIDEO_H264_BP`
-/// — the only codec this encoder ever advertises. Not caller-configurable
-/// yet; matches the Pi 5 software-H.264 fallback path already selected in
-/// `ARCHITECTURE.md`/M3. Extending to other codecs later is a new field
-/// addition to [`VideoCapability`], not a redesign.
-const MEDIA_CODEC_VIDEO_H264_BP: i32 = 3;
+/// `aap_protobuf.service.media.shared.message.MediaCodecType`, the subset
+/// this project can advertise for video. Real-hardware evidence for
+/// advertising both at once: a known-good reference client (`f-io/LIVI`)
+/// advertises `h264, h265` together and the same real phone actively
+/// selected H.265 over H.264 when given the choice
+/// (`docs/protocol/error-2-investigation.md`, "LIVI known-good capture").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoCodecType {
+    H264,
+    Hevc,
+}
+
+impl VideoCodecType {
+    const fn wire_value(self) -> i32 {
+        match self {
+            Self::H264 => 3, // MEDIA_CODEC_VIDEO_H264_BP
+            Self::Hevc => 7, // MEDIA_CODEC_VIDEO_H265
+        }
+    }
+}
 
 /// `aap_protobuf.service.media.shared.message.Insets` — four `uint32`
 /// pixel-offset fields (`docs/protocol/aasdk-adoption.md`).
@@ -108,6 +122,7 @@ pub struct UiConfig {
 pub struct VideoCapability {
     pub resolution: VideoCodecResolution,
     pub frame_rate: VideoFrameRate,
+    pub codec: VideoCodecType,
     pub ui_config: Option<UiConfig>,
 }
 
@@ -228,7 +243,10 @@ pub struct MicrophoneCapability {
 /// wire-neutral per `ARCHITECTURE.md` §4.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ServiceCapabilities {
-    pub video: Option<VideoCapability>,
+    /// One entry per advertised `VideoConfiguration` (`MediaSinkService.
+    /// video_configs`, a repeated field) — `Start.configuration_index`
+    /// (`video_setup.rs`) refers back into this list by position.
+    pub video: Option<Vec<VideoCapability>>,
     pub touch: Option<TouchCapability>,
     pub media_audio: Option<AudioCapability>,
     pub system_audio: Option<AudioCapability>,
@@ -340,10 +358,11 @@ fn encode_service(
     protobuf::write_int32_field(&mut out, 1, i32::from(channel_id));
     match kind {
         ServiceKind::Video => {
-            let capability = capabilities
+            let capabilities = capabilities
                 .video
+                .as_deref()
                 .ok_or(ServiceDiscoveryResponseError::MissingCapability { channel_id, kind })?;
-            let media_sink_service = encode_media_sink_service(capability);
+            let media_sink_service = encode_media_sink_service(capabilities);
             // Service.media_sink_service (field 3).
             protobuf::write_length_delimited_field(&mut out, 3, &media_sink_service);
         }
@@ -409,31 +428,35 @@ fn encode_service(
     Ok(out)
 }
 
-fn encode_media_sink_service(capability: VideoCapability) -> Vec<u8> {
-    let mut video_configuration = Vec::new();
-    // VideoConfiguration.codec_resolution (field 1, optional enum).
-    protobuf::write_int32_field(
-        &mut video_configuration,
-        1,
-        capability.resolution.wire_value(),
-    );
-    // VideoConfiguration.frame_rate (field 2, optional enum).
-    protobuf::write_int32_field(
-        &mut video_configuration,
-        2,
-        capability.frame_rate.wire_value(),
-    );
-    // VideoConfiguration.video_codec_type (field 10, optional enum).
-    protobuf::write_int32_field(&mut video_configuration, 10, MEDIA_CODEC_VIDEO_H264_BP);
-    if let Some(ui_config) = capability.ui_config {
-        let ui_config_bytes = encode_ui_config(ui_config);
-        // VideoConfiguration.ui_config (field 11, optional UiConfig).
-        protobuf::write_length_delimited_field(&mut video_configuration, 11, &ui_config_bytes);
-    }
-
+fn encode_media_sink_service(capabilities: &[VideoCapability]) -> Vec<u8> {
     let mut media_sink_service = Vec::new();
-    // MediaSinkService.video_configs (field 4, repeated VideoConfiguration).
-    protobuf::write_length_delimited_field(&mut media_sink_service, 4, &video_configuration);
+    for capability in capabilities {
+        let mut video_configuration = Vec::new();
+        // VideoConfiguration.codec_resolution (field 1, optional enum).
+        protobuf::write_int32_field(
+            &mut video_configuration,
+            1,
+            capability.resolution.wire_value(),
+        );
+        // VideoConfiguration.frame_rate (field 2, optional enum).
+        protobuf::write_int32_field(
+            &mut video_configuration,
+            2,
+            capability.frame_rate.wire_value(),
+        );
+        // VideoConfiguration.video_codec_type (field 10, optional enum).
+        protobuf::write_int32_field(&mut video_configuration, 10, capability.codec.wire_value());
+        if let Some(ui_config) = capability.ui_config {
+            let ui_config_bytes = encode_ui_config(ui_config);
+            // VideoConfiguration.ui_config (field 11, optional UiConfig).
+            protobuf::write_length_delimited_field(&mut video_configuration, 11, &ui_config_bytes);
+        }
+        // MediaSinkService.video_configs (field 4, repeated VideoConfiguration) —
+        // one entry per advertised capability, in list order, since
+        // `Start.configuration_index` (`video_setup.rs`) refers back into
+        // this list by position.
+        protobuf::write_length_delimited_field(&mut media_sink_service, 4, &video_configuration);
+    }
     media_sink_service
 }
 
@@ -592,11 +615,12 @@ mod tests {
             availability: ServiceAvailability::Ready,
         }]);
         let capabilities = ServiceCapabilities {
-            video: Some(VideoCapability {
+            video: Some(vec![VideoCapability {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
+                codec: VideoCodecType::H264,
                 ui_config: None,
-            }),
+            }]),
             touch: None,
             media_audio: None,
             system_audio: None,
@@ -757,11 +781,12 @@ mod tests {
             },
         ]);
         let capabilities = ServiceCapabilities {
-            video: Some(VideoCapability {
+            video: Some(vec![VideoCapability {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
+                codec: VideoCodecType::H264,
                 ui_config: None,
-            }),
+            }]),
             touch: Some(TouchCapability {
                 width: 800,
                 height: 480,
@@ -981,11 +1006,12 @@ mod tests {
             .collect();
         let catalogue = catalogue(&candidates);
         let capabilities = ServiceCapabilities {
-            video: Some(VideoCapability {
+            video: Some(vec![VideoCapability {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
+                codec: VideoCodecType::H264,
                 ui_config: None,
-            }),
+            }]),
             touch: Some(TouchCapability {
                 width: 800,
                 height: 480,

@@ -23,8 +23,8 @@ use protocol_aap::{
     HandshakeEvent, HandshakeState, MediaMessage, MediaMessageId, MessageAssembler, MessageType,
     ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue, ServiceKind,
     TlsClient, TouchCapability, TouchScreenType, VideoCapability, VideoCodecResolution,
-    VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupStateMachine, decode_frame,
-    encode_frame, encode_service_discovery_response,
+    VideoCodecType, VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupStateMachine,
+    decode_frame, encode_frame, encode_service_discovery_response,
 };
 use security_openssl::{OpenSslTlsClient, TestServerTls};
 use transport_api::{SessionTransport, fake};
@@ -218,11 +218,12 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
     )
     .expect("catalogue");
     let capabilities = ServiceCapabilities {
-        video: Some(VideoCapability {
+        video: Some(vec![VideoCapability {
             resolution: VideoCodecResolution::Video800x480,
             frame_rate: VideoFrameRate::Fps30,
+            codec: VideoCodecType::H264,
             ui_config: None,
-        }),
+        }]),
         touch: Some(TouchCapability {
             width: 800,
             height: 480,
