@@ -9,13 +9,17 @@ use crate::protobuf;
 // (protobuf/aap_protobuf/service/media/source/message/Ack.proto), at the
 // pinned project revision (9bf6adf933665dee26532201719fac14a047ccf1).
 // `encode_media_ack`'s send-unconditionally-after-every-frame policy is
-// motivated by independently observing that behaviour in a separate,
-// independently implemented, GPL-3.0-or-later Android Auto client
-// (`f-io/LIVI`, `stack/channels/{Video,Audio}Channel.ts`'s `_sendAck()`,
-// not AASDK-derived) — no LIVI code is reproduced, only the wire shape,
-// itself confirmed against this project's own pinned AASDK schema above.
+// derived from a separate, independently implemented, GPL-3.0-or-later
+// Android Auto client (`f-io/LIVI` revision
+// 9000f308eec423c5c56ac0a14491a7c95ce5762d,
+// `src/main/services/projection/driver/aa/stack/channels/{Video,Audio}Channel.ts`,
+// not AASDK-derived), formally adopted per `docs/protocol/livi-adoption.md`
+// ("Adopted scope" item 2). No LIVI code is reproduced, only the wire
+// shape, itself confirmed against this project's own pinned AASDK schema
+// above, and the ack-every-frame behavioural rule.
 // Copyright (C) 2018 f1x.studio (Michal Szwaj)
 // Copyright (C) 2024 CubeOne (Simon Dean)
+// Copyright (C) 2024-2026 Open Android Auto contributors (LIVI)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub const DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE: usize = 1024 * 1024;

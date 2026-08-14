@@ -9,8 +9,17 @@ use crate::service_catalogue::{ServiceCatalogue, ServiceKind};
 // schema at the pinned project revision (9bf6adf933665dee26532201719fac14a047ccf1);
 // field numbers and enum values match the mapping recorded in
 // docs/protocol/aasdk-adoption.md.
+//
+// `PingConfiguration`'s populated values are derived from a separate,
+// independently implemented, GPL-3.0-or-later Android Auto client
+// (`f-io/LIVI` revision 9000f308eec423c5c56ac0a14491a7c95ce5762d,
+// `src/main/services/projection/driver/aa/stack/session/ServiceDiscoveryBuilder.ts`
+// and `Session.ts`, not AASDK-derived), formally adopted per
+// `docs/protocol/livi-adoption.md` ("Adopted scope" items 4-5). No LIVI
+// code is reproduced; only the four numeric field values themselves.
 // Copyright (C) 2018 f1x.studio (Michal Szwaj)
 // Copyright (C) 2024 CubeOne (Simon Dean)
+// Copyright (C) 2024-2026 Open Android Auto contributors (LIVI)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /// `aap_protobuf.service.media.sink.message.VideoCodecResolutionType`.

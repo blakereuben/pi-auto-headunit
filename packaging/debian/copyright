@@ -12,3 +12,55 @@ License: GPL-3+
  .
  On Debian systems, the complete text of the GNU General Public License
  version 3 can be found in /usr/share/common-licenses/GPL-3.
+
+Files:
+ crates/protocol-aap/src/channel_open.rs
+ crates/protocol-aap/src/sensor.rs
+ crates/protocol-aap/src/nav_focus.rs
+ crates/protocol-aap/src/control.rs
+ crates/protocol-aap/src/input_message.rs
+ crates/protocol-aap/src/lib.rs
+ crates/protocol-aap/src/service_discovery.rs
+ crates/protocol-aap/src/ping.rs
+ crates/protocol-aap/src/tls.rs
+ crates/protocol-aap/src/byebye.rs
+ crates/protocol-aap/src/audio_setup.rs
+ crates/protocol-aap/src/assembly.rs
+ crates/protocol-aap/src/audio_focus.rs
+Copyright: 2026 Blake Reuben and contributors
+ 2018 f1x.studio (Michal Szwaj)
+ 2024 CubeOne (Simon Dean)
+License: GPL-3+
+Comment: Behaviour independently reimplemented in Rust, derived from AASDK
+ (opencardev/aasdk, pinned revision 9bf6adf933665dee26532201719fac14a047ccf1,
+ GPL-3.0-or-later). No AASDK source code is reproduced in these files. See
+ docs/protocol/aasdk-adoption.md for exact file-level provenance and scope.
+
+Files:
+ crates/protocol-aap/src/video_setup.rs
+ crates/protocol-aap/src/media_message.rs
+ crates/protocol-aap/src/service_discovery_response.rs
+ apps/aa-headunit-diagnostics/src/auth_discovery_probe.rs
+Copyright: 2026 Blake Reuben and contributors
+ 2018 f1x.studio (Michal Szwaj)
+ 2024 CubeOne (Simon Dean)
+ 2024-2026 Open Android Auto contributors
+License: GPL-3+
+Comment: Behaviour independently reimplemented in Rust, derived from AASDK
+ (see above) and from f-io/LIVI (pinned revision
+ 9000f308eec423c5c56ac0a14491a7c95ce5762d, GPL-3.0-or-later). No AASDK or
+ LIVI source code is reproduced in these files. See
+ docs/protocol/aasdk-adoption.md and docs/protocol/livi-adoption.md for
+ exact file-level provenance and scope.
+
+Files:
+ crates/protocol-aap/src/service_catalogue.rs
+Copyright: 2026 Blake Reuben and contributors
+ 2018 f1x.studio (Michal Szwaj)
+License: GPL-3+
+Comment: Behaviour independently reimplemented in Rust, derived from
+ OpenAuto (f1xpl/openauto, pinned revision
+ aa90412bf93b5a5078495ea85ac9270c6297d369, GPL-3.0-or-later in the reviewed
+ source headers). No OpenAuto source code is reproduced in this file. See
+ docs/protocol/openauto-adoption.md for exact file-level provenance and
+ scope.

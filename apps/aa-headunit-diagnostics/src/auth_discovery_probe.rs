@@ -302,6 +302,24 @@
 //! neutralizing ping entirely. `PING_INTERVAL`/`PING_WATCHDOG_TIMEOUT`
 //! below now implement this model; ping is armed in `handle_message` right
 //! after `send_service_discovery_response` (see `PingState`).
+//!
+//! **Attribution.** This probe's overall session-orchestration shape
+//! (version → TLS → auth → service discovery → channel setup → running)
+//! follows AASDK revision `9bf6adf933665dee26532201719fac14a047ccf1` and
+//! `OpenAuto` revision `aa90412bf93b5a5078495ea85ac9270c6297d369`
+//! (`docs/protocol/aasdk-adoption.md`, `docs/protocol/openauto-adoption.md`).
+//! `evaluate_key_binding_request`'s unconditional-success policy and this
+//! file's ping arm-timing/cadence/watchdog model (`PingState`,
+//! `PING_INTERVAL`, `PING_WATCHDOG_TIMEOUT`) are derived from `f-io/LIVI`
+//! revision `9000f308eec423c5c56ac0a14491a7c95ce5762d`
+//! (`docs/protocol/livi-adoption.md`, "Adopted scope" items 3 and 5). No
+//! AASDK/OpenAuto/LIVI code is reproduced in this file — only independently
+//! reimplemented behaviour, cited to its source.
+
+// Copyright (C) 2018 f1x.studio (Michal Szwaj)
+// Copyright (C) 2024 CubeOne (Simon Dean)
+// Copyright (C) 2024-2026 Open Android Auto contributors (LIVI)
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 use credential_store::CredentialMaterial;
 use protocol_aap::{

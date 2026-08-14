@@ -18,16 +18,18 @@ use crate::protobuf::{self, ProtobufDecodeError};
 // record for the full provenance trail.
 //
 // The proactive, unsolicited VideoFocusNotification send after Config is
-// not derived from AASDK/OpenAuto (neither sends it) — it's motivated by
-// independently observing that behaviour in a separate, independently
-// implemented, GPL-3.0-or-later Android Auto client (`f-io/LIVI`,
+// derived from a separate, independently implemented, GPL-3.0-or-later
+// Android Auto client (`f-io/LIVI` revision
+// 9000f308eec423c5c56ac0a14491a7c95ce5762d,
 // `src/main/services/projection/driver/aa/stack/session/Session.ts`, not
-// AASDK-derived). No LIVI code is reproduced here; only the wire
-// message/field shape, itself confirmed byte-for-byte against this
-// project's own pinned AASDK schema above, and the idea of sending it
-// unconditionally after Config.
+// AASDK-derived), formally adopted per
+// `docs/protocol/livi-adoption.md` ("Adopted scope" item 1). No LIVI code
+// is reproduced here; only the wire message/field shape, itself confirmed
+// byte-for-byte against this project's own pinned AASDK schema above, and
+// the behavioural rule of sending it unconditionally after Config.
 // Copyright (C) 2018 f1x.studio (Michal Szwaj)
 // Copyright (C) 2024 CubeOne (Simon Dean)
+// Copyright (C) 2024-2026 Open Android Auto contributors (LIVI)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /// `aap_protobuf.service.media.shared.message.MediaCodecType.MEDIA_CODEC_VIDEO_H264_BP`
