@@ -1,10 +1,14 @@
 //! `GStreamer` capability adapter for the board-independent media contracts.
 
 #[cfg(target_os = "linux")]
+mod audio;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod render;
 
+#[cfg(target_os = "linux")]
+pub use audio::{AudioFormat, AudioPlaybackPipeline, AudioSink};
 #[cfg(target_os = "linux")]
 pub use linux::{GstreamerBackend, GstreamerError};
 #[cfg(target_os = "linux")]

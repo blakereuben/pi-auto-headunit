@@ -92,4 +92,12 @@ impl GstreamerBackend {
     ) -> Result<crate::VideoRenderPipeline, GstreamerError> {
         crate::VideoRenderPipeline::new(pipeline_elements(capability), sink)
     }
+
+    pub fn build_audio_playback_pipeline(
+        &self,
+        format: crate::AudioFormat,
+        sink: crate::AudioSink,
+    ) -> Result<crate::AudioPlaybackPipeline, GstreamerError> {
+        crate::AudioPlaybackPipeline::new(format, sink)
+    }
 }

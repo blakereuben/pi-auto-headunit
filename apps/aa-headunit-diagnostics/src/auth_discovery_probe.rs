@@ -303,31 +303,48 @@
 //! below now implement this model; ping is armed in `handle_message` right
 //! after `send_service_discovery_response` (see `PingState`).
 //!
-//! No real phone has ever sent `Data`/`CodecConfig` on the video channel in
-//! any trial to date (Error 2 fires first), so the leading remaining
-//! theory is that this project has only ever diagnosed the wire protocol —
-//! it has never actually decoded or rendered anything, which a real phone
-//! may require before committing to a session. `video_render` (a
-//! `VideoRenderState`, alongside `video_channel`) now builds a real
-//! `media_gstreamer::VideoRenderPipeline` (`appsrc ! h264parse !
-//! avdec_h264 ! videoconvert ! waylandsink`) lazily once `Start` is
-//! received, and pushes every subsequent `Data`/`CodecConfig` payload into
-//! it. A pipeline construction, start, or push/bus failure (most commonly:
-//! no reachable Wayland compositor, e.g. an SSH session without
-//! `WAYLAND_DISPLAY` forwarded) is logged and demotes `video_render` to
-//! `Failed` — it never aborts the probe or affects `Ack`-sending, which
-//! stays entirely protocol-driven. This cannot yet be exercised against a
-//! real phone for the reason above; it's proven with a self-generated
-//! synthetic H.264 fixture instead (`media_gstreamer::render`'s tests) and
-//! wired in so a future trial that gets past `Start` exercises it for
-//! real. Two framing details are genuine, explicitly-flagged assumptions,
-//! not confirmed facts: `Data`/`CodecConfig` are assumed Annex-B
-//! byte-stream H.264 (start-code-delimited NAL units, `CodecConfig` pushed
-//! through the same `appsrc` ahead of frame data so `h264parse` can
-//! extract in-band SPS/PPS), and `Data`'s 8-byte timestamp is assumed
-//! microseconds for PTS purposes. Both fail closed (a pipeline bus error,
-//! not corrupted output) if wrong, and neither has been confirmable
-//! against real phone bytes yet.
+//! Error 2 is now resolved (`docs/protocol/error-2-investigation.md`): a
+//! real phone genuinely streams `Data` on the video channel once
+//! `ServiceDiscoveryResponse` correctly identifies the head unit as
+//! compatible. `video_render` (a `VideoRenderState`, alongside
+//! `video_channel`) builds a real `media_gstreamer::VideoRenderPipeline`
+//! (`appsrc ! {h264,h265}parse ! avdec_{h264,h265} ! videoconvert !
+//! waylandsink`, codec chosen by whichever `configuration_index` the phone
+//! actually selects) lazily once `Start` is received, and pushes every
+//! subsequent `Data`/`CodecConfig` payload into it. A pipeline
+//! construction, start, or push/bus failure (most commonly: no reachable
+//! Wayland compositor, e.g. an SSH session without `WAYLAND_DISPLAY`
+//! forwarded) is logged and demotes `video_render` to `Failed` — it never
+//! aborts the probe or affects `Ack`-sending, which stays entirely
+//! protocol-driven. Real-hardware-confirmed working for both H.264 (self-
+//! generated synthetic fixture, `media_gstreamer::render`'s tests) and
+//! H.265 (real phone `Data`, real video on the head unit's own display —
+//! see `docs/protocol/error-2-investigation.md`). Two framing details
+//! remain genuine, explicitly-flagged assumptions, not confirmed facts:
+//! `Data`/`CodecConfig` are assumed Annex-B byte-stream framing
+//! (start-code-delimited NAL units, `CodecConfig` pushed through the same
+//! `appsrc` ahead of frame data so the parser can extract in-band
+//! parameter sets), and `Data`'s 8-byte timestamp is assumed microseconds
+//! for PTS purposes — both would fail closed (a pipeline bus error, not
+//! corrupted output) if wrong, but the real-hardware trial produced
+//! correctly-rendered video, which is itself strong indirect evidence both
+//! assumptions are right.
+//!
+//! The three PCM audio channels (`MediaAudio`/`SystemAudio`/`SpeechAudio`)
+//! get the same treatment: `media_audio_playback`/`system_audio_playback`/
+//! `speech_audio_playback` (each an `AudioPlaybackState`, mirroring
+//! `video_render`) build an independent `media_gstreamer::
+//! AudioPlaybackPipeline` (`appsrc ! audioconvert ! audioresample !
+//! pulsesink`) lazily once that channel's own `Start` is received, and
+//! push every subsequent `Data` payload into it — raw
+//! `MEDIA_CODEC_AUDIO_PCM` bytes, no decoder stage. Unlike H.264/H.265,
+//! raw PCM has no in-stream parser to reject a wrong sample-format
+//! assumption (`S16LE` interleaved — the platform-standard layout,
+//! unconfirmed against real phone bytes), so a wrong guess would produce
+//! audible noise rather than a clean pipeline error; this must be
+//! confirmed by ear on real hardware, not inferred from a clean bus alone.
+//! `CodecConfig` on an audio channel is logged only, never pushed (see
+//! `media_gstreamer::audio`'s doc comment).
 //!
 //! **Attribution.** This probe's overall session-orchestration shape
 //! (version → TLS → auth → service discovery → channel setup → running)
@@ -349,7 +366,10 @@
 
 use credential_store::CredentialMaterial;
 use media_api::{DecoderCapability, DecoderKind, VideoCodec as DecoderVideoCodec};
-use media_gstreamer::{GstreamerBackend, RenderSink, VideoRenderPipeline};
+use media_gstreamer::{
+    AudioFormat, AudioPlaybackPipeline, AudioSink, GstreamerBackend, RenderSink,
+    VideoRenderPipeline,
+};
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
     AudioSetupAction, AudioSetupEvent, AudioSetupStateMachine, AudioStreamType,
@@ -557,6 +577,18 @@ const MEDIA_AUDIO_SAMPLING_RATE: u32 = 48_000;
 const VOICE_AUDIO_SAMPLING_RATE: u32 = 16_000;
 const VOICE_AUDIO_BITS: u32 = 16;
 const VOICE_AUDIO_CHANNELS: u32 = 1;
+/// Playback pipeline formats matching the `AudioConfiguration` values
+/// actually advertised above for each channel (`MediaAudio`: stereo;
+/// `SystemAudio`/`SpeechAudio`: mono voice) — kept alongside them so a
+/// future change to one can't silently desync from the other.
+const MEDIA_AUDIO_PLAYBACK_FORMAT: AudioFormat = AudioFormat {
+    sampling_rate: MEDIA_AUDIO_SAMPLING_RATE,
+    channels: 2,
+};
+const VOICE_AUDIO_PLAYBACK_FORMAT: AudioFormat = AudioFormat {
+    sampling_rate: VOICE_AUDIO_SAMPLING_RATE,
+    channels: VOICE_AUDIO_CHANNELS,
+};
 
 /// Per-channel progress for the video channel, driven once
 /// `ServiceDiscoveryResponse` has been sent. `Open` covers the entire
@@ -575,10 +607,10 @@ enum VideoChannel {
 /// (no compositor reachable, decode error, etc.) must never affect
 /// protocol-level correctness (acking keeps happening regardless). Built
 /// lazily on `VideoSetupAction::Ready`, since only then is the negotiated
-/// configuration known — this probe advertises both an 800x480@30 H.264
-/// and an 800x480@30 H.265 configuration (`build_service_capabilities`),
-/// but only starts this pipeline when H.264 is the one actually selected;
-/// see `handle_video_channel_message`'s `Ready` arm.
+/// codec known — this probe advertises both a 1280x720@60 H.264 and an
+/// identical H.265 configuration (`build_service_capabilities`), and
+/// starts the pipeline typed for whichever one the phone actually
+/// selected; see `handle_video_start_received`.
 enum VideoRenderState {
     /// `GstreamerBackend::new()` itself failed (`GStreamer` unusable on this
     /// host at all) — never attempted again this run. The error is
@@ -593,6 +625,50 @@ enum VideoRenderState {
     /// keeps going. The error is printed at the point of failure, not
     /// retained here.
     Failed,
+}
+
+/// Lifecycle of the real PCM playback pipeline for one audio channel
+/// (`MediaAudio`/`SystemAudio`/`SpeechAudio` each get their own instance),
+/// independent of that channel's own protocol state — same shape and same
+/// reasoning as `VideoRenderState` (a pipeline failure must never affect
+/// protocol-level correctness). Built lazily on `AudioSetupAction::Ready`.
+enum AudioPlaybackState {
+    /// `GstreamerBackend::new()` itself failed for this channel's backend —
+    /// never attempted again this run. The error is printed at the point
+    /// of failure, not retained here.
+    Unavailable,
+    /// Backend is ready; pipeline not yet built (waiting for `Ready`).
+    NotStarted(GstreamerBackend),
+    /// Pipeline built and playing.
+    Running(AudioPlaybackPipeline),
+    /// Construction, start, or a later push/bus error occurred — no
+    /// further attempts are made this run, but the probe (and acking)
+    /// keeps going. The error is printed at the point of failure, not
+    /// retained here.
+    Failed,
+}
+
+/// Bundles every real media pipeline's lifecycle state together — purely
+/// to keep `run()`/`drain_and_dispatch_frames`/`handle_message`'s argument
+/// lists and line counts manageable as this grows; each field is otherwise
+/// independent (see `VideoRenderState`/`AudioPlaybackState`'s own doc
+/// comments), not a shared state machine.
+struct MediaPipelines {
+    video_render: VideoRenderState,
+    media_audio_playback: AudioPlaybackState,
+    system_audio_playback: AudioPlaybackState,
+    speech_audio_playback: AudioPlaybackState,
+}
+
+impl MediaPipelines {
+    fn new() -> Self {
+        Self {
+            video_render: new_video_render_state(),
+            media_audio_playback: new_audio_playback_state("media_audio"),
+            system_audio_playback: new_audio_playback_state("system_audio"),
+            speech_audio_playback: new_audio_playback_state("speech_audio"),
+        }
+    }
 }
 
 /// Per-channel progress for the `MediaAudio` channel, driven once
@@ -767,10 +843,10 @@ pub fn run<T: SessionTransport>(
     // whatever the phone sends after video Start, until PROBE_TIMEOUT.
     let mut channel_setup_complete = false;
     let mut video_channel: Option<VideoChannel> = None;
-    let mut video_render = new_video_render_state();
     let mut media_audio_channel: Option<MediaAudioChannel> = None;
     let mut system_audio_channel: Option<SystemAudioChannel> = None;
     let mut speech_audio_channel: Option<SpeechAudioChannel> = None;
+    let mut media_pipelines = MediaPipelines::new();
     let mut sensors_channel: Option<SensorsChannel> = None;
     // Every channel that only ever needs to reach ChannelOpenState::Open —
     // input/touch plus two of the six non-video channels this experiment
@@ -798,10 +874,10 @@ pub fn run<T: SessionTransport>(
             &mut assembler,
             &mut handshake,
             &mut video_channel,
-            &mut video_render,
             &mut media_audio_channel,
             &mut system_audio_channel,
             &mut speech_audio_channel,
+            &mut media_pipelines,
             &mut sensors_channel,
             &mut simple_channels,
             &mut ping_state,
@@ -874,10 +950,10 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
     assembler: &mut MessageAssembler,
     handshake: &mut HandshakeStateMachine,
     video_channel: &mut Option<VideoChannel>,
-    video_render: &mut VideoRenderState,
     media_audio_channel: &mut Option<MediaAudioChannel>,
     system_audio_channel: &mut Option<SystemAudioChannel>,
     speech_audio_channel: &mut Option<SpeechAudioChannel>,
+    media_pipelines: &mut MediaPipelines,
     sensors_channel: &mut Option<SensorsChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     ping_state: &mut Option<PingState>,
@@ -905,10 +981,10 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
             &message,
             handshake,
             video_channel,
-            video_render,
             media_audio_channel,
             system_audio_channel,
             speech_audio_channel,
+            media_pipelines,
             sensors_channel,
             simple_channels,
             ping_state,
@@ -922,15 +998,51 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
     }
 }
 
+/// Arms every channel's state machine the instant `ServiceDiscoveryResponse`
+/// has been sent — extracted out of `handle_message` purely to stay under
+/// clippy's line-count limit; no behavior change from when this was inline.
+#[allow(clippy::too_many_arguments)]
+fn arm_channels_after_service_discovery(
+    video_channel: &mut Option<VideoChannel>,
+    media_audio_channel: &mut Option<MediaAudioChannel>,
+    system_audio_channel: &mut Option<SystemAudioChannel>,
+    speech_audio_channel: &mut Option<SpeechAudioChannel>,
+    sensors_channel: &mut Option<SensorsChannel>,
+    simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
+) {
+    *video_channel = Some(VideoChannel::AwaitingOpen(ChannelOpenStateMachine::new(
+        VIDEO_CHANNEL_ID,
+    )));
+    *media_audio_channel = Some(MediaAudioChannel::AwaitingOpen(
+        ChannelOpenStateMachine::new(MEDIA_AUDIO_CHANNEL_ID),
+    ));
+    *system_audio_channel = Some(SystemAudioChannel::AwaitingOpen(
+        ChannelOpenStateMachine::new(SYSTEM_AUDIO_CHANNEL_ID),
+    ));
+    *speech_audio_channel = Some(SpeechAudioChannel::AwaitingOpen(
+        ChannelOpenStateMachine::new(SPEECH_AUDIO_CHANNEL_ID),
+    ));
+    *sensors_channel = Some(SensorsChannel::AwaitingOpen(ChannelOpenStateMachine::new(
+        SENSORS_CHANNEL_ID,
+    )));
+    for channel_id in [
+        INPUT_CHANNEL_ID,
+        BLUETOOTH_CHANNEL_ID,
+        MICROPHONE_CHANNEL_ID,
+    ] {
+        simple_channels.insert(channel_id, ChannelOpenStateMachine::new(channel_id));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_message<T: SessionTransport>(
     message: &Message,
     handshake: &mut HandshakeStateMachine,
     video_channel: &mut Option<VideoChannel>,
-    video_render: &mut VideoRenderState,
     media_audio_channel: &mut Option<MediaAudioChannel>,
     system_audio_channel: &mut Option<SystemAudioChannel>,
     speech_audio_channel: &mut Option<SpeechAudioChannel>,
+    media_pipelines: &mut MediaPipelines,
     sensors_channel: &mut Option<SensorsChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     ping_state: &mut Option<PingState>,
@@ -962,40 +1074,54 @@ fn handle_message<T: SessionTransport>(
                 sends_since_arm: 1,
             });
             println!("probe_state=ping_armed");
-            *video_channel = Some(VideoChannel::AwaitingOpen(ChannelOpenStateMachine::new(
-                VIDEO_CHANNEL_ID,
-            )));
-            *media_audio_channel = Some(MediaAudioChannel::AwaitingOpen(
-                ChannelOpenStateMachine::new(MEDIA_AUDIO_CHANNEL_ID),
-            ));
-            *system_audio_channel = Some(SystemAudioChannel::AwaitingOpen(
-                ChannelOpenStateMachine::new(SYSTEM_AUDIO_CHANNEL_ID),
-            ));
-            *speech_audio_channel = Some(SpeechAudioChannel::AwaitingOpen(
-                ChannelOpenStateMachine::new(SPEECH_AUDIO_CHANNEL_ID),
-            ));
-            *sensors_channel = Some(SensorsChannel::AwaitingOpen(ChannelOpenStateMachine::new(
-                SENSORS_CHANNEL_ID,
-            )));
-            for channel_id in [
-                INPUT_CHANNEL_ID,
-                BLUETOOTH_CHANNEL_ID,
-                MICROPHONE_CHANNEL_ID,
-            ] {
-                simple_channels.insert(channel_id, ChannelOpenStateMachine::new(channel_id));
-            }
+            arm_channels_after_service_discovery(
+                video_channel,
+                media_audio_channel,
+                system_audio_channel,
+                speech_audio_channel,
+                sensors_channel,
+                simple_channels,
+            );
         }
         return Ok(ProbeOutcome::Continue);
     }
 
     if message.channel_id == VIDEO_CHANNEL_ID {
-        handle_video_channel_message(message, video_channel, video_render, tls, transport, limits)?;
+        handle_video_channel_message(
+            message,
+            video_channel,
+            &mut media_pipelines.video_render,
+            tls,
+            transport,
+            limits,
+        )?;
     } else if message.channel_id == MEDIA_AUDIO_CHANNEL_ID {
-        handle_media_audio_channel_message(message, media_audio_channel, tls, transport, limits)?;
+        handle_media_audio_channel_message(
+            message,
+            media_audio_channel,
+            &mut media_pipelines.media_audio_playback,
+            tls,
+            transport,
+            limits,
+        )?;
     } else if message.channel_id == SYSTEM_AUDIO_CHANNEL_ID {
-        handle_system_audio_channel_message(message, system_audio_channel, tls, transport, limits)?;
+        handle_system_audio_channel_message(
+            message,
+            system_audio_channel,
+            &mut media_pipelines.system_audio_playback,
+            tls,
+            transport,
+            limits,
+        )?;
     } else if message.channel_id == SPEECH_AUDIO_CHANNEL_ID {
-        handle_speech_audio_channel_message(message, speech_audio_channel, tls, transport, limits)?;
+        handle_speech_audio_channel_message(
+            message,
+            speech_audio_channel,
+            &mut media_pipelines.speech_audio_playback,
+            tls,
+            transport,
+            limits,
+        )?;
     } else if message.channel_id == SENSORS_CHANNEL_ID {
         handle_sensors_channel_message(message, sensors_channel, tls, transport, limits)?;
     } else if message.channel_id == INPUT_CHANNEL_ID
@@ -1685,6 +1811,107 @@ fn start_video_render_pipeline(video_render: &mut VideoRenderState, codec: Decod
     }
 }
 
+/// Initializes `GStreamer` once at probe startup for one audio channel's
+/// playback pipeline, independent of session progress (the pipeline itself
+/// is still built lazily, on that channel's own `Start` — see
+/// `start_audio_playback_pipeline`). Mirrors `new_video_render_state`; each
+/// audio channel gets its own `GstreamerBackend` (cheap — `gst::init()` is
+/// idempotent) so one channel's failure is independently diagnosable from
+/// the others.
+fn new_audio_playback_state(label: &str) -> AudioPlaybackState {
+    match GstreamerBackend::new() {
+        Ok(backend) => AudioPlaybackState::NotStarted(backend),
+        Err(error) => {
+            println!("probe_state={label}_playback_backend_unavailable");
+            println!("{label}_playback_error={error}");
+            AudioPlaybackState::Unavailable
+        }
+    }
+}
+
+/// Logs `AudioSetupAction::Ready` for any of the three audio channels —
+/// shared since the print shape is identical across `MediaAudio`/
+/// `SystemAudio`/`SpeechAudio`, only the `label` prefix differs.
+fn log_audio_channel_start_received(label: &str, session_id: i32, configuration_index: u32) {
+    println!("probe_state={label}_channel_start_received");
+    println!("{label}_channel_session_id={session_id}");
+    println!("{label}_channel_configuration_index={configuration_index}");
+}
+
+/// Logs `AudioSetupAction::MediaDataReceived` for any of the three audio
+/// channels — shared for the same reason as `log_audio_channel_start_received`.
+fn log_audio_media_data_received(label: &str, timestamp: u64, byte_len: usize) {
+    println!("probe_state={label}_media_data_received");
+    println!("{label}_media_data_timestamp={timestamp}");
+    println!("{label}_media_data_bytes={byte_len}");
+}
+
+/// Lazily builds and starts one audio channel's real PCM playback pipeline
+/// on that channel's own `Start`. Mirrors `start_video_render_pipeline`;
+/// construction/start failure (most commonly: no reachable
+/// PipeWire/PulseAudio session, e.g. an unprivileged `sudo` session without
+/// `-E`) demotes `audio_playback` to `Failed` and is logged — never returns
+/// an error or aborts the probe, since playback is independent of protocol
+/// correctness (see `AudioPlaybackState`'s doc comment).
+fn start_audio_playback_pipeline(
+    audio_playback: &mut AudioPlaybackState,
+    format: AudioFormat,
+    label: &str,
+) {
+    if !matches!(audio_playback, AudioPlaybackState::NotStarted(_)) {
+        return;
+    }
+    let AudioPlaybackState::NotStarted(backend) =
+        std::mem::replace(audio_playback, AudioPlaybackState::Failed)
+    else {
+        unreachable!("just matched NotStarted above");
+    };
+    match backend.build_audio_playback_pipeline(format, AudioSink::Pulse) {
+        Ok(pipeline) => match pipeline.start() {
+            Ok(()) => {
+                println!("probe_state={label}_playback_pipeline_started");
+                *audio_playback = AudioPlaybackState::Running(pipeline);
+            }
+            Err(error) => {
+                println!("probe_state={label}_playback_pipeline_start_failed");
+                println!("{label}_playback_error={error}");
+                *audio_playback = AudioPlaybackState::Failed;
+            }
+        },
+        Err(error) => {
+            println!("probe_state={label}_playback_pipeline_build_failed");
+            println!("{label}_playback_error={error}");
+            *audio_playback = AudioPlaybackState::Failed;
+        }
+    }
+}
+
+/// Runs `push` against the pipeline only if `audio_playback` is currently
+/// `Running`; a no-op otherwise. Mirrors `apply_to_running_pipeline`; a
+/// push error or a bus error observed right after demotes `audio_playback`
+/// to `Failed` — never returns an error, since playback is independent of
+/// protocol correctness (see `AudioPlaybackState`'s doc comment).
+fn apply_to_running_audio_pipeline(
+    audio_playback: &mut AudioPlaybackState,
+    label: &str,
+    push: impl FnOnce(&AudioPlaybackPipeline) -> Result<(), media_gstreamer::GstreamerError>,
+) {
+    let failure = match audio_playback {
+        AudioPlaybackState::Running(pipeline) => match push(pipeline) {
+            Err(error) => Some(("playback_push_failed", error)),
+            Ok(()) => pipeline
+                .poll_bus_error()
+                .map(|error| ("playback_pipeline_error", error)),
+        },
+        _ => None,
+    };
+    if let Some((state, error)) = failure {
+        println!("probe_state={label}_{state}");
+        println!("{label}_playback_error={error}");
+        *audio_playback = AudioPlaybackState::Failed;
+    }
+}
+
 /// Drives the `MediaAudio` channel's `ChannelOpenStateMachine` then
 /// `AudioSetupStateMachine`, sending each state machine's response actions
 /// as TLS-encrypted application data. Mirrors `handle_video_channel_message`
@@ -1693,6 +1920,7 @@ fn start_video_render_pipeline(video_render: &mut VideoRenderState, codec: Decod
 fn handle_media_audio_channel_message<T: SessionTransport>(
     message: &Message,
     media_audio_channel: &mut Option<MediaAudioChannel>,
+    audio_playback: &mut AudioPlaybackState,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
@@ -1767,14 +1995,24 @@ fn handle_media_audio_channel_message<T: SessionTransport>(
                         session_id,
                         configuration_index,
                     } => {
-                        println!("probe_state=media_audio_channel_start_received");
-                        println!("media_audio_channel_session_id={session_id}");
-                        println!("media_audio_channel_configuration_index={configuration_index}");
+                        log_audio_channel_start_received(
+                            "media_audio",
+                            session_id,
+                            configuration_index,
+                        );
+                        start_audio_playback_pipeline(
+                            audio_playback,
+                            MEDIA_AUDIO_PLAYBACK_FORMAT,
+                            "media_audio",
+                        );
                     }
                     AudioSetupAction::MediaDataReceived { timestamp, payload } => {
-                        println!("probe_state=media_audio_media_data_received");
-                        println!("media_audio_media_data_timestamp={timestamp}");
-                        println!("media_audio_media_data_bytes={}", payload.len());
+                        log_audio_media_data_received("media_audio", timestamp, payload.len());
+                        apply_to_running_audio_pipeline(
+                            audio_playback,
+                            "media_audio",
+                            |pipeline| pipeline.push_frame(&payload, timestamp),
+                        );
                     }
                     AudioSetupAction::CodecConfigReceived { payload } => {
                         println!("probe_state=media_audio_media_codec_config_received");
@@ -1797,6 +2035,7 @@ fn handle_media_audio_channel_message<T: SessionTransport>(
 fn handle_system_audio_channel_message<T: SessionTransport>(
     message: &Message,
     system_audio_channel: &mut Option<SystemAudioChannel>,
+    audio_playback: &mut AudioPlaybackState,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
@@ -1871,14 +2110,24 @@ fn handle_system_audio_channel_message<T: SessionTransport>(
                         session_id,
                         configuration_index,
                     } => {
-                        println!("probe_state=system_audio_channel_start_received");
-                        println!("system_audio_channel_session_id={session_id}");
-                        println!("system_audio_channel_configuration_index={configuration_index}");
+                        log_audio_channel_start_received(
+                            "system_audio",
+                            session_id,
+                            configuration_index,
+                        );
+                        start_audio_playback_pipeline(
+                            audio_playback,
+                            VOICE_AUDIO_PLAYBACK_FORMAT,
+                            "system_audio",
+                        );
                     }
                     AudioSetupAction::MediaDataReceived { timestamp, payload } => {
-                        println!("probe_state=system_audio_media_data_received");
-                        println!("system_audio_media_data_timestamp={timestamp}");
-                        println!("system_audio_media_data_bytes={}", payload.len());
+                        log_audio_media_data_received("system_audio", timestamp, payload.len());
+                        apply_to_running_audio_pipeline(
+                            audio_playback,
+                            "system_audio",
+                            |pipeline| pipeline.push_frame(&payload, timestamp),
+                        );
                     }
                     AudioSetupAction::CodecConfigReceived { payload } => {
                         println!("probe_state=system_audio_media_codec_config_received");
@@ -1902,6 +2151,7 @@ fn handle_system_audio_channel_message<T: SessionTransport>(
 fn handle_speech_audio_channel_message<T: SessionTransport>(
     message: &Message,
     speech_audio_channel: &mut Option<SpeechAudioChannel>,
+    audio_playback: &mut AudioPlaybackState,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
@@ -1976,14 +2226,24 @@ fn handle_speech_audio_channel_message<T: SessionTransport>(
                         session_id,
                         configuration_index,
                     } => {
-                        println!("probe_state=speech_audio_channel_start_received");
-                        println!("speech_audio_channel_session_id={session_id}");
-                        println!("speech_audio_channel_configuration_index={configuration_index}");
+                        log_audio_channel_start_received(
+                            "speech_audio",
+                            session_id,
+                            configuration_index,
+                        );
+                        start_audio_playback_pipeline(
+                            audio_playback,
+                            VOICE_AUDIO_PLAYBACK_FORMAT,
+                            "speech_audio",
+                        );
                     }
                     AudioSetupAction::MediaDataReceived { timestamp, payload } => {
-                        println!("probe_state=speech_audio_media_data_received");
-                        println!("speech_audio_media_data_timestamp={timestamp}");
-                        println!("speech_audio_media_data_bytes={}", payload.len());
+                        log_audio_media_data_received("speech_audio", timestamp, payload.len());
+                        apply_to_running_audio_pipeline(
+                            audio_playback,
+                            "speech_audio",
+                            |pipeline| pipeline.push_frame(&payload, timestamp),
+                        );
                     }
                     AudioSetupAction::CodecConfigReceived { payload } => {
                         println!("probe_state=speech_audio_media_codec_config_received");
