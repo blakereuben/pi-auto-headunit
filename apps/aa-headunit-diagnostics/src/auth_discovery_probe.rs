@@ -1549,6 +1549,9 @@ fn handle_video_channel_message<T: SessionTransport>(
                             pipeline.push_codec_config(&payload)
                         });
                     }
+                    VideoSetupAction::VideoFocusRequested { body_len } => {
+                        log_video_focus_requested(body_len);
+                    }
                 }
             }
             Ok(())
@@ -1595,6 +1598,17 @@ fn new_video_render_state() -> VideoRenderState {
             VideoRenderState::Unavailable
         }
     }
+}
+
+/// Logs `VideoSetupAction::VideoFocusRequested` — the phone asking for
+/// video focus back while `Ready`, real-hardware-confirmed to arrive
+/// shortly after `Start` (`docs/protocol/error-2-investigation.md`,
+/// "`frame_rate`/`density` breakthrough"). The reply itself is a
+/// `VideoSetupAction::SendMedia` handled by the match arm above this one;
+/// this only logs receipt.
+fn log_video_focus_requested(body_len: usize) {
+    println!("probe_state=video_focus_requested");
+    println!("video_focus_request_bytes={body_len}");
 }
 
 /// Handles `VideoSetupAction::Ready` (video `Start` accepted). Index 0 is

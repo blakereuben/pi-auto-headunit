@@ -146,6 +146,20 @@ pub enum VideoSetupAction {
     CodecConfigReceived {
         payload: Vec<u8>,
     },
+    /// A `VideoFocusRequest` arrived while `Ready` — the phone asking for
+    /// video focus back, real-hardware-confirmed to happen shortly after
+    /// `Start` (`docs/protocol/error-2-investigation.md`,
+    /// "`frame_rate`/`density` breakthrough"). `body_len` is reported
+    /// rather than the body itself since this project has no pinned-source
+    /// field mapping for `VideoFocusRequest`'s own contents yet — the
+    /// reply (a second `VideoFocusNotification`, immediately following
+    /// this action) is unconditional regardless of what the request
+    /// actually asked for, matching this project's existing
+    /// grant-what's-asked precedent (`grant_audio_focus`,
+    /// `evaluate_key_binding_request`).
+    VideoFocusRequested {
+        body_len: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,6 +436,14 @@ impl VideoSetupStateMachine {
                 },
                 VideoSetupAction::SendMedia(encode_media_ack(session_id)),
             ]),
+            MediaMessageId::VideoFocusRequest => Ok(vec![
+                VideoSetupAction::VideoFocusRequested {
+                    body_len: message.body.len(),
+                },
+                VideoSetupAction::SendMedia(encode_video_focus_notification(
+                    VideoFocusMode::Projected,
+                )),
+            ]),
             other => Err(VideoSetupError::UnexpectedMediaMessage {
                 state: self.state,
                 id: other,
@@ -430,12 +452,16 @@ impl VideoSetupStateMachine {
     }
 }
 
-/// Encodes `VideoFocusNotification`, proactively granting the phone video
-/// focus. `focus` (field 1, optional enum) is the only field ever written —
+/// Encodes `VideoFocusNotification`, granting the phone video focus.
+/// `focus` (field 1, optional enum) is the only field ever written —
 /// `unsolicited` (field 2, optional bool) is left unset, matching `f-io/LIVI`'s
-/// own exact wire bytes for this send (`[0x08, 0x01]` for `Projected`), not
-/// a reply to any `VideoFocusRequest` from the phone (this project has
-/// never received one — see this crate's module boundary notes).
+/// own exact wire bytes for this send (`[0x08, 0x01]` for `Projected`). Sent
+/// two ways: proactively, unconditionally, right after `Config` (from
+/// `handle_setup`); and as a reply to `VideoFocusRequest` while `Ready`
+/// (from `handle_media`) — real-hardware-confirmed to arrive shortly after
+/// `Start` (`docs/protocol/error-2-investigation.md`, "`frame_rate`/`density`
+/// breakthrough"), always answered with the same unconditional `Projected`
+/// grant regardless of what the request itself asked for.
 #[must_use]
 pub fn encode_video_focus_notification(focus: VideoFocusMode) -> MediaMessage {
     let mut body = Vec::new();
@@ -710,6 +736,36 @@ mod tests {
             })
         );
         assert_eq!(machine.state(), VideoSetupState::Failed);
+    }
+
+    #[test]
+    fn answers_video_focus_request_with_video_focus_notification() {
+        let mut machine = VideoSetupStateMachine::new();
+        machine
+            .advance(VideoSetupEvent::InboundMedia(&setup_payload(
+                MEDIA_CODEC_VIDEO_H264_BP,
+            )))
+            .expect("setup");
+        machine
+            .advance(VideoSetupEvent::InboundMedia(&start_payload(7, 0)))
+            .expect("start");
+
+        let actions = machine
+            .advance(VideoSetupEvent::InboundMedia(&media_message(
+                MediaMessageId::VideoFocusRequest,
+                vec![0x08, 0x01],
+            )))
+            .expect("video focus request");
+        assert_eq!(machine.state(), VideoSetupState::Ready);
+        assert_eq!(
+            actions[0],
+            VideoSetupAction::VideoFocusRequested { body_len: 2 }
+        );
+        let VideoSetupAction::SendMedia(notification) = &actions[1] else {
+            panic!("expected SendMedia");
+        };
+        assert_eq!(notification.id, MediaMessageId::VideoFocusNotification);
+        assert_eq!(notification.body, vec![0x08, 0x01]);
     }
 
     #[test]
