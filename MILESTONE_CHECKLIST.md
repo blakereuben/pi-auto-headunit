@@ -16,7 +16,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Prepare the Pi 5 8 GB/NVMe reference system for native Rust development.
 - [x] Confirm 64-bit Raspberry Pi OS/Debian Trixie baseline and unprivileged hardware groups.
 - [x] Select GPL-3.0-or-later and add the complete licence and third-party notices.
-- [ ] Complete the protocol-source, trademark, and clean-room policy review needed for implementation.
+- [x] Complete the protocol-source, trademark, and clean-room policy review needed for implementation. This item gates `MILESTONES.md`'s M0 exit criterion — "no unresolved legal/provenance ambiguity about the source permitted for Milestone 1" — not the full Android Auto session protocol (that's M2's own exit gate, separately closed by `docs/architecture/decisions/0002-android-auto-protocol-source-gate.md`). Closure record consolidating the already-established decisions: `docs/protocol/m0-source-trademark-clean-room-review.md`. Protocol source: M1 uses only publicly documented AOA (AOSP), no third-party protocol source. Trademark: the project's existing non-affiliation/uncertified disclosure (`README.md`, `PRD.md` §1) is sufficient for continued development under the working name; final-product-naming trademark clearance remains explicitly open, later, pre-1.0 work (`PRD.md` §1, `RISK_REGISTER.md` R-004) — not an M0/M1 blocker. Clean-room: not required for M1 (no third-party protocol source involved); remains a correctly-tracked future consideration under ADR-0002 for any later undocumented behaviour.
 
 ## M1 — Pi 5 documented USB/AOA foundation
 
@@ -34,7 +34,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Upgrade from `0.0.9-1` to `0.1.0-1` while preserving a locally modified configuration.
 - [x] Detect a physical unplug while the accessory bulk interface is actively claimed.
 - [x] Inject unplug at every backend-driven AOA state in deterministic automated tests.
-- [ ] Record a final Pi 5 M1 report and mark the milestone reference-complete.
+- [x] Record a final Pi 5 M1 report and mark the milestone reference-complete. `MILESTONE_01.md`'s "Final Pi 5 reference report (15 August 2026)" section records the closure, citing the existing hardware evidence (`docs/hardware/evidence/pi5-2026-08-04.md` through `pi5-2026-08-07.md`) against this milestone's own "Pending Pi 5 reference evidence"/"Definition of done" criteria — every one of which is now real-hardware-confirmed and checked above. Pi 4/Waveshare CM4/CM5 physical evidence and additional phone vendors remain correctly deferred to the later cross-board validation phase, per this milestone's own already-recorded scope decision, not a new one.
 
 ## M2 — Lawful Android Auto session foundation on Pi 5
 

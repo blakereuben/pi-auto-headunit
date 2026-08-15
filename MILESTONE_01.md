@@ -1,5 +1,47 @@
 # Exact First Implementation Milestone: Documented USB/AOA Vertical Slice
 
+## Final Pi 5 reference report (15 August 2026)
+
+Every item this milestone's own "Pending Pi 5 reference evidence" list
+below named is now complete and real-hardware-confirmed; see
+`MILESTONE_CHECKLIST.md`'s M1 section (all items checked but one — a
+short closing note, this update) for the item-by-item record. Evidence:
+
+- Repeated physical cable connect/disconnect soak and the 100-cycle
+  claim/release soak: both complete, no handle or resident-memory growth
+  (`docs/hardware/evidence/pi5-2026-08-04.md`, "Accessory-mode stability
+  soak").
+- Documented AOA transition, re-enumeration, endpoint discovery,
+  unprivileged access, clean unplug, and reconnect without a Pi reboot or
+  service reset: all pass (`docs/hardware/evidence/pi5-2026-08-04.md`,
+  "First AOA transition" through "Reconnection").
+- Unplug injected at every backend-driven AOA state in deterministic fake-
+  backend tests, plus a real controlled physical unplug while the bulk
+  interface was actively claimed (`docs/hardware/evidence/pi5-2026-08-04.md`,
+  "Active-interface unplug").
+- Native `.deb` build/install/upgrade/remove/purge/reinstall lifecycle,
+  Pi 5 native formatting/strict Clippy/full workspace test suite: all pass
+  (`docs/hardware/evidence/pi5-2026-08-04.md`, "Native build and package").
+- Independent Wi-Fi/Bluetooth `Auto`/`Onboard`/USB-provider detection and
+  selection policy, including disabled-state detection, hot-unplug, and
+  return-to-onboard: all pass (`docs/hardware/evidence/pi5-2026-08-04.md`,
+  "Wireless discovery").
+- Multiple candidate phones and an explicit `BUS:ADDRESS` selector
+  requirement (never attaching arbitrarily): implemented and exercised
+  across every trial in the evidence record.
+
+Additional phone vendors/Android versions and Pi 4/Waveshare CM4/CM5
+physical evidence remain out of scope for this milestone by the project's
+own already-recorded decision (`MILESTONE_01.md`'s "In scope" section and
+`MILESTONES.md`'s M1 exit gate both defer cross-board validation to the
+later Pi 5 completion gate) — not a new decision made here, and not a gap
+in the Pi 5 reference result.
+
+**Milestone 1 is therefore Pi 5 reference-complete.** Cross-board
+(Pi 4/CM4/CM5) and expanded phone-matrix validation remain correctly
+deferred, per standing project policy, to the later cross-board
+validation phase after the Pi 5 completion gate (M8).
+
 ## Implementation status (3 August 2026)
 
 Implemented in the workspace:
