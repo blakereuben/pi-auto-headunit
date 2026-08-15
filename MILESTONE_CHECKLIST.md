@@ -78,7 +78,7 @@ Architecture and automated tests must remain portable throughout development, bu
 ## M3 — Pi 5 display, media, audio, microphone, and touch
 
 - [x] Connect and identify the official 7-inch DSI touchscreen.
-- [ ] Bring up a native full-screen development UI without relying on VNC.
+- [ ] Bring up a native full-screen development UI without relying on VNC. **GTK4/GStreamer architecture spike passed, real-hardware-confirmed (2026-08-15)**: `ARCHITECTURE.md` §4's explicit gate ("GTK/GStreamer integration, render-buffer sharing, and 720p/1080p latency must pass an on-device architecture spike before this choice is locked in") is satisfied — see that section for full detail. `crates/media-gstreamer/examples/gtk_fullscreen_spike.rs` renders a full-screen, correctly-composited, smooth synthetic video clip directly on the Pi's own display via `gtk4paintablesink`, no VNC involved; the operator confirmed this directly on the physical screen. Still open before this checklist item is fully done: this is a disposable spike (not a permanent CLI command), synthetic video only (no live phone session wired in yet), and there's no real `ui-model`/`ui-gtk` crate, chrome, or diagnostics surface — just the bare rendering path. GTK 4 is now the locked-in choice for whatever real dev UI gets built next.
 - [x] Verify native touch press, move, release, coordinates, and two-finger multi-touch.
 - [ ] Verify touch rotation and calibration in every supported screen orientation.
 - [x] Render synthetic H.264 video and measure Pi 5 decode/presentation performance.

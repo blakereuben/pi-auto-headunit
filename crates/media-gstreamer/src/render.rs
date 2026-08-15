@@ -25,11 +25,19 @@ use crate::{GstreamerError, PipelineElements};
 
 /// Where decoded frames are presented. `Fake` never touches a display and
 /// is the only sink used by automated tests; `Wayland` is the production
-/// sink, reusing `PipelineElements::sink` unmodified.
+/// sink, reusing `PipelineElements::sink` unmodified. `Gtk4Paintable` is a
+/// third, spike-only option: `gtk4paintablesink`, whose `paintable`
+/// `GObject` property (retrievable via `VideoRenderPipeline::
+/// gtk4_paintable_property`) bridges decoded video into a `gtk::Picture`
+/// widget. Used only by `examples/gtk_fullscreen_spike.rs`, answering
+/// `ARCHITECTURE.md` §4's "GTK/GStreamer integration... must pass an
+/// on-device architecture spike" gate — the already-proven `Wayland` path
+/// in `auth_discovery_probe.rs` is untouched.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderSink {
     Wayland,
     Fake,
+    Gtk4Paintable,
 }
 
 /// A running (or not-yet-started) decode/render pipeline for one video
@@ -47,6 +55,7 @@ impl VideoRenderPipeline {
         let sink_element = match sink {
             RenderSink::Wayland => elements.sink,
             RenderSink::Fake => "fakesink",
+            RenderSink::Gtk4Paintable => "gtk4paintablesink name=gtk_paintable_sink",
         };
         let description = format!(
             "appsrc name=src is-live=true format=time \
@@ -131,6 +140,18 @@ impl VideoRenderPipeline {
             }
         }
         None
+    }
+
+    /// The `gtk4paintablesink` element's `paintable` `GObject` property, as a
+    /// raw `glib::Value` — kept untyped so GTK stays confined to the
+    /// example that actually needs it (`examples/gtk_fullscreen_spike.rs`);
+    /// this crate's own dependency graph is unchanged. `None` unless built
+    /// with `RenderSink::Gtk4Paintable`.
+    #[must_use]
+    pub fn gtk4_paintable_property(&self) -> Option<gst::glib::Value> {
+        self.pipeline
+            .by_name("gtk_paintable_sink")
+            .map(|element| element.property_value("paintable"))
     }
 
     /// Graceful shutdown: EOS, bounded wait for it to propagate, then

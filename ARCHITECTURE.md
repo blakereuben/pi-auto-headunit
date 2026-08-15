@@ -105,6 +105,8 @@ Touch events are normalized in `ui-model`, transformed using the negotiated cont
 
 GTK/GStreamer integration, render-buffer sharing, and 720p/1080p latency must pass an on-device architecture spike before this choice is locked in. If it fails, the replacement must still implement the same `ui-model` and media contracts.
 
+**Spike passed, real-hardware-confirmed (2026-08-15): the GTK 4 choice is locked in for video rendering.** `crates/media-gstreamer/examples/gtk_fullscreen_spike.rs` opens a full-screen GTK4 window directly on the Pi 5's Wayland session (no VNC) and renders a self-generated, moving 1280x720 H.264 clip through `gtk4paintablesink` (the `gstreamer1.0-gtk4` plugin), bridged into a `gtk::Picture` via that element's `paintable` `GObject` property (`VideoRenderPipeline::gtk4_paintable_property`, a new `RenderSink::Gtk4Paintable` variant alongside the existing `Wayland`/`Fake` sinks — the already-proven direct-`waylandsink` path in `auth_discovery_probe.rs` is untouched). The operator directly confirmed on the physical screen — not inferred from logs — smooth, correct full-screen rendering with no black gaps before or after playback (an initial run showed black stretches on both ends, traced to the example's own batching/teardown timing, not GTK4/GStreamer rendering itself, and fixed by streaming encoded frames instead of buffering the whole clip first and by closing the window only once playback genuinely finishes). This is synthetic-video-only, not yet a live phone session — see `MILESTONE_CHECKLIST.md` M3 for what remains before this is a complete "native full-screen development UI."
+
 ### `platform-api`, `platform-linux`, and `platform-rpi`
 
 Principal contracts:
