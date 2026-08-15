@@ -24,6 +24,7 @@
 | Service-discovery response wire format | PX pending mapping | Pinned OpenAuto uses an older `ChannelDescriptor` schema; pinned maintained AASDK uses newer repeated `Service` messages | No; field-by-field current-schema adoption required before encoding |
 | Wireless Android Auto bootstrap/session | PX | Not publicly specified in the sources reviewed | No |
 | LIVI-derived video-focus timing, per-frame media ack, unconditional key-binding response, and ping arm-timing/cadence/watchdog | P1 partially adopted | GPL-3.0-or-later LIVI revision `9000f30`; exact file scope in `docs/protocol/livi-adoption.md` | Implemented; real-hardware result mixed — see `docs/protocol/error-2-investigation.md`, "LIVI formally adopted; real ping-timing trial" |
+| LIVI-derived small/recycled touch pointer-id allocation (kernel `ABS_MT_SLOT` used as `pointer_id`, not the raw driver `ABS_MT_TRACKING_ID`) | P1 adopted | GPL-3.0-or-later LIVI revision `9000f30`; exact file scope in `docs/protocol/livi-adoption.md` | Implemented; real-hardware-confirmed — continuous drag and pinch, previously non-functional across four prior trials, now register on a real phone; see `docs/protocol/touch-input-investigation.md`, "Trial 5" |
 
 Public sources:
 

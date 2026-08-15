@@ -1,6 +1,6 @@
 # Real-phone investigation: touch input (head unit → phone)
 
-## Status: **PARTIALLY CONFIRMED — single-finger taps work on real hardware; continuous drag (pan) and multitouch (pinch) do not yet, and the cause is not yet identified.**
+## Status: **FULLY RESOLVED — real-hardware-confirmed, including continuous drag (pan) and multitouch (pinch).**
 
 Touch is architecturally the reverse direction from every other channel this
 project has implemented so far: the head unit is the `InputSourceService`,
@@ -123,6 +123,50 @@ swipe/pan and pinch still produced no visible effect. This refutes
 independently correct (matches the reference implementation exactly) and
 stays in the code.
 
+## Trial 5: pointer-id allocation strategy — RESOLVED
+
+Third hypothesis, following the suggested-next-steps path of comparing
+against a known-working client instead of continuing to guess: LIVI
+(`docs/protocol/livi-adoption.md`, formally adopted GPL-3.0-or-later
+revision `9000f308eec423c5c56ac0a14491a7c95ce5762d`) was read directly.
+`useProjectionTouch.ts`'s `alloc()`/`free()` deliberately maps the
+browser's own arbitrary, large `PointerEvent.pointerId` down to the
+smallest free non-negative integer per active contact, recycled on lift,
+before `AaSession.ts`'s `SendMultiTouch` handler ever calls
+`InputChannel.sendTouch` — LIVI never sends the browser's raw pointer id to
+the phone.
+
+This project's `MultiTouchTracker::to_point`
+(`crates/platform-api/src/touch.rs`) did the opposite: `pointer_id:
+state.tracking_id.unwrap_or(slot)` passed the Linux kernel driver's raw
+`ABS_MT_TRACKING_ID` straight through — an ever-incrementing counter across
+the touchscreen's whole session lifetime (every new contact gets a new,
+larger id, never reused), unlike LIVI's deliberately small, reused ids. A
+session with several taps followed by a two-finger pinch could hand the
+phone pointer ids well past single digits, plausibly overflowing whatever
+small fixed-size internal representation the phone's own input pipeline
+uses to track concurrent pointers — this is exactly the "`pointer_id`
+values grow unbounded" theory this document had already flagged as
+worth hardening but not yet attempted.
+
+**Fixed**: `to_point` now uses the kernel's own `ABS_MT_SLOT` index as
+`pointer_id` instead of `ABS_MT_TRACKING_ID`. No manual allocate/free
+bookkeeping was needed on the Rust side (unlike LIVI's JS layer, which only
+has access to the browser's own arbitrary pointer id) — `ABS_MT_SLOT` is
+already small, bounded by the touchscreen's simultaneous-touch capability,
+and reused by the kernel driver itself as soon as a contact lifts, so using
+it directly achieves the same property LIVI achieves manually. Formally
+added to `docs/protocol/livi-adoption.md`'s adopted scope (item 7).
+
+**Trial 5 result (real hardware): CONFIRMED.** 257 single-finger `Moved`
+reports, 232 two-finger `Moved` reports, plus correct `Down`/`Up`/
+`PointerDown`/`PointerUp` transitions, zero protocol errors, clean
+`observation_window_complete` — and the operator directly confirmed
+**drag/swipe and pinch now work** on the real phone screen. This closes the
+investigation: the full touch pipeline (evdev capture, multitouch state
+tracking, wire encoding, live TLS-encrypted send) is confirmed correct end
+to end for taps, continuous drag, and multitouch gestures alike.
+
 ## Confirmed facts
 
 - Real evdev multitouch capture of the DSI touchscreen (`ft5x06`,
@@ -131,59 +175,36 @@ stays in the code.
   by taps registering correctly on a real phone (trial 3).
 - `TouchCapability`'s advertised coordinate space must match the video
   resolution actually negotiated, not the touchscreen's native panel
-  resolution — the single confirmed root cause found this session.
+  resolution — the first confirmed root cause found this session.
 - `MEDIA_MESSAGE_STOP` is a real, unhandled-until-now message a real phone
   sends during ordinary audio-focus ducking; unrelated to touch, but
   discovered by touch trials and now fixed for every AV channel.
+- `pointer_id` must be a small, contact-lifetime-scoped id (the kernel's
+  own `ABS_MT_SLOT` index), not the driver's raw, ever-incrementing
+  `ABS_MT_TRACKING_ID` — the second confirmed root cause, found by direct
+  comparison against LIVI's own pointer-id allocation strategy
+  (`docs/protocol/livi-adoption.md`, adopted scope item 7) and
+  real-hardware-confirmed to unblock continuous drag/pinch (trial 5).
 
-## Refuted (or not the blocking cause)
+## Refuted (or not the blocking cause, on their own)
 
 - `action_index` being omitted for `Down`/`Moved` (trial 4) — fixed,
-  independently correct, but not sufficient to unblock swipe/pinch.
+  independently correct, but not sufficient on its own to unblock
+  swipe/pinch; needed alongside the trial 5 `pointer_id` fix.
+- Something rate- or timestamp-sensitive, or specific to the app under test
+  — never had supporting evidence, and are moot now that the actual cause
+  (trial 5) is confirmed and gestures work end to end.
 
-## Not ruled out
+## Suggested follow-up (optional, not blocking)
 
-In roughly descending order of how well-motivated they are:
+The investigation is closed — touch input (taps, drag, pinch) is fully
+functional. If anyone wants to hunt for further edge cases:
 
-- **Something rate- or timestamp-sensitive that only affects continuous
-  gesture recognition.** Unlike the two fixes above, no reference-source
-  citation currently supports a specific variant of this theory — it would
-  be a guess, not an evidenced hypothesis. `encode_touch_report`'s
-  timestamp convention (wall-clock microseconds since the Unix epoch) was
-  checked against `InputSourceService::onTouchEvent`'s own
-  `high_resolution_clock::now()`-in-microseconds convention and found
-  directionally consistent (both are wall/monotonic-clock microseconds,
-  not an uptime-relative or millisecond convention) — this weakens, but
-  doesn't eliminate, a timestamp-based theory.
-- **`pointer_id` values grow unbounded** (`state.tracking_id.unwrap_or(slot)`
-  passes the kernel's raw, ever-incrementing `ABS_MT_TRACKING_ID` straight
-  through), while Android's native input system caps pointer ids at 0–31
-  internally. Unlikely to be the active cause this early in a session
-  (values are still small across a single ~30s trial), but worth
-  hardening regardless — not yet attempted.
-- Something specific to the app under test (Google Maps' own gesture
-  handling) or the DSI panel's own drag-tracking characteristics, outside
-  this project's control either way.
-- Something else not yet considered.
-
-## Suggested next steps for whoever picks this up
-
-1. The most direct path, matching how Error 2 was ultimately resolved: a
-   real packet-level capture of a known-working Android Auto client (the
-   same technique used for `docs/protocol/error-2-investigation.md`'s
-   TLS-decrypted LIVI session capture) sending an actual drag/pinch
-   gesture, to see the real wire bytes rather than continuing to guess.
-2. If `opencardev/openauto` continues to be a useful reference, consider
-   formally adopting it (mirroring `docs/protocol/aasdk-adoption.md`/
-   `openauto-adoption.md`'s process — this requires the project owner's
-   explicit decision, not something to self-declare) at commit
-   `4cc739b813622739b09352655581072fc4d39280` or later, since it is
-   demonstrably kept in sync with the newer `aasdk` schema this project
-   already uses, unlike the separately pinned `f1xpl/openauto`.
-3. Try clamping/wrapping `pointer_id` into a bounded range (e.g. 0–31, or
-   reusing small freed ids) as a cheap, independently-reversible
-   experiment if the packet-capture route isn't available.
-4. `MILESTONE_CHECKLIST.md`'s M4 "Return calibrated touch input to the
-   phone" should stay unchecked until continuous gestures work — single
-   taps alone are not "calibrated touch input" in the sense that item
-   means.
+1. `opencardev/openauto` is still only read-only investigative provenance,
+   not formally adopted (unlike LIVI, which now is, per
+   `docs/protocol/livi-adoption.md`'s adopted scope). Formal adoption would
+   need the project owner's explicit decision, not something to
+   self-declare.
+2. `MILESTONE_CHECKLIST.md`'s M4 "Return calibrated touch input to the
+   phone" can now be checked off — continuous gestures are confirmed
+   working, not just taps.

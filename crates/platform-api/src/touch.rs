@@ -8,9 +8,8 @@
 
 /// One finger's current position, keyed by a stable per-contact id that
 /// must not change for the same physical finger across its own down-move-up
-/// sequence (Linux calls this `ABS_MT_TRACKING_ID`; Android's `MotionEvent`
-/// calls the equivalent concept a pointer id — both map directly onto
-/// `pointer_id` here).
+/// sequence. This is the kernel's `ABS_MT_SLOT` index, not the driver's raw
+/// `ABS_MT_TRACKING_ID` — see [`to_point`]'s doc comment for why.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TouchPoint {
     pub pointer_id: u32,
@@ -234,9 +233,27 @@ impl MultiTouchTracker {
     }
 }
 
+/// `pointer_id` is the kernel `ABS_MT_SLOT` index, deliberately not the
+/// driver's raw `ABS_MT_TRACKING_ID` (which `SlotState.tracking_id` holds
+/// but is otherwise only used to detect down/up transitions). A real
+/// touchscreen driver's tracking id is an ever-incrementing counter across
+/// the whole device lifetime — a session with several taps followed by a
+/// two-finger pinch can hand the phone pointer ids well past single digits.
+/// `ABS_MT_SLOT`, by contrast, is small (bounded by the touchscreen's
+/// simultaneous-touch capability, typically single digits) and reused by
+/// the kernel itself as soon as a contact lifts, exactly like the
+/// small-integer, explicitly-recycled pointer ids LIVI's own
+/// `useProjectionTouch.ts` (`alloc`/`free`) synthesizes for its own,
+/// similarly large/arbitrary, browser `PointerEvent.pointerId` values
+/// before ever calling `InputChannel.sendTouch`
+/// (`docs/protocol/livi-adoption.md`). Real-hardware-tested: taps (which
+/// only ever need one id, alive for a single down-up pair) worked with the
+/// raw tracking id; continuous drag/pinch (which can accumulate several ids
+/// within one session) did not — see
+/// `docs/protocol/touch-input-investigation.md`.
 fn to_point((slot, state): (u32, SlotState)) -> TouchPoint {
     TouchPoint {
-        pointer_id: state.tracking_id.unwrap_or(slot),
+        pointer_id: slot,
         x: state.x,
         y: state.y,
     }
@@ -269,7 +286,7 @@ mod tests {
         assert_eq!(
             down.points,
             vec![TouchPoint {
-                pointer_id: 5,
+                pointer_id: 0,
                 x: 100,
                 y: 200
             }]
@@ -285,7 +302,7 @@ mod tests {
         assert_eq!(
             moved.points,
             vec![TouchPoint {
-                pointer_id: 5,
+                pointer_id: 0,
                 x: 110,
                 y: 200
             }]
@@ -302,7 +319,7 @@ mod tests {
         assert_eq!(
             up.points,
             vec![TouchPoint {
-                pointer_id: 5,
+                pointer_id: 0,
                 x: 110,
                 y: 200
             }]
@@ -350,12 +367,12 @@ mod tests {
             second_down.points,
             vec![
                 TouchPoint {
-                    pointer_id: 5,
+                    pointer_id: 0,
                     x: 100,
                     y: 200
                 },
                 TouchPoint {
-                    pointer_id: 9,
+                    pointer_id: 1,
                     x: 300,
                     y: 400
                 },
@@ -393,12 +410,12 @@ mod tests {
             lifted.points,
             vec![
                 TouchPoint {
-                    pointer_id: 5,
+                    pointer_id: 0,
                     x: 100,
                     y: 200
                 },
                 TouchPoint {
-                    pointer_id: 9,
+                    pointer_id: 1,
                     x: 300,
                     y: 400
                 },
@@ -417,7 +434,7 @@ mod tests {
         assert_eq!(
             last_up.points,
             vec![TouchPoint {
-                pointer_id: 9,
+                pointer_id: 1,
                 x: 300,
                 y: 400
             }]
@@ -450,7 +467,7 @@ mod tests {
         assert_eq!(
             reused.points,
             vec![TouchPoint {
-                pointer_id: 6,
+                pointer_id: 0,
                 x: 50,
                 y: 60
             }],

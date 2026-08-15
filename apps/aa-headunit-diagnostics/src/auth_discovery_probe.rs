@@ -407,8 +407,35 @@
 //! `platform_api::touch::TouchFrame`'s doc comment for the full citation.
 //! `action_index`/`action` are now non-optional (`u32`/`PointerAction`) in
 //! both `TouchFrame` and `encode_touch_report`, closing off the class of
-//! bug rather than just patching the two known instances. Not yet
-//! confirmed on real hardware.
+//! bug rather than just patching the two known instances.
+//!
+//! **Real-hardware result (third trial, `action_index` fix): no change.**
+//! 108 well-formed reports sent cleanly, zero protocol errors, but the
+//! operator confirmed drag/pinch still produced no visible effect —
+//! refuting `action_index` omission as *the* (or *a*) blocking cause, though
+//! the fix is independently correct and stayed in the code.
+//!
+//! **Fourth hypothesis, fixed and real-hardware-confirmed:** `pointer_id`
+//! itself. `MultiTouchTracker::to_point` (`platform_api::touch`) was passing
+//! the Linux kernel driver's raw `ABS_MT_TRACKING_ID` straight through as
+//! `pointer_id` — an ever-incrementing counter across the touchscreen's
+//! whole session lifetime, never reused. `f-io/LIVI`
+//! (`docs/protocol/livi-adoption.md`, formally adopted)
+//! `useProjectionTouch.ts`'s `alloc()`/`free()` does the opposite
+//! deliberately: it maps the browser's own similarly arbitrary
+//! `PointerEvent.pointerId` down to the smallest free non-negative integer
+//! per active contact, recycled on lift, and never sends the browser's raw
+//! id to the phone. `to_point` now uses the kernel's own `ABS_MT_SLOT`
+//! index as `pointer_id` instead — already small, bounded by the
+//! touchscreen's simultaneous-touch capability, and reused by the kernel
+//! itself, so no manual allocate/free bookkeeping was needed on this side.
+//! **Real-hardware result (fourth trial): CONFIRMED.** 257 single-finger and
+//! 232 two-finger `Moved` reports sent cleanly, zero protocol errors, and
+//! the operator directly confirmed **drag/swipe and pinch now work** on the
+//! real phone screen — closing this investigation. See
+//! `docs/protocol/touch-input-investigation.md` ("Trial 5") and
+//! `docs/protocol/livi-adoption.md`'s adopted-scope item 7 for the full
+//! record.
 //!
 //! **Attribution.** This probe's overall session-orchestration shape
 //! (version → TLS → auth → service discovery → channel setup → running)
