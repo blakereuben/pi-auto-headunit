@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 platform-api = { path = "../platform-api" }
+evdev = "=0.13.2"
 
 [lints]
 workspace = true

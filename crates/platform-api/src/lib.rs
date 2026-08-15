@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+mod touch;
+pub use touch::{MultiTouchTracker, RawTouchEvent, TouchFrame, TouchPhase, TouchPoint};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapabilityState {
     Absent,

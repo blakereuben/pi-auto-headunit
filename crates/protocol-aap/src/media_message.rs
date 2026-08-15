@@ -32,16 +32,24 @@ const MESSAGE_ID_SIZE: usize = 2;
 /// head-unit media stream itself (also `protocol_aap::video_setup`/
 /// `protocol_aap::audio_setup` — this project is a `MediaSinkService`, so
 /// the phone sends these, not us); `Ack` is the head-unit's flow-control
-/// reply to each (`encode_media_ack`, below). The rest (`_STOP`,
-/// microphone, UI config, audio underflow) are out of scope until
-/// something decodes or sends them, matching `Unknown` surviving
-/// round-trip the same way `ControlMessageId::Unknown` already does.
+/// reply to each (`encode_media_ack`, below); `Stop` is an empty
+/// (`aap_protobuf.service.media.shared.message.Stop` has no fields),
+/// unacknowledged notification the phone can send at any time while
+/// `Ready` — confirmed real-hardware behavior (observed on the `MediaAudio`
+/// channel immediately after an `AudioFocusRequest::GainTransientMayDuck`),
+/// confirmed unacknowledged from the pinned AASDK source
+/// (`VideoMediaSinkService::handleStopIndication` parses and forwards it to
+/// the app layer, but never calls `send()`). The rest (microphone, UI
+/// config, audio underflow) are out of scope until something decodes or
+/// sends them, matching `Unknown` surviving round-trip the same way
+/// `ControlMessageId::Unknown` already does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaMessageId {
     Data,
     CodecConfig,
     Setup,
     Start,
+    Stop,
     Config,
     Ack,
     VideoFocusRequest,
@@ -57,6 +65,7 @@ impl MediaMessageId {
             Self::CodecConfig => 1,
             Self::Setup => 32768,
             Self::Start => 32769,
+            Self::Stop => 32770,
             Self::Config => 32771,
             Self::Ack => 32772,
             Self::VideoFocusRequest => 32775,
@@ -71,6 +80,7 @@ impl MediaMessageId {
             1 => Self::CodecConfig,
             32768 => Self::Setup,
             32769 => Self::Start,
+            32770 => Self::Stop,
             32771 => Self::Config,
             32772 => Self::Ack,
             32775 => Self::VideoFocusRequest,
@@ -231,6 +241,7 @@ mod tests {
             MediaMessageId::CodecConfig,
             MediaMessageId::Setup,
             MediaMessageId::Start,
+            MediaMessageId::Stop,
             MediaMessageId::Config,
             MediaMessageId::Ack,
             MediaMessageId::VideoFocusRequest,

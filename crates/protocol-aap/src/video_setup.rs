@@ -160,6 +160,12 @@ pub enum VideoSetupAction {
     VideoFocusRequested {
         body_len: usize,
     },
+    /// A `Stop` arrived while `Ready` — an empty, unacknowledged notification
+    /// the phone can send at any time (real-hardware-confirmed; see
+    /// `MediaMessageId::Stop`'s doc comment). Not a state transition: stays
+    /// `Ready`, no reply is sent, matching the pinned AASDK source's own
+    /// `handleStopIndication` (parses and forwards, never calls `send()`).
+    StopReceived,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -444,6 +450,7 @@ impl VideoSetupStateMachine {
                     VideoFocusMode::Projected,
                 )),
             ]),
+            MediaMessageId::Stop => Ok(vec![VideoSetupAction::StopReceived]),
             other => Err(VideoSetupError::UnexpectedMediaMessage {
                 state: self.state,
                 id: other,
@@ -641,6 +648,29 @@ mod tests {
         };
         assert_eq!(ack.id, MediaMessageId::Ack);
         assert_eq!(ack.body, vec![0x08, 0x07, 0x10, 0x01]);
+    }
+
+    #[test]
+    fn stop_while_ready_is_a_no_reply_notification() {
+        let mut machine = VideoSetupStateMachine::new();
+        machine
+            .advance(VideoSetupEvent::InboundMedia(&setup_payload(
+                MEDIA_CODEC_VIDEO_H264_BP,
+            )))
+            .expect("setup");
+        machine
+            .advance(VideoSetupEvent::InboundMedia(&start_payload(1, 0)))
+            .expect("start");
+        assert_eq!(machine.state(), VideoSetupState::Ready);
+
+        let actions = machine
+            .advance(VideoSetupEvent::InboundMedia(&media_message(
+                MediaMessageId::Stop,
+                Vec::new(),
+            )))
+            .expect("stop");
+        assert_eq!(actions, vec![VideoSetupAction::StopReceived]);
+        assert_eq!(machine.state(), VideoSetupState::Ready);
     }
 
     #[test]

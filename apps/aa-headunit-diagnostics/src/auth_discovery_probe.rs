@@ -346,6 +346,70 @@
 //! `CodecConfig` on an audio channel is logged only, never pushed (see
 //! `media_gstreamer::audio`'s doc comment).
 //!
+//! Touch is the reverse direction from every other channel handled so far:
+//! the head unit is the `InputSourceService`, so it *sends* `InputReport`
+//! (`protocol_aap::encode_touch_report`) rather than receiving `Data`.
+//! `open_touch_source` discovers the DSI touchscreen's evdev node once
+//! before the receive loop starts (`platform_linux::touch::
+//! discover_touchscreen`, matching on both multitouch position axes rather
+//! than any kernel-assigned device name) and opens it
+//! (`EvdevTouchSource`), which spawns a background thread translating raw
+//! Linux "protocol B" multitouch events into `platform_api::TouchFrame`s —
+//! kept in a portable, evdev-free crate so `protocol-aap` and this probe
+//! never depend on `evdev` types directly. `service_touch_input`, called
+//! once per loop iteration exactly like `service_ping`, drains any queued
+//! frames and sends each proactively once the input channel has reached
+//! `ChannelOpenState::Open` — never before, since sending on an unopened
+//! channel would be a protocol violation. A missing touchscreen or evdev
+//! open failure is logged and demotes touch to permanently absent for the
+//! rest of the run, exactly like `video_render`/`media_pipelines`'s own
+//! failure posture: it never aborts the probe or affects protocol
+//! correctness. `PointerAction`'s wire values (`ACTION_DOWN`/`_UP`/
+//! `_MOVE`/`_POINTER_DOWN`/`_POINTER_UP` = 0/1/2/5/6) are exactly Android's
+//! own `MotionEvent.ACTION_*` constants, not an AASDK-specific invention —
+//! `MultiTouchTracker` (`platform_api::touch`) follows that same contract
+//! for `action_index`/multi-finger `points` membership, verified by its own
+//! unit tests rather than assumed.
+//!
+//! **Real-hardware result (first trial):** wire-level success, no visible
+//! effect. A real phone accepted 93 `InputReport`s across a full session
+//! (real touchscreen taps/drags, correct `Down`/`Moved`/`Up` sequencing)
+//! with zero protocol errors — the session reached a clean
+//! `observation_window_complete`, and video was genuinely rendering on the
+//! head unit's own display throughout. But touching the screen produced no
+//! observed reaction on the phone (confirmed by the operator watching the
+//! screen, not inferred from logs). `InputReport` has no wire-level ack, so
+//! this can't be diagnosed from protocol success alone. Leading hypothesis,
+//! now fixed and awaiting its own real-hardware trial: a coordinate-space
+//! mismatch. `TouchCapability` advertised the DSI panel's native 800x480
+//! resolution while `VideoConfiguration` advertises 1280x720, and touch
+//! reports were scaled into that same 800x480 space — but the pinned
+//! `OpenAuto` source rescales raw touchscreen pixels into the *display*
+//! (video) resolution before ever building an outgoing touch event
+//! (`InputDevice::handleTouchEvent`), strongly suggesting the phone maps
+//! touch against the frame buffer it renders, not the physical digitizer's
+//! own resolution. `TOUCH_COORDINATE_SPACE_WIDTH`/`_HEIGHT` now advertise
+//! and scale into 1280x720 instead — a single-variable, reversible change.
+//!
+//! **Real-hardware result (second trial, coordinate-space fix):** taps now
+//! land correctly (confirmed by the operator: "pressing on the screen
+//! worked"), proving the wire-level pipeline and coordinate scaling are
+//! both genuinely correct end to end. Continuous drag (pan) and multitouch
+//! (pinch) still did not register, despite 226 well-formed reports sent —
+//! including 197 `Moved` and several `PointerDown`/`PointerUp` frames — with
+//! zero protocol errors. Root-caused before a third trial: `action_index`
+//! was left unset (`None`) for `Moved`, and — a second, related instance of
+//! the same gap — for `Down`. `opencardev/openauto`'s current `main` branch
+//! (same org as this project's pinned `aasdk` fork, unlike the separately
+//! pinned `f1xpl/openauto`, already updated to this project's
+//! `InputReport`/`sendInputReport` schema) shows `action_index` is
+//! *always* sent, `0` for `Down`/plain movement — never omitted. See
+//! `platform_api::touch::TouchFrame`'s doc comment for the full citation.
+//! `action_index`/`action` are now non-optional (`u32`/`PointerAction`) in
+//! both `TouchFrame` and `encode_touch_report`, closing off the class of
+//! bug rather than just patching the two known instances. Not yet
+//! confirmed on real hardware.
+//!
 //! **Attribution.** This probe's overall session-orchestration shape
 //! (version → TLS → auth → service discovery → channel setup → running)
 //! follows AASDK revision `9bf6adf933665dee26532201719fac14a047ccf1` and
@@ -370,6 +434,8 @@ use media_gstreamer::{
     AudioFormat, AudioPlaybackPipeline, AudioSink, GstreamerBackend, RenderSink,
     VideoRenderPipeline,
 };
+use platform_api::TouchPhase;
+use platform_linux::touch::{EvdevTouchSource, discover_touchscreen};
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
     AudioSetupAction, AudioSetupEvent, AudioSetupStateMachine, AudioStreamType,
@@ -380,17 +446,18 @@ use protocol_aap::{
     FrameError, FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
     HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus,
     MediaMessageId, Message, MessageAssembler, MessageType, MicrophoneCapability, NavFocusType,
-    PingConfiguration, ProtocolLimits, SensorCapability, SensorMessage, SensorMessageId,
-    SensorType, ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue,
-    ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress, TouchCapability,
-    TouchScreenType, UiConfig, VideoCapability, VideoCodecResolution, VideoCodecType,
-    VideoFocusMode, VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupState,
-    VideoSetupStateMachine, decode_audio_focus_request, decode_byebye_request, decode_frame,
-    decode_key_binding_request, decode_nav_focus_request, decode_ping_response,
-    decode_sensor_request, encode_audio_focus_notification, encode_byebye_response,
-    encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
-    encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
-    encode_sensor_response, encode_service_discovery_response, encode_video_focus_notification,
+    PingConfiguration, PointerAction, ProtocolLimits, SensorCapability, SensorMessage,
+    SensorMessageId, SensorType, ServiceAvailability, ServiceCandidate, ServiceCapabilities,
+    ServiceCatalogue, ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress,
+    TouchCapability, TouchPointer, TouchScreenType, UiConfig, VideoCapability,
+    VideoCodecResolution, VideoCodecType, VideoFocusMode, VideoFrameRate, VideoSetupAction,
+    VideoSetupEvent, VideoSetupState, VideoSetupStateMachine, decode_audio_focus_request,
+    decode_byebye_request, decode_frame, decode_key_binding_request, decode_nav_focus_request,
+    decode_ping_response, decode_sensor_request, encode_audio_focus_notification,
+    encode_byebye_response, encode_driving_status_unrestricted_batch, encode_frame,
+    encode_key_binding_response, encode_nav_focus_notification, encode_night_mode_batch,
+    encode_ping_request, encode_sensor_response, encode_service_discovery_response,
+    encode_touch_report, encode_video_focus_notification,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::{HashMap, VecDeque};
@@ -565,11 +632,29 @@ const SPEECH_AUDIO_CHANNEL_ID: u8 = 5;
 const SENSORS_CHANNEL_ID: u8 = 6;
 const BLUETOOTH_CHANNEL_ID: u8 = 7;
 const MICROPHONE_CHANNEL_ID: u8 = 8;
-/// The Pi 5 reference display: the official 7-inch DSI touchscreen,
-/// matching the 800x480/30fps baseline already selected in
-/// `ARCHITECTURE.md`/M3.
-const REFERENCE_DISPLAY_WIDTH: i32 = 800;
-const REFERENCE_DISPLAY_HEIGHT: i32 = 480;
+/// The coordinate space touch reports must be sent in: the negotiated
+/// video resolution (`VideoCodecResolution::Video1280x720`,
+/// `build_service_capabilities` below), **not** the DSI touchscreen's own
+/// native panel resolution (800x480). Confirmed from the pinned `OpenAuto`
+/// source: `InputDevice::handleTouchEvent`
+/// (`src/autoapp/Projection/InputDevice.cpp`) explicitly rescales raw
+/// touchscreen pixels into `displayGeometry_` — the video output
+/// resolution — before an event ever reaches `InputService::onTouchEvent`,
+/// which then sends `event.x`/`event.y` unchanged; the phone maps touch
+/// against the frame buffer it is actually rendering, not the physical
+/// digitizer's own pixel count. A real-hardware trial that instead
+/// advertised/scaled touch to the panel's native 800x480 (while video
+/// stayed 1280x720) sent well-formed reports with zero protocol errors but
+/// produced no visible reaction on the phone — consistent with, though not
+/// yet proof of, this coordinate-space mismatch; this constant is the
+/// single-variable fix under test.
+const TOUCH_COORDINATE_SPACE_WIDTH: i32 = 1280;
+const TOUCH_COORDINATE_SPACE_HEIGHT: i32 = 720;
+/// Same dimensions as [`TOUCH_COORDINATE_SPACE_WIDTH`]/
+/// [`TOUCH_COORDINATE_SPACE_HEIGHT`], as `u32` — what raw evdev touch
+/// coordinates are actually scaled into (`open_touch_source`).
+const TOUCH_COORDINATE_SPACE_WIDTH_PIXELS: u32 = TOUCH_COORDINATE_SPACE_WIDTH.unsigned_abs();
+const TOUCH_COORDINATE_SPACE_HEIGHT_PIXELS: u32 = TOUCH_COORDINATE_SPACE_HEIGHT.unsigned_abs();
 /// `OpenAuto`'s `ServiceFactory` defaults (`MediaAudioService`: 2ch/16-bit/48kHz;
 /// `SpeechAudioService`/`SystemAudioService`/`AudioInputService`: 1ch/16-bit/16kHz),
 /// not invented values.
@@ -855,6 +940,7 @@ pub fn run<T: SessionTransport>(
     // ServiceDiscoveryResponse is sent, then populated with one entry per
     // advertised channel_id.
     let mut simple_channels: HashMap<u8, ChannelOpenStateMachine> = HashMap::new();
+    let touch_source = open_touch_source();
 
     while Instant::now() < deadline {
         let size = match transport.receive(&mut read_buffer) {
@@ -889,16 +975,28 @@ pub fn run<T: SessionTransport>(
         if stop {
             return Ok(());
         }
-        service_ping(
+        service_proactive_sends(
             &mut ping_state,
             &experiment_flags,
             reactive_frame_processed,
+            touch_source.as_ref(),
+            &simple_channels,
             transport,
             &mut tls,
             limits,
         )?;
     }
 
+    finish_probe_after_timeout(channel_setup_complete, &tls)
+}
+
+/// `run()`'s outcome once its deadline is reached without an earlier
+/// explicit stop — split out purely to keep `run()` itself under
+/// `clippy::too_many_lines`.
+fn finish_probe_after_timeout(
+    channel_setup_complete: bool,
+    tls: &OpenSslTlsClient,
+) -> Result<(), CliError> {
     if channel_setup_complete {
         println!("probe_result=observation_window_complete");
         return Ok(());
@@ -1305,6 +1403,139 @@ fn service_ping<T: SessionTransport>(
     Ok(())
 }
 
+/// Every proactive (not-a-reply) send `run()`'s loop attempts once per
+/// iteration, grouped into one call purely to keep `run()` itself under
+/// `clippy::too_many_lines`.
+#[allow(clippy::too_many_arguments)]
+fn service_proactive_sends<T: SessionTransport>(
+    ping_state: &mut Option<PingState>,
+    flags: &ExperimentFlags,
+    reactive_frame_processed: bool,
+    touch_source: Option<&EvdevTouchSource>,
+    simple_channels: &HashMap<u8, ChannelOpenStateMachine>,
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    service_ping(
+        ping_state,
+        flags,
+        reactive_frame_processed,
+        transport,
+        tls,
+        limits,
+    )?;
+    let input_open = simple_channels
+        .get(&INPUT_CHANNEL_ID)
+        .is_some_and(|machine| machine.state() == ChannelOpenState::Open);
+    service_touch_input(touch_source, input_open, transport, tls, limits)
+}
+
+/// Best-effort touchscreen discovery, run once before the receive loop
+/// starts. Mirrors `video_render`/`media_pipelines`' posture: a missing or
+/// unopenable touchscreen is logged and never fails the probe — the head
+/// unit may simply not be attached to a display yet (e.g. an SSH-only
+/// session), and touch input has no bearing on protocol correctness.
+fn open_touch_source() -> Option<EvdevTouchSource> {
+    let path = match discover_touchscreen() {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            println!("probe_state=touch_input_unavailable reason=no_touchscreen_found");
+            return None;
+        }
+        Err(error) => {
+            println!("probe_state=touch_input_unavailable reason=discovery_failed error={error}");
+            return None;
+        }
+    };
+    match EvdevTouchSource::open(
+        &path,
+        TOUCH_COORDINATE_SPACE_WIDTH_PIXELS,
+        TOUCH_COORDINATE_SPACE_HEIGHT_PIXELS,
+    ) {
+        Ok(source) => {
+            println!(
+                "probe_state=touch_input_source_opened path={}",
+                path.display()
+            );
+            Some(source)
+        }
+        Err(error) => {
+            println!("probe_state=touch_input_unavailable reason=open_failed error={error}");
+            None
+        }
+    }
+}
+
+/// Maps `platform_api::TouchPhase` onto the wire `PointerAction` it always
+/// corresponds to (both are literally Android's own `MotionEvent.ACTION_*`
+/// contract — see `protocol_aap::PointerAction`'s doc comment).
+const fn touch_wire_action(phase: TouchPhase) -> PointerAction {
+    match phase {
+        TouchPhase::Down => PointerAction::Down,
+        TouchPhase::Up => PointerAction::Up,
+        TouchPhase::Moved => PointerAction::Moved,
+        TouchPhase::PointerDown => PointerAction::PointerDown,
+        TouchPhase::PointerUp => PointerAction::PointerUp,
+    }
+}
+
+/// Drains every touch frame queued since the last call and sends each as an
+/// `InputReport` — proactive, not a reply to anything the phone sent, so
+/// this only runs once the input channel has actually reached `Open`
+/// (sending on an unopened channel would be a protocol violation the phone
+/// has no reason to expect).
+fn service_touch_input<T: SessionTransport>(
+    touch_source: Option<&EvdevTouchSource>,
+    input_open: bool,
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    if !input_open {
+        return Ok(());
+    }
+    let Some(touch_source) = touch_source else {
+        return Ok(());
+    };
+    while let Some(frame) = touch_source.try_recv() {
+        let pointers: Vec<TouchPointer> = frame
+            .points
+            .iter()
+            .map(|point| TouchPointer {
+                x: point.x,
+                y: point.y,
+                pointer_id: point.pointer_id,
+            })
+            .collect();
+        let message = encode_touch_report(
+            frame.timestamp_micros,
+            &pointers,
+            frame.action_index,
+            touch_wire_action(frame.phase),
+        );
+        let payload = message
+            .encode(DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE)
+            .map_err(|error| CliError::Protocol(error.to_string()))?;
+        send_encrypted(
+            transport,
+            tls,
+            INPUT_CHANNEL_ID,
+            MessageType::Specific,
+            &payload,
+            limits,
+        )?;
+        // Coordinates are never logged, matching the no-raw-payload-logging
+        // rule applied to media `Data`/`CodecConfig` elsewhere in this file.
+        println!(
+            "probe_state=touch_report_sent phase={:?} pointer_count={}",
+            frame.phase,
+            frame.points.len()
+        );
+    }
+    Ok(())
+}
+
 /// The `AA_HEADUNIT_PING_ISOLATION` experiment's substitute message: a
 /// duplicate, unsolicited `VideoFocusNotification(Projected)` on the video
 /// channel — the same message/value this probe already sends exactly once,
@@ -1474,9 +1705,10 @@ fn build_service_capabilities() -> ServiceCapabilities {
         // decodes H.264 so far (see `start_video_render_pipeline`).
         //
         // Resolution tier: `VideoCodecResolution::Video1280x720`, not the
-        // real Pi 5 reference display's actual 800x480
-        // (`REFERENCE_DISPLAY_WIDTH`/`REFERENCE_DISPLAY_HEIGHT`, still used
-        // unchanged for `TouchCapability` below). This is a deliberate,
+        // real Pi 5 reference display's actual native 800x480 panel
+        // resolution. `TouchCapability` below now advertises this same
+        // 1280x720 tier rather than the panel's native resolution — see
+        // `TOUCH_COORDINATE_SPACE_WIDTH`'s doc comment. This is a deliberate,
         // single-variable, reversible real-hardware experiment — LIVI
         // advertised 1280x720, not 800x480, in the same known-good capture
         // that first surfaced H.265 (`docs/protocol/error-2-investigation.md`,
@@ -1520,8 +1752,8 @@ fn build_service_capabilities() -> ServiceCapabilities {
             },
         ]),
         touch: Some(TouchCapability {
-            width: REFERENCE_DISPLAY_WIDTH,
-            height: REFERENCE_DISPLAY_HEIGHT,
+            width: TOUCH_COORDINATE_SPACE_WIDTH,
+            height: TOUCH_COORDINATE_SPACE_HEIGHT,
             touch_type: TouchScreenType::Capacitive,
         }),
         media_audio: Some(AudioCapability {
@@ -1657,9 +1889,7 @@ fn handle_video_channel_message<T: SessionTransport>(
                     VideoSetupAction::Ready {
                         session_id,
                         configuration_index,
-                    } => {
-                        handle_video_start_received(video_render, session_id, configuration_index);
-                    }
+                    } => handle_video_start_received(video_render, session_id, configuration_index),
                     VideoSetupAction::MediaDataReceived { timestamp, payload } => {
                         println!("probe_state=video_media_data_received");
                         println!("video_media_data_timestamp={timestamp}");
@@ -1678,6 +1908,7 @@ fn handle_video_channel_message<T: SessionTransport>(
                     VideoSetupAction::VideoFocusRequested { body_len } => {
                         log_video_focus_requested(body_len);
                     }
+                    VideoSetupAction::StopReceived => log_video_stop_received(),
                 }
             }
             Ok(())
@@ -1735,6 +1966,12 @@ fn new_video_render_state() -> VideoRenderState {
 fn log_video_focus_requested(body_len: usize) {
     println!("probe_state=video_focus_requested");
     println!("video_focus_request_bytes={body_len}");
+}
+
+/// Logs `VideoSetupAction::StopReceived` — see `MediaMessageId::Stop`'s doc
+/// comment; no reply is sent and the channel stays `Ready`.
+fn log_video_stop_received() {
+    println!("probe_state=video_channel_stop_received");
 }
 
 /// Handles `VideoSetupAction::Ready` (video `Start` accepted). Index 0 is
@@ -1844,6 +2081,13 @@ fn log_audio_media_data_received(label: &str, timestamp: u64, byte_len: usize) {
     println!("probe_state={label}_media_data_received");
     println!("{label}_media_data_timestamp={timestamp}");
     println!("{label}_media_data_bytes={byte_len}");
+}
+
+/// Logs `AudioSetupAction::StopReceived` for any of the three audio
+/// channels — see `MediaMessageId::Stop`'s doc comment; no reply is sent
+/// and the channel stays `Ready`.
+fn log_audio_stop_received(label: &str) {
+    println!("probe_state={label}_channel_stop_received");
 }
 
 /// Lazily builds and starts one audio channel's real PCM playback pipeline
@@ -2018,6 +2262,7 @@ fn handle_media_audio_channel_message<T: SessionTransport>(
                         println!("probe_state=media_audio_media_codec_config_received");
                         println!("media_audio_media_codec_config_bytes={}", payload.len());
                     }
+                    AudioSetupAction::StopReceived => log_audio_stop_received("media_audio"),
                 }
             }
             Ok(())
@@ -2133,6 +2378,7 @@ fn handle_system_audio_channel_message<T: SessionTransport>(
                         println!("probe_state=system_audio_media_codec_config_received");
                         println!("system_audio_media_codec_config_bytes={}", payload.len());
                     }
+                    AudioSetupAction::StopReceived => log_audio_stop_received("system_audio"),
                 }
             }
             Ok(())
@@ -2249,6 +2495,7 @@ fn handle_speech_audio_channel_message<T: SessionTransport>(
                         println!("probe_state=speech_audio_media_codec_config_received");
                         println!("speech_audio_media_codec_config_bytes={}", payload.len());
                     }
+                    AudioSetupAction::StopReceived => log_audio_stop_received("speech_audio"),
                 }
             }
             Ok(())

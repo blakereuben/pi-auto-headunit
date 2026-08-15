@@ -82,6 +82,12 @@ pub enum AudioSetupAction {
     CodecConfigReceived {
         payload: Vec<u8>,
     },
+    /// A `Stop` arrived while `Ready` — an empty, unacknowledged notification
+    /// the phone can send at any time (real-hardware-confirmed; see
+    /// `MediaMessageId::Stop`'s doc comment). Not a state transition: stays
+    /// `Ready`, no reply is sent, matching the pinned AASDK source's own
+    /// `handleStopIndication` (parses and forwards, never calls `send()`).
+    StopReceived,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,6 +344,7 @@ impl AudioSetupStateMachine {
                 },
                 AudioSetupAction::SendMedia(encode_media_ack(session_id)),
             ]),
+            MediaMessageId::Stop => Ok(vec![AudioSetupAction::StopReceived]),
             other => Err(AudioSetupError::UnexpectedMediaMessage {
                 state: self.state,
                 id: other,
@@ -504,6 +511,29 @@ mod tests {
         };
         assert_eq!(ack.id, MediaMessageId::Ack);
         assert_eq!(ack.body, vec![0x08, 0x07, 0x10, 0x01]);
+    }
+
+    #[test]
+    fn stop_while_ready_is_a_no_reply_notification() {
+        let mut machine = AudioSetupStateMachine::new();
+        machine
+            .advance(AudioSetupEvent::InboundMedia(&setup_payload(
+                MEDIA_CODEC_AUDIO_PCM,
+            )))
+            .expect("setup");
+        machine
+            .advance(AudioSetupEvent::InboundMedia(&start_payload(1, 0)))
+            .expect("start");
+        assert_eq!(machine.state(), AudioSetupState::Ready);
+
+        let actions = machine
+            .advance(AudioSetupEvent::InboundMedia(&media_message(
+                MediaMessageId::Stop,
+                Vec::new(),
+            )))
+            .expect("stop");
+        assert_eq!(actions, vec![AudioSetupAction::StopReceived]);
+        assert_eq!(machine.state(), AudioSetupState::Ready);
     }
 
     #[test]

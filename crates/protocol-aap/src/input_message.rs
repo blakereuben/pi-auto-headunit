@@ -6,11 +6,13 @@ use crate::protobuf::{self, ProtobufDecodeError};
 // (protobuf/aap_protobuf/service/inputsource/InputMessageId.proto),
 // KeyBindingRequest/KeyBindingResponse protobuf schema
 // (protobuf/aap_protobuf/service/media/sink/message/KeyBindingRequest.proto,
-// KeyBindingResponse.proto), the shared MessageStatus enum
+// KeyBindingResponse.proto), InputReport/TouchEvent/PointerAction protobuf
+// schema (protobuf/aap_protobuf/service/inputsource/message/InputReport.proto,
+// TouchEvent.proto, PointerAction.proto), the shared MessageStatus enum
 // (protobuf/aap_protobuf/shared/MessageStatus.proto), and
-// InputSourceService's messageHandler/sendKeyBindingResponse dispatch
-// (src/Channel/InputSource/InputSourceService.cpp), at the pinned project
-// revision (9bf6adf933665dee26532201719fac14a047ccf1).
+// InputSourceService's messageHandler/sendKeyBindingResponse/sendInputReport
+// dispatch (src/Channel/InputSource/InputSourceService.cpp), at the pinned
+// project revision (9bf6adf933665dee26532201719fac14a047ccf1).
 // Copyright (C) 2018 f1x.studio (Michal Szwaj)
 // Copyright (C) 2024 CubeOne (Simon Dean)
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -18,13 +20,12 @@ use crate::protobuf::{self, ProtobufDecodeError};
 pub const DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE: usize = 1024 * 1024;
 const MESSAGE_ID_SIZE: usize = 2;
 
-/// `aap_protobuf.service.inputsource.InputMessageId`. Only the two values
-/// this increment's key-binding exchange needs are named; the rest
-/// (`INPUT_MESSAGE_INPUT_REPORT`, `_INPUT_FEEDBACK`) are out of scope until
-/// something decodes or sends them, matching `MediaMessageId::Unknown`
-/// surviving round-trip the same way.
+/// `aap_protobuf.service.inputsource.InputMessageId`. `INPUT_MESSAGE_INPUT_FEEDBACK`
+/// is the only value still out of scope until something decodes or sends
+/// it, matching `MediaMessageId::Unknown` surviving round-trip the same way.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputMessageId {
+    InputReport,
     KeyBindingRequest,
     KeyBindingResponse,
     Unknown(u16),
@@ -34,6 +35,7 @@ impl InputMessageId {
     #[must_use]
     pub const fn wire_value(self) -> u16 {
         match self {
+            Self::InputReport => 32769,
             Self::KeyBindingRequest => 32770,
             Self::KeyBindingResponse => 32771,
             Self::Unknown(value) => value,
@@ -42,6 +44,7 @@ impl InputMessageId {
 
     const fn from_wire(value: u16) -> Self {
         match value {
+            32769 => Self::InputReport,
             32770 => Self::KeyBindingRequest,
             32771 => Self::KeyBindingResponse,
             value => Self::Unknown(value),
@@ -245,6 +248,93 @@ pub fn encode_key_binding_response(status: KeyBindingStatus) -> InputMessage {
     }
 }
 
+/// One finger's current position in `TouchEvent.pointer_data` (nested
+/// `Pointer` message). `pointer_id` must stay stable for the same physical
+/// finger across an entire down-move-up sequence — callers derive it from
+/// the touch driver's own per-contact tracking id, not a freshly assigned
+/// counter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TouchPointer {
+    pub x: u32,
+    pub y: u32,
+    pub pointer_id: u32,
+}
+
+/// `aap_protobuf.service.inputsource.message.PointerAction`. Numeric values
+/// (0, 1, 2, 5, 6) are exactly Android's own `MotionEvent.ACTION_DOWN` /
+/// `_UP` / `_MOVE` / `_POINTER_DOWN` / `_POINTER_UP` constants, not an
+/// AASDK-specific invention — `action`/`action_index` follow the same
+/// `MotionEvent` contract: for `Down`/`Up`/`Moved` there is exactly one
+/// relevant index (`0`); for `PointerDown`/`PointerUp` (a second or later
+/// finger joining/leaving while others stay down) `pointer_data` lists
+/// every currently active finger and `action_index` names which entry just
+/// changed. Both fields are always sent — never omitted, even for `Moved`
+/// — confirmed against `opencardev/openauto`'s current `main` branch
+/// (`InputSourceService::onTouchEvent` unconditionally calls
+/// `touchEvent->set_action_index(...)`); see `platform_api::touch::TouchFrame`'s
+/// doc comment for the real-hardware finding that surfaced this.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PointerAction {
+    Down,
+    Up,
+    Moved,
+    PointerDown,
+    PointerUp,
+}
+
+impl PointerAction {
+    const fn wire_value(self) -> i32 {
+        match self {
+            Self::Down => 0,
+            Self::Up => 1,
+            Self::Moved => 2,
+            Self::PointerDown => 5,
+            Self::PointerUp => 6,
+        }
+    }
+}
+
+/// Encodes an `InputReport` carrying one `TouchEvent` as an input-channel
+/// message — the head unit reporting its own touchscreen back to the phone
+/// (the reverse direction from `KeyBindingRequest`/`Response`). `timestamp`
+/// is the report's own clock reading; this project has no confirmed real
+/// phone behaviour pinning its unit, so callers should use the same
+/// microseconds convention already assumed for media `Data` PTS
+/// (`media_message`'s doc comment) for consistency, not because it is
+/// independently confirmed here.
+#[must_use]
+pub fn encode_touch_report(
+    timestamp: u64,
+    pointers: &[TouchPointer],
+    action_index: u32,
+    action: PointerAction,
+) -> InputMessage {
+    let mut touch_event = Vec::new();
+    for pointer in pointers {
+        let mut pointer_body = Vec::new();
+        protobuf::write_uint32_field(&mut pointer_body, 1, pointer.x);
+        protobuf::write_uint32_field(&mut pointer_body, 2, pointer.y);
+        protobuf::write_uint32_field(&mut pointer_body, 3, pointer.pointer_id);
+        // TouchEvent.pointer_data (field 1, repeated Pointer).
+        protobuf::write_length_delimited_field(&mut touch_event, 1, &pointer_body);
+    }
+    // TouchEvent.action_index (field 2, optional uint32) and .action (field
+    // 3, optional PointerAction enum) — always written; see this
+    // function's doc comment for why neither is ever omitted.
+    protobuf::write_uint32_field(&mut touch_event, 2, action_index);
+    protobuf::write_int32_field(&mut touch_event, 3, action.wire_value());
+
+    let mut body = Vec::new();
+    // InputReport.timestamp (field 1, required uint64).
+    protobuf::write_uint64_field(&mut body, 1, timestamp);
+    // InputReport.touch_event (field 3, optional TouchEvent).
+    protobuf::write_length_delimited_field(&mut body, 3, &touch_event);
+    InputMessage {
+        id: InputMessageId::InputReport,
+        body,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +350,7 @@ mod tests {
     #[test]
     fn known_ids_round_trip_through_their_wire_values() {
         for id in [
+            InputMessageId::InputReport,
             InputMessageId::KeyBindingRequest,
             InputMessageId::KeyBindingResponse,
         ] {
@@ -372,5 +463,67 @@ mod tests {
                 0x08, 0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01
             ]
         );
+    }
+
+    #[test]
+    fn encodes_a_single_finger_down_report_with_exact_bytes() {
+        let message = encode_touch_report(
+            5,
+            &[TouchPointer {
+                x: 10,
+                y: 20,
+                pointer_id: 0,
+            }],
+            0,
+            PointerAction::Down,
+        );
+        assert_eq!(message.id, InputMessageId::InputReport);
+        // InputReport{timestamp=5, touch_event=TouchEvent{
+        //   pointer_data=[Pointer{x=10,y=20,pointer_id=0}],
+        //   action_index=0, action=ACTION_DOWN(0)}}. Every value here is
+        // <128, so each varint is exactly one byte — safe to spell out by
+        // hand; larger values are covered by the round-trip test below
+        // instead of a hand-computed multi-byte varint.
+        let expected_pointer = [0x08, 10, 0x10, 20, 0x18, 0x00];
+        assert_eq!(expected_pointer.len(), 6);
+        let mut expected_touch_event = vec![0x0a, 6];
+        expected_touch_event.extend_from_slice(&expected_pointer);
+        expected_touch_event.extend_from_slice(&[0x10, 0x00, 0x18, 0x00]);
+        assert_eq!(expected_touch_event.len(), 12);
+        let mut expected_body = vec![0x08, 5, 0x1a, 12];
+        expected_body.extend_from_slice(&expected_touch_event);
+        assert_eq!(message.body, expected_body);
+    }
+
+    #[test]
+    fn encodes_a_two_finger_report_listing_both_pointers() {
+        let message = encode_touch_report(
+            2000,
+            &[
+                TouchPointer {
+                    x: 10,
+                    y: 20,
+                    pointer_id: 0,
+                },
+                TouchPointer {
+                    x: 30,
+                    y: 40,
+                    pointer_id: 1,
+                },
+            ],
+            1,
+            PointerAction::PointerDown,
+        );
+        let payload = message
+            .encode(DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE)
+            .expect("encode");
+        let decoded =
+            InputMessage::decode(&payload, DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE).expect("decode");
+        assert_eq!(decoded.id, InputMessageId::InputReport);
+        assert_eq!(decoded.body, message.body);
+        // Both Pointer sub-messages and the trailing action_index/action
+        // fields are present, in encounter order.
+        assert!(message.body.windows(2).any(|w| w == [0x08, 10]));
+        assert!(message.body.windows(2).any(|w| w == [0x08, 30]));
     }
 }

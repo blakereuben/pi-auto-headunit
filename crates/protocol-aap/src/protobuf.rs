@@ -168,6 +168,15 @@ pub(crate) fn write_uint32_field(out: &mut Vec<u8>, field: u32, value: u32) {
     write_varint(out, u64::from(value));
 }
 
+/// Writes a proto2 `uint64` field — same wire encoding as
+/// [`write_uint32_field`], taken directly as `u64` (no widening cast) for
+/// fields whose value can exceed `u32::MAX`, such as a microsecond
+/// timestamp.
+pub(crate) fn write_uint64_field(out: &mut Vec<u8>, field: u32, value: u64) {
+    write_tag(out, field, 0);
+    write_varint(out, value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

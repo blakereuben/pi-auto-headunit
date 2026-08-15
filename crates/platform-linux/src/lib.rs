@@ -6,6 +6,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+pub mod touch;
+
 #[must_use]
 pub fn system_inventory() -> SystemInventory {
     let os_release = parse_key_value_file(Path::new("/etc/os-release")).unwrap_or_default();
