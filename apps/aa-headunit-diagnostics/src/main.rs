@@ -15,6 +15,9 @@ mod credentials;
 #[cfg(target_os = "linux")]
 mod session_supervisor;
 
+#[cfg(target_os = "linux")]
+mod connection_state;
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match run(&args) {
@@ -306,21 +309,29 @@ fn developer_auth_discovery_probe(tls12_compatibility: bool) -> Result<(), CliEr
     use std::path::Path;
     use std::time::Duration;
 
-    let paths = credential_store::CredentialPaths::from(
-        credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
-            .map_err(|error| CliError::Credentials(error.to_string()))?,
-    );
-    let credentials = credential_store::load_credentials(&paths, true)
-        .map_err(|error| CliError::Credentials(error.to_string()))?;
-    let mut transport = transport_tcp::DeveloperTcpTransport::connect(
-        transport_tcp::DEFAULT_DEVELOPER_ADDRESS,
-        Duration::from_secs(2),
-        Duration::from_millis(500),
-    )
-    .map_err(CliError::Transport)?;
-    println!("developer_transport=tcp");
-    println!("developer_endpoint={}", transport.peer());
-    auth_discovery_probe::run(&mut transport, tls12_compatibility, credentials.material)
+    connection_state::report(connection_state::ConnectionState::Ready);
+    let result = (|| -> Result<(), CliError> {
+        let paths = credential_store::CredentialPaths::from(
+            credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
+                .map_err(|error| CliError::Credentials(error.to_string()))?,
+        );
+        let credentials = credential_store::load_credentials(&paths, true)
+            .map_err(|error| CliError::Credentials(error.to_string()))?;
+        connection_state::report(connection_state::ConnectionState::Connecting);
+        let mut transport = transport_tcp::DeveloperTcpTransport::connect(
+            transport_tcp::DEFAULT_DEVELOPER_ADDRESS,
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+        )
+        .map_err(CliError::Transport)?;
+        println!("developer_transport=tcp");
+        println!("developer_endpoint={}", transport.peer());
+        auth_discovery_probe::run(&mut transport, tls12_compatibility, credentials.material)
+    })();
+    if result.is_err() {
+        connection_state::report(connection_state::ConnectionState::Error);
+    }
+    result
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -927,34 +938,42 @@ fn usb_auth_discovery_probe(selector: &str, tls12_compatibility: bool) -> Result
 
     const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-    let paths = credential_store::CredentialPaths::from(
-        credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
-            .map_err(|error| CliError::Credentials(error.to_string()))?,
-    );
-    let credentials = credential_store::load_credentials(&paths, true)
-        .map_err(|error| CliError::Credentials(error.to_string()))?;
+    connection_state::report(connection_state::ConnectionState::Ready);
+    let result = (|| -> Result<(), CliError> {
+        let paths = credential_store::CredentialPaths::from(
+            credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
+                .map_err(|error| CliError::Credentials(error.to_string()))?,
+        );
+        let credentials = credential_store::load_credentials(&paths, true)
+            .map_err(|error| CliError::Credentials(error.to_string()))?;
 
-    let (bus, address) = transport_usb::parse_bus_address(selector).map_err(CliError::Aoa)?;
-    let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
-    let candidate = backend
-        .list_devices()
-        .map_err(CliError::Aoa)?
-        .into_iter()
-        .find(|device| device.bus == bus && device.address == address)
-        .ok_or(CliError::Aoa(transport_api::AoaError::Unplugged))?;
+        let (bus, address) = transport_usb::parse_bus_address(selector).map_err(CliError::Aoa)?;
+        let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
+        let candidate = backend
+            .list_devices()
+            .map_err(CliError::Aoa)?
+            .into_iter()
+            .find(|device| device.bus == bus && device.address == address)
+            .ok_or(CliError::Aoa(transport_api::AoaError::Unplugged))?;
 
-    println!("probe_authorization=operator_confirmed");
-    println!("probe_payload_logging=disabled");
-    println!("probe_state=preparing_accessory_transport");
-    let mut aoa = AoaMachine::new(backend, PROBE_TIMEOUT);
-    let outcome = aoa
-        .run(candidate, &AoaIdentification::receiver_probe())
-        .map_err(CliError::Aoa)?;
-    let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
-    let mut transport = backend
-        .open_claimed_session_transport(&outcome.transport.device)
-        .map_err(CliError::Aoa)?;
-    auth_discovery_probe::run(&mut transport, tls12_compatibility, credentials.material)
+        println!("probe_authorization=operator_confirmed");
+        println!("probe_payload_logging=disabled");
+        println!("probe_state=preparing_accessory_transport");
+        connection_state::report(connection_state::ConnectionState::Connecting);
+        let mut aoa = AoaMachine::new(backend, PROBE_TIMEOUT);
+        let outcome = aoa
+            .run(candidate, &AoaIdentification::receiver_probe())
+            .map_err(CliError::Aoa)?;
+        let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
+        let mut transport = backend
+            .open_claimed_session_transport(&outcome.transport.device)
+            .map_err(CliError::Aoa)?;
+        auth_discovery_probe::run(&mut transport, tls12_compatibility, credentials.material)
+    })();
+    if result.is_err() {
+        connection_state::report(connection_state::ConnectionState::Error);
+    }
+    result
 }
 
 #[cfg(not(target_os = "linux"))]

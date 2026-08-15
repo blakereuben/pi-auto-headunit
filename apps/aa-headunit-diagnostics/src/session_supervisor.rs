@@ -16,6 +16,12 @@
 //! Real-hardware validation is a manual multi-cycle unplug/replug trial
 //! instead (see `docs/protocol/` trial-record conventions used elsewhere
 //! in this project).
+//!
+//! Each cycle's `attempt` also reports the coarse `connection_state`
+//! (`crate::connection_state`) alongside these `probe_state=`/
+//! `supervisor_*` lines: `Ready` before device resolution, `Connecting`
+//! once the device is found, and `Error` from `supervise` on either
+//! outcome — retrying or fatal.
 
 use std::path::Path;
 use std::time::Duration;
@@ -102,12 +108,14 @@ where
                 println!(
                     "probe_state=supervisor_cycle_result cycle={cycle} outcome=retrying reason={error}"
                 );
+                crate::connection_state::report(crate::connection_state::ConnectionState::Error);
                 std::thread::sleep(retry_backoff);
             }
             Err(error) => {
                 println!(
                     "probe_state=supervisor_cycle_result cycle={cycle} outcome=fatal reason={error}"
                 );
+                crate::connection_state::report(crate::connection_state::ConnectionState::Error);
                 return Err(error);
             }
         }
@@ -143,6 +151,7 @@ impl SupervisedSession {
     /// fresh load is cheap (only happens on reconnect events) and picks up
     /// a credential rotation without restarting the supervisor.
     fn attempt(&mut self, cycle: u32) -> Result<(), CliError> {
+        crate::connection_state::report(crate::connection_state::ConnectionState::Ready);
         let paths = credential_store::CredentialPaths::from(
             credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
                 .map_err(|error| CliError::Credentials(error.to_string()))?,
@@ -165,6 +174,7 @@ impl SupervisedSession {
                 .map_err(CliError::Aoa)?,
         };
         println!("probe_state=supervisor_device_resolved cycle={cycle} device={candidate}");
+        crate::connection_state::report(crate::connection_state::ConnectionState::Connecting);
         self.last_known = Some(candidate.clone());
 
         let mut aoa = AoaMachine::new(backend, AOA_TRANSITION_TIMEOUT);

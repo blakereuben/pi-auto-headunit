@@ -1064,6 +1064,9 @@ fn report_probe_outcome(outcome: &ProbeOutcome, channel_setup_complete: &mut boo
             if !*channel_setup_complete {
                 println!("probe_state=channel_setup_complete");
                 println!("probe_state=observing_for_post_start_media_traffic");
+                crate::connection_state::report(
+                    crate::connection_state::ConnectionState::Connected,
+                );
                 *channel_setup_complete = true;
             }
             false
