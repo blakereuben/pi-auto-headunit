@@ -123,6 +123,14 @@ pub struct VideoCapability {
     pub resolution: VideoCodecResolution,
     pub frame_rate: VideoFrameRate,
     pub codec: VideoCodecType,
+    /// `VideoConfiguration.density` (field 5, optional `uint32`) — a
+    /// display-density value in dpi. Never populated before this — see
+    /// `docs/protocol/error-2-investigation.md`, "TLS-decrypted LIVI
+    /// session capture": a real, decrypted `f-io/LIVI` session (TLS
+    /// session-keylog + raw `usbmon` capture, not source-code reuse) shows
+    /// it advertising `density = 180` for its 1280x720 tier, a field this
+    /// project has never populated at all.
+    pub density: Option<u32>,
     /// `VideoConfiguration.pixel_aspect_ratio_e4` (field 8, optional
     /// `uint32`) — a fixed-point pixel-aspect-ratio value scaled by 10000,
     /// e.g. `10000` for a 1:1 (square-pixel) ratio. Never populated before
@@ -454,6 +462,10 @@ fn encode_media_sink_service(capabilities: &[VideoCapability]) -> Vec<u8> {
             2,
             capability.frame_rate.wire_value(),
         );
+        if let Some(density) = capability.density {
+            // VideoConfiguration.density (field 5, optional uint32).
+            protobuf::write_uint32_field(&mut video_configuration, 5, density);
+        }
         if let Some(pixel_aspect_ratio_e4) = capability.pixel_aspect_ratio_e4 {
             // VideoConfiguration.pixel_aspect_ratio_e4 (field 8, optional uint32).
             protobuf::write_uint32_field(&mut video_configuration, 8, pixel_aspect_ratio_e4);
@@ -633,6 +645,7 @@ mod tests {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
                 codec: VideoCodecType::H264,
+                density: None,
                 pixel_aspect_ratio_e4: None,
                 ui_config: None,
             }]),
@@ -675,6 +688,7 @@ mod tests {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
                 codec: VideoCodecType::H264,
+                density: None,
                 pixel_aspect_ratio_e4: Some(10000),
                 ui_config: None,
             }]),
@@ -700,6 +714,49 @@ mod tests {
                 0x08, 0x01, // VideoConfiguration.codec_resolution = 1 (800x480)
                 0x10, 0x02, // VideoConfiguration.frame_rate = 2 (30fps)
                 0x40, 0x90, 0x4e, // VideoConfiguration.pixel_aspect_ratio_e4 = 10000
+                0x50, 0x03, // VideoConfiguration.video_codec_type = 3 (H264 BP)
+            ]
+        );
+    }
+
+    #[test]
+    fn encodes_density_with_exact_bytes() {
+        let catalogue = catalogue(&[ServiceCandidate {
+            channel_id: 1,
+            kind: ServiceKind::Video,
+            availability: ServiceAvailability::Ready,
+        }]);
+        let capabilities = ServiceCapabilities {
+            video: Some(vec![VideoCapability {
+                resolution: VideoCodecResolution::Video800x480,
+                frame_rate: VideoFrameRate::Fps30,
+                codec: VideoCodecType::H264,
+                density: Some(180),
+                pixel_aspect_ratio_e4: None,
+                ui_config: None,
+            }]),
+            touch: None,
+            media_audio: None,
+            system_audio: None,
+            speech_audio: None,
+            bluetooth: None,
+            microphone: None,
+            sensors: None,
+            head_unit_info: None,
+            ping_configuration: None,
+        };
+
+        let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
+        assert_eq!(
+            message.body,
+            vec![
+                0x0a, 0x0f, // channels (field 1), length 15
+                0x08, 0x01, // Service.id = 1
+                0x1a, 0x0b, // Service.media_sink_service (field 3), length 11
+                0x22, 0x09, // MediaSinkService.video_configs (field 4), length 9
+                0x08, 0x01, // VideoConfiguration.codec_resolution = 1 (800x480)
+                0x10, 0x02, // VideoConfiguration.frame_rate = 2 (30fps)
+                0x28, 0xb4, 0x01, // VideoConfiguration.density = 180
                 0x50, 0x03, // VideoConfiguration.video_codec_type = 3 (H264 BP)
             ]
         );
@@ -842,6 +899,7 @@ mod tests {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
                 codec: VideoCodecType::H264,
+                density: None,
                 pixel_aspect_ratio_e4: None,
                 ui_config: None,
             }]),
@@ -1068,6 +1126,7 @@ mod tests {
                 resolution: VideoCodecResolution::Video800x480,
                 frame_rate: VideoFrameRate::Fps30,
                 codec: VideoCodecType::H264,
+                density: None,
                 pixel_aspect_ratio_e4: None,
                 ui_config: None,
             }]),

@@ -222,6 +222,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
             resolution: VideoCodecResolution::Video800x480,
             frame_rate: VideoFrameRate::Fps30,
             codec: VideoCodecType::H264,
+            density: None,
             pixel_aspect_ratio_e4: None,
             ui_config: None,
         }]),

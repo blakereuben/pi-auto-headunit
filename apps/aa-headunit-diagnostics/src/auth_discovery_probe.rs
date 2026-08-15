@@ -1358,11 +1358,19 @@ fn build_service_capabilities() -> ServiceCapabilities {
         // 800x480 didn't change the phone's codec choice, so resolution
         // tier is now the variable under test, isolated from touch/display
         // capability, which stays truthful to the real target hardware.
+        // frame_rate=Fps60 and density=180 both come from a real,
+        // TLS-decrypted `f-io/LIVI` session capture (session-keylog +
+        // usbmon, not source-code reuse — see
+        // `docs/protocol/error-2-investigation.md`, "TLS-decrypted LIVI
+        // session capture"): the exact wire bytes LIVI sends for its own
+        // 1280x720 tier. This project had only ever advertised Fps30 and
+        // never populated `density` at all.
         video: Some(vec![
             VideoCapability {
                 resolution: VideoCodecResolution::Video1280x720,
-                frame_rate: VideoFrameRate::Fps30,
+                frame_rate: VideoFrameRate::Fps60,
                 codec: VideoCodecType::H264,
+                density: Some(180),
                 // 10000 = 1:1 (square-pixel) ratio, matching LIVI's own
                 // observed value (`PAR e4=10000`) — the only
                 // `VideoConfiguration` field difference left after both
@@ -1378,8 +1386,9 @@ fn build_service_capabilities() -> ServiceCapabilities {
             },
             VideoCapability {
                 resolution: VideoCodecResolution::Video1280x720,
-                frame_rate: VideoFrameRate::Fps30,
+                frame_rate: VideoFrameRate::Fps60,
                 codec: VideoCodecType::Hevc,
+                density: Some(180),
                 pixel_aspect_ratio_e4: Some(10000),
                 ui_config: Some(UiConfig::default()),
             },
