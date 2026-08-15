@@ -18,6 +18,9 @@ mod session_supervisor;
 #[cfg(target_os = "linux")]
 mod connection_state;
 
+#[cfg(target_os = "linux")]
+mod gtk_dev_ui;
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match run(&args) {
@@ -206,6 +209,23 @@ fn run(args: &[String]) -> Result<(), CliError> {
         {
             usb_session_supervisor(selector, true, Some(parse_cycles(cycles)?))
         }
+        [group, command, device_flag, selector, allow]
+            if group == "usb"
+                && command == "gtk-dev-ui"
+                && device_flag == "--device"
+                && allow == "--allow-live-aap" =>
+        {
+            usb_gtk_dev_ui(selector, false)
+        }
+        [group, command, device_flag, selector, allow, compatibility]
+            if group == "usb"
+                && command == "gtk-dev-ui"
+                && device_flag == "--device"
+                && allow == "--allow-live-aap"
+                && compatibility == "--tls12-compat" =>
+        {
+            usb_gtk_dev_ui(selector, true)
+        }
         [] | [..] if args.iter().any(|arg| arg == "--help" || arg == "-h") => {
             print_help();
             Ok(())
@@ -241,6 +261,7 @@ fn print_help() {
            usb credential-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
            usb auth-discovery-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
            usb session-supervisor --device BUS:ADDRESS --allow-live-aap [--tls12-compat] [--max-cycles COUNT]\n\
+           usb gtk-dev-ui --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
          \n\
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
         env!("CARGO_PKG_VERSION")
@@ -326,7 +347,12 @@ fn developer_auth_discovery_probe(tls12_compatibility: bool) -> Result<(), CliEr
         .map_err(CliError::Transport)?;
         println!("developer_transport=tcp");
         println!("developer_endpoint={}", transport.peer());
-        auth_discovery_probe::run(&mut transport, tls12_compatibility, credentials.material)
+        auth_discovery_probe::run(
+            &mut transport,
+            tls12_compatibility,
+            credentials.material,
+            auth_discovery_probe::VideoRenderTarget::Wayland,
+        )
     })();
     if result.is_err() {
         connection_state::report(connection_state::ConnectionState::Error);
@@ -968,7 +994,12 @@ fn usb_auth_discovery_probe(selector: &str, tls12_compatibility: bool) -> Result
         let mut transport = backend
             .open_claimed_session_transport(&outcome.transport.device)
             .map_err(CliError::Aoa)?;
-        auth_discovery_probe::run(&mut transport, tls12_compatibility, credentials.material)
+        auth_discovery_probe::run(
+            &mut transport,
+            tls12_compatibility,
+            credentials.material,
+            auth_discovery_probe::VideoRenderTarget::Wayland,
+        )
     })();
     if result.is_err() {
         connection_state::report(connection_state::ConnectionState::Error);
@@ -992,6 +1023,16 @@ fn usb_session_supervisor(
 
 #[cfg(not(target_os = "linux"))]
 fn usb_session_supervisor(_: &str, _: bool, _: Option<u32>) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+fn usb_gtk_dev_ui(selector: &str, tls12_compatibility: bool) -> Result<(), CliError> {
+    gtk_dev_ui::run(selector, tls12_compatibility)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn usb_gtk_dev_ui(_: &str, _: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 

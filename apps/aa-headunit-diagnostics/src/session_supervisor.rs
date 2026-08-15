@@ -189,6 +189,7 @@ impl SupervisedSession {
             &mut transport,
             self.tls12_compatibility,
             credentials.material,
+            crate::auth_discovery_probe::VideoRenderTarget::Wayland,
         )
     }
 }

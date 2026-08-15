@@ -458,7 +458,7 @@
 use credential_store::CredentialMaterial;
 use media_api::{DecoderCapability, DecoderKind, VideoCodec as DecoderVideoCodec};
 use media_gstreamer::{
-    AudioFormat, AudioPlaybackPipeline, AudioSink, GstreamerBackend, RenderSink,
+    AudioFormat, AudioPlaybackPipeline, AudioSink, GstreamerBackend, GstreamerError, RenderSink,
     VideoRenderPipeline,
 };
 use platform_api::TouchPhase;
@@ -489,6 +489,7 @@ use protocol_aap::{
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::{HashMap, VecDeque};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use transport_api::{SessionTransport, TransportError};
 
@@ -756,6 +757,66 @@ enum VideoRenderState {
     Failed,
 }
 
+/// Where a session's decoded video actually gets displayed. `Wayland` is
+/// today's only behavior, used unmodified by all three existing callers of
+/// [`run`] (`usb_auth_discovery_probe`/`developer_auth_discovery_probe` in
+/// `main.rs`, `session_supervisor::SupervisedSession::attempt`) via
+/// `VideoRenderTarget::Wayland`. `Gtk4Window` is new: pipeline
+/// construction is handed off to whichever thread owns the GTK main loop
+/// (see [`Gtk4WindowHandoff`]) — this type never touches `gtk4`/`gdk4`
+/// itself, keeping GTK confined to `gtk_dev_ui.rs`.
+pub(crate) enum VideoRenderTarget {
+    Wayland,
+    Gtk4Window(Gtk4WindowHandoff),
+}
+
+/// One-shot request/response channel pair, used at most once per session
+/// (video render construction is already lazy/single-shot — see
+/// `start_video_render_pipeline`'s `NotStarted` guard). `request` sends the
+/// negotiated [`DecoderCapability`] and blocks, bounded by
+/// [`GTK_PIPELINE_HANDOFF_TIMEOUT`], for the GTK-owning thread to build,
+/// wire into its `gtk::Picture`, and start a `RenderSink::Gtk4Paintable`
+/// pipeline — mirroring the exact build → retrieve-paintable →
+/// set-on-`Picture` → present → start ordering the real-hardware-confirmed
+/// GTK4 spike (`crates/media-gstreamer/examples/gtk_fullscreen_spike.rs`)
+/// proved correct, just executed from a poll callback instead of directly
+/// inside `connect_activate`.
+pub(crate) struct Gtk4WindowHandoff {
+    pub(crate) capability_sender: mpsc::Sender<DecoderCapability>,
+    pub(crate) pipeline_receiver: mpsc::Receiver<Result<VideoRenderPipeline, GstreamerError>>,
+}
+
+/// Well under `PING_WATCHDOG_TIMEOUT` (5s) — deliberately, not just
+/// generously. `ping_state` is armed before video `Start` ever arrives,
+/// and `service_ping` kills the whole session if `last_pong.elapsed() >=
+/// PING_WATCHDOG_TIMEOUT` the next time it runs, which happens in the same
+/// loop iteration right after this blocking handoff returns. A timeout
+/// anywhere close to 5s would let a slow-but-successful handoff get its
+/// pipeline built and then have the session killed immediately after, for
+/// a reason unrelated to real link health. Real GTK pipeline construction
+/// is sub-second in the spike's own real-hardware timing, so 3s stays
+/// generous while staying safely clear of the watchdog.
+const GTK_PIPELINE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(3);
+
+impl Gtk4WindowHandoff {
+    fn request(
+        &self,
+        capability: DecoderCapability,
+    ) -> Result<VideoRenderPipeline, GstreamerError> {
+        self.capability_sender
+            .send(capability)
+            .map_err(|_| GstreamerError::Initialization("GTK window thread is gone".into()))?;
+        self.pipeline_receiver
+            .recv_timeout(GTK_PIPELINE_HANDOFF_TIMEOUT)
+            .map_err(|_| {
+                GstreamerError::Initialization(
+                    "timed out waiting for the GTK window thread to build the render pipeline"
+                        .into(),
+                )
+            })?
+    }
+}
+
 /// Lifecycle of the real PCM playback pipeline for one audio channel
 /// (`MediaAudio`/`SystemAudio`/`SpeechAudio` each get their own instance),
 /// independent of that channel's own protocol state — same shape and same
@@ -909,10 +970,20 @@ fn read_experiment_flags() -> ExperimentFlags {
     }
 }
 
+// `video_render_target` is only ever borrowed inside this function (passed
+// down as `&video_render_target`), never moved-from — an intentional API
+// choice, not an oversight clippy should flag: `run` must own it for the
+// whole session so the caller can't keep using `Gtk4WindowHandoff`'s
+// channels after handing off, and `VideoRenderTarget` isn't `Clone` (it
+// holds a non-`Clone` `mpsc::Receiver`), so a `&VideoRenderTarget`
+// parameter here would just push the same ownership decision onto every
+// caller instead.
+#[allow(clippy::needless_pass_by_value)]
 pub fn run<T: SessionTransport>(
     transport: &mut T,
     tls12_compatibility: bool,
     credentials: CredentialMaterial,
+    video_render_target: VideoRenderTarget,
 ) -> Result<(), CliError> {
     println!("probe_scope=version_tls_auth_and_service_discovery_summary");
     println!("probe_credentials=user_supplied_runtime");
@@ -1008,6 +1079,7 @@ pub fn run<T: SessionTransport>(
             &mut system_audio_channel,
             &mut speech_audio_channel,
             &mut media_pipelines,
+            &video_render_target,
             &mut sensors_channel,
             &mut simple_channels,
             &mut ping_state,
@@ -1099,6 +1171,7 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
     system_audio_channel: &mut Option<SystemAudioChannel>,
     speech_audio_channel: &mut Option<SpeechAudioChannel>,
     media_pipelines: &mut MediaPipelines,
+    video_render_target: &VideoRenderTarget,
     sensors_channel: &mut Option<SensorsChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     ping_state: &mut Option<PingState>,
@@ -1130,6 +1203,7 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
             system_audio_channel,
             speech_audio_channel,
             media_pipelines,
+            video_render_target,
             sensors_channel,
             simple_channels,
             ping_state,
@@ -1188,6 +1262,7 @@ fn handle_message<T: SessionTransport>(
     system_audio_channel: &mut Option<SystemAudioChannel>,
     speech_audio_channel: &mut Option<SpeechAudioChannel>,
     media_pipelines: &mut MediaPipelines,
+    video_render_target: &VideoRenderTarget,
     sensors_channel: &mut Option<SensorsChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     ping_state: &mut Option<PingState>,
@@ -1236,6 +1311,7 @@ fn handle_message<T: SessionTransport>(
             message,
             video_channel,
             &mut media_pipelines.video_render,
+            video_render_target,
             tls,
             transport,
             limits,
@@ -1879,6 +1955,7 @@ fn handle_video_channel_message<T: SessionTransport>(
     message: &Message,
     video_channel: &mut Option<VideoChannel>,
     video_render: &mut VideoRenderState,
+    video_render_target: &VideoRenderTarget,
     tls: &mut OpenSslTlsClient,
     transport: &mut T,
     limits: ProtocolLimits,
@@ -1914,74 +1991,101 @@ fn handle_video_channel_message<T: SessionTransport>(
             *state = VideoChannel::Open(VideoSetupStateMachine::new());
             Ok(())
         }
-        VideoChannel::Open(machine) => {
-            if message.message_type != MessageType::Specific {
-                return Err(CliError::Protocol(
-                    "expected a video-channel media message".into(),
-                ));
+        VideoChannel::Open(machine) => handle_video_channel_open_message(
+            message,
+            machine,
+            video_render,
+            video_render_target,
+            tls,
+            transport,
+            limits,
+        ),
+    }
+}
+
+/// The `VideoChannel::Open` arm of `handle_video_channel_message`, split
+/// out purely to keep that function under `clippy::too_many_lines` — no
+/// behavior change from when this was inline.
+#[allow(clippy::too_many_arguments)]
+fn handle_video_channel_open_message<T: SessionTransport>(
+    message: &Message,
+    machine: &mut VideoSetupStateMachine,
+    video_render: &mut VideoRenderState,
+    video_render_target: &VideoRenderTarget,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    if message.message_type != MessageType::Specific {
+        return Err(CliError::Protocol(
+            "expected a video-channel media message".into(),
+        ));
+    }
+    let actions = machine
+        .advance(VideoSetupEvent::InboundMedia(&message.payload))
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    for action in actions {
+        match action {
+            VideoSetupAction::SetupRequested { codec_type } => {
+                println!("probe_state=video_setup_requested");
+                println!("video_setup_codec_type={codec_type}");
             }
-            let actions = machine
-                .advance(VideoSetupEvent::InboundMedia(&message.payload))
-                .map_err(|error| CliError::Protocol(error.to_string()))?;
-            for action in actions {
-                match action {
-                    VideoSetupAction::SetupRequested { codec_type } => {
-                        println!("probe_state=video_setup_requested");
-                        println!("video_setup_codec_type={codec_type}");
+            VideoSetupAction::SendMedia(response) => {
+                let payload = response
+                    .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+                let response_id = response.id;
+                send_encrypted(
+                    transport,
+                    tls,
+                    VIDEO_CHANNEL_ID,
+                    MessageType::Specific,
+                    &payload,
+                    limits,
+                )?;
+                match response_id {
+                    MediaMessageId::VideoFocusNotification => {
+                        println!("probe_state=video_channel_video_focus_notification_sent");
                     }
-                    VideoSetupAction::SendMedia(response) => {
-                        let payload = response
-                            .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
-                            .map_err(|error| CliError::Protocol(error.to_string()))?;
-                        let response_id = response.id;
-                        send_encrypted(
-                            transport,
-                            tls,
-                            VIDEO_CHANNEL_ID,
-                            MessageType::Specific,
-                            &payload,
-                            limits,
-                        )?;
-                        match response_id {
-                            MediaMessageId::VideoFocusNotification => {
-                                println!("probe_state=video_channel_video_focus_notification_sent");
-                            }
-                            MediaMessageId::Ack => {
-                                println!("probe_state=video_channel_ack_sent");
-                            }
-                            _ => {
-                                println!("probe_state=video_channel_setup_config_sent");
-                            }
-                        }
+                    MediaMessageId::Ack => {
+                        println!("probe_state=video_channel_ack_sent");
                     }
-                    VideoSetupAction::Ready {
-                        session_id,
-                        configuration_index,
-                    } => handle_video_start_received(video_render, session_id, configuration_index),
-                    VideoSetupAction::MediaDataReceived { timestamp, payload } => {
-                        println!("probe_state=video_media_data_received");
-                        println!("video_media_data_timestamp={timestamp}");
-                        println!("video_media_data_bytes={}", payload.len());
-                        apply_to_running_pipeline(video_render, |pipeline| {
-                            pipeline.push_frame(&payload, timestamp)
-                        });
+                    _ => {
+                        println!("probe_state=video_channel_setup_config_sent");
                     }
-                    VideoSetupAction::CodecConfigReceived { payload } => {
-                        println!("probe_state=video_media_codec_config_received");
-                        println!("video_media_codec_config_bytes={}", payload.len());
-                        apply_to_running_pipeline(video_render, |pipeline| {
-                            pipeline.push_codec_config(&payload)
-                        });
-                    }
-                    VideoSetupAction::VideoFocusRequested { body_len } => {
-                        log_video_focus_requested(body_len);
-                    }
-                    VideoSetupAction::StopReceived => log_video_stop_received(),
                 }
             }
-            Ok(())
+            VideoSetupAction::Ready {
+                session_id,
+                configuration_index,
+            } => handle_video_start_received(
+                video_render,
+                session_id,
+                configuration_index,
+                video_render_target,
+            ),
+            VideoSetupAction::MediaDataReceived { timestamp, payload } => {
+                println!("probe_state=video_media_data_received");
+                println!("video_media_data_timestamp={timestamp}");
+                println!("video_media_data_bytes={}", payload.len());
+                apply_to_running_pipeline(video_render, |pipeline| {
+                    pipeline.push_frame(&payload, timestamp)
+                });
+            }
+            VideoSetupAction::CodecConfigReceived { payload } => {
+                println!("probe_state=video_media_codec_config_received");
+                println!("video_media_codec_config_bytes={}", payload.len());
+                apply_to_running_pipeline(video_render, |pipeline| {
+                    pipeline.push_codec_config(&payload)
+                });
+            }
+            VideoSetupAction::VideoFocusRequested { body_len } => {
+                log_video_focus_requested(body_len);
+            }
+            VideoSetupAction::StopReceived => log_video_stop_received(),
         }
     }
+    Ok(())
 }
 
 /// Runs `push` against the pipeline only if `video_render` is currently
@@ -2052,6 +2156,7 @@ fn handle_video_start_received(
     video_render: &mut VideoRenderState,
     session_id: i32,
     configuration_index: u32,
+    target: &VideoRenderTarget,
 ) {
     println!("probe_state=video_channel_start_received");
     println!("video_channel_session_id={session_id}");
@@ -2060,7 +2165,7 @@ fn handle_video_start_received(
         0 => DecoderVideoCodec::H264,
         _ => DecoderVideoCodec::Hevc,
     };
-    start_video_render_pipeline(video_render, codec);
+    start_video_render_pipeline(video_render, codec, target);
 }
 
 /// Lazily builds and starts the real decode/render pipeline once (on the
@@ -2071,7 +2176,11 @@ fn handle_video_start_received(
 /// never returns an error or aborts the probe, since rendering is
 /// independent of protocol correctness (see `VideoRenderState`'s doc
 /// comment).
-fn start_video_render_pipeline(video_render: &mut VideoRenderState, codec: DecoderVideoCodec) {
+fn start_video_render_pipeline(
+    video_render: &mut VideoRenderState,
+    codec: DecoderVideoCodec,
+    target: &VideoRenderTarget,
+) {
     if !matches!(video_render, VideoRenderState::NotStarted(_)) {
         return;
     }
@@ -2096,9 +2205,29 @@ fn start_video_render_pipeline(video_render: &mut VideoRenderState, codec: Decod
         maximum_height: 720,
         maximum_frames_per_second: 60,
     };
-    match backend.build_video_render_pipeline(&capability, RenderSink::Wayland) {
-        Ok(pipeline) => match pipeline.start() {
-            Ok(()) => {
+    match target {
+        VideoRenderTarget::Wayland => {
+            match backend.build_video_render_pipeline(&capability, RenderSink::Wayland) {
+                Ok(pipeline) => match pipeline.start() {
+                    Ok(()) => {
+                        println!("probe_state=video_render_pipeline_started");
+                        *video_render = VideoRenderState::Running(pipeline);
+                    }
+                    Err(error) => {
+                        println!("probe_state=video_render_pipeline_start_failed");
+                        println!("video_render_error={error}");
+                        *video_render = VideoRenderState::Failed;
+                    }
+                },
+                Err(error) => {
+                    println!("probe_state=video_render_pipeline_build_failed");
+                    println!("video_render_error={error}");
+                    *video_render = VideoRenderState::Failed;
+                }
+            }
+        }
+        VideoRenderTarget::Gtk4Window(handoff) => match handoff.request(capability) {
+            Ok(pipeline) => {
                 println!("probe_state=video_render_pipeline_started");
                 *video_render = VideoRenderState::Running(pipeline);
             }
@@ -2108,11 +2237,6 @@ fn start_video_render_pipeline(video_render: &mut VideoRenderState, codec: Decod
                 *video_render = VideoRenderState::Failed;
             }
         },
-        Err(error) => {
-            println!("probe_state=video_render_pipeline_build_failed");
-            println!("video_render_error={error}");
-            *video_render = VideoRenderState::Failed;
-        }
     }
 }
 
