@@ -30,6 +30,7 @@ mod service_discovery;
 mod service_discovery_response;
 mod tls;
 mod video_setup;
+mod voice_session;
 
 pub use assembly::{AssemblyError, Message, MessageAssembler};
 pub use audio_focus::{
@@ -86,6 +87,7 @@ pub use video_setup::{
     VideoFocusMode, VideoSetupAction, VideoSetupError, VideoSetupEvent, VideoSetupState,
     VideoSetupStateMachine, encode_video_focus_notification,
 };
+pub use voice_session::{VoiceSessionError, VoiceSessionStatus, decode_voice_session_notification};
 
 pub const AASDK_MAX_FRAME_PAYLOAD_SIZE: usize = 0x4000;
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;

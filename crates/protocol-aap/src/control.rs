@@ -49,6 +49,7 @@ pub enum ControlMessageId {
     NavFocusNotification,
     ByeByeRequest,
     ByeByeResponse,
+    VoiceSessionNotification,
     AudioFocusRequest,
     AudioFocusNotification,
     Unknown(u16),
@@ -72,6 +73,7 @@ impl ControlMessageId {
             Self::NavFocusNotification => 14,
             Self::ByeByeRequest => 15,
             Self::ByeByeResponse => 16,
+            Self::VoiceSessionNotification => 17,
             Self::AudioFocusRequest => 18,
             Self::AudioFocusNotification => 19,
             Self::Unknown(value) => value,
@@ -94,6 +96,7 @@ impl ControlMessageId {
             14 => Self::NavFocusNotification,
             15 => Self::ByeByeRequest,
             16 => Self::ByeByeResponse,
+            17 => Self::VoiceSessionNotification,
             18 => Self::AudioFocusRequest,
             19 => Self::AudioFocusNotification,
             value => Self::Unknown(value),
@@ -438,6 +441,15 @@ mod tests {
         message
             .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
             .expect("encode")
+    }
+
+    #[test]
+    fn voice_session_notification_wire_value_round_trips() {
+        assert_eq!(ControlMessageId::VoiceSessionNotification.wire_value(), 17);
+        assert_eq!(
+            ControlMessageId::from_wire(17),
+            ControlMessageId::VoiceSessionNotification
+        );
     }
 
     #[test]

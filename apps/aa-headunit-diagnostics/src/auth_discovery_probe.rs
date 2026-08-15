@@ -480,11 +480,12 @@ use protocol_aap::{
     VideoCodecResolution, VideoCodecType, VideoFocusMode, VideoFrameRate, VideoSetupAction,
     VideoSetupEvent, VideoSetupState, VideoSetupStateMachine, decode_audio_focus_request,
     decode_byebye_request, decode_frame, decode_key_binding_request, decode_nav_focus_request,
-    decode_ping_response, decode_sensor_request, encode_audio_focus_notification,
-    encode_byebye_response, encode_driving_status_unrestricted_batch, encode_frame,
-    encode_key_binding_response, encode_nav_focus_notification, encode_night_mode_batch,
-    encode_ping_request, encode_sensor_response, encode_service_discovery_response,
-    encode_touch_report, encode_video_focus_notification,
+    decode_ping_response, decode_sensor_request, decode_voice_session_notification,
+    encode_audio_focus_notification, encode_byebye_response,
+    encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
+    encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
+    encode_sensor_response, encode_service_discovery_response, encode_touch_report,
+    encode_video_focus_notification,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::{HashMap, VecDeque};
@@ -500,6 +501,22 @@ use crate::CliError;
 /// would eventually send `Data`/`CodecConfig`. Directly analogous to the
 /// earlier 10s→30s experiment already proven safe (no behavioral
 /// difference observed then, beyond the intended longer window).
+///
+/// Was temporarily raised to 120s for a `SystemAudio`/`SpeechAudio`
+/// verification trial (these two channels only carry data when the phone
+/// actually has something to say, e.g. a nav voice prompt or a system
+/// notification tone, unlike `MediaAudio` which starts as soon as any media
+/// plays) — reverted back to 30s since neither channel could be reliably
+/// triggered from this environment (no working microphone for voice
+/// prompts; stationary rig, so no real turn-by-turn nav; no easy way to
+/// generate a phone notification on demand). `SystemAudio`/`SpeechAudio`
+/// remain built (same code path as the confirmed-working `MediaAudio`) but
+/// unverified with real data. One real, previously-unmapped gap was found
+/// and fixed along the way: a text-message notification made a real phone
+/// send `ControlMessageId::VoiceSessionNotification` (wire id 17,
+/// undocumented in this project until now), which crashed the whole probe
+/// since any unmapped control message was a hard error — see
+/// `crates/protocol-aap/src/voice_session.rs`'s module doc comment.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Extended observation budget used only when
 /// `AA_HEADUNIT_SURVIVE_PROACTIVE_WRITE_TIMEOUT` is set (see that
@@ -1283,12 +1300,25 @@ fn handle_message<T: SessionTransport>(
 /// Handles control-channel traffic that arrives after `HandshakeStateMachine`
 /// has already reached `ServiceDiscoveryReceived` (which has nothing further
 /// to do — see `docs/protocol/error-2-investigation.md`). `AudioFocusRequest`,
-/// `PingResponse`, `NavFocusRequest`, and `ByeByeRequest` are handled;
-/// anything else fails closed with a clear, distinct error naming the
-/// unexpected message, so if the phone sends something new next, that's
-/// immediately visible rather than silently swallowed. Returns
-/// `Some(reason)` only for `ByeByeRequest` — the protocol's own explicit
-/// session-end signal, which `run()` treats as a clean stop, not an error.
+/// `PingResponse`, `NavFocusRequest`, `VoiceSessionNotification`, and
+/// `ByeByeRequest` are handled; anything else fails closed with a clear,
+/// distinct error naming the unexpected message, so if the phone sends
+/// something new next, that's immediately visible rather than silently
+/// swallowed. Returns `Some(reason)` only for `ByeByeRequest` — the
+/// protocol's own explicit session-end signal, which `run()` treats as a
+/// clean stop, not an error.
+///
+/// `VoiceSessionNotification` (wire id 17, `START`/`END`) was discovered as
+/// a real, previously-unmapped gap by a real phone: it arrived, unprompted,
+/// during ordinary notification-readout use and crashed the whole probe,
+/// since any `ControlMessageId::Unknown` here was a hard error. Decoded and
+/// logged only, no reply sent — `f-io/LIVI`'s `ControlChannel.ts`
+/// (`docs/protocol/livi-adoption.md`) documents this as "no response
+/// expected (matches aasdk + openauto behaviour)" for the ordinary
+/// phone-initiated case; see `crates/protocol-aap/src/voice_session.rs`'s
+/// module doc comment for the full citation, including the separate
+/// head-unit-initiated push-to-talk path this project has no working
+/// microphone hardware to exercise.
 fn handle_post_discovery_control_message<T: SessionTransport>(
     message: &Message,
     ping_state: &mut Option<PingState>,
@@ -1339,6 +1369,13 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
                 .map_err(|error| CliError::Protocol(error.to_string()))?;
             send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits)?;
             println!("probe_state=nav_focus_notification_sent");
+            Ok(None)
+        }
+        ControlMessageId::VoiceSessionNotification => {
+            let status = decode_voice_session_notification(&control_message.body)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            println!("probe_state=voice_session_notification_received");
+            println!("voice_session_status={status:?}");
             Ok(None)
         }
         ControlMessageId::ByeByeRequest => {
