@@ -9,10 +9,10 @@ use crate::protobuf::{self, ProtobufDecodeError};
 // `9bf6adf933665dee26532201719fac14a047ccf1`,
 // `docs/protocol/aasdk-adoption.md`), the same source `nav_focus.rs`/
 // `audio_focus.rs` use for their own wire schemas. Wire id 17 discovered on
-// a real phone (`docs/protocol/touch-input-investigation.md`'s sibling
-// audio investigation; a real device sent this, unprompted, during ordinary
-// notification-readout use — not something reproducible from fixtures
-// alone). `ControlServiceChannel.hpp` shows AASDK models this
+// a real phone, unprompted, when a WhatsApp message notification arrived
+// during a `SystemAudio`/`SpeechAudio` verification trial — not something
+// reproducible from fixtures alone. `ControlServiceChannel.hpp` shows AASDK
+// models this
 // bidirectionally (a `sendVoiceSessionFocusResponse` HU-to-phone path
 // exists, presumably for a head-unit-initiated push-to-talk session this
 // project doesn't have working microphone hardware to exercise); for the

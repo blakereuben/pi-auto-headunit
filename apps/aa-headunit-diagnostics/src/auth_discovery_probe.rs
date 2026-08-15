@@ -512,7 +512,7 @@ use crate::CliError;
 /// generate a phone notification on demand). `SystemAudio`/`SpeechAudio`
 /// remain built (same code path as the confirmed-working `MediaAudio`) but
 /// unverified with real data. One real, previously-unmapped gap was found
-/// and fixed along the way: a text-message notification made a real phone
+/// and fixed along the way: a `WhatsApp` message notification made a real phone
 /// send `ControlMessageId::VoiceSessionNotification` (wire id 17,
 /// undocumented in this project until now), which crashed the whole probe
 /// since any unmapped control message was a hard error — see
@@ -1310,8 +1310,9 @@ fn handle_message<T: SessionTransport>(
 ///
 /// `VoiceSessionNotification` (wire id 17, `START`/`END`) was discovered as
 /// a real, previously-unmapped gap by a real phone: it arrived, unprompted,
-/// during ordinary notification-readout use and crashed the whole probe,
-/// since any `ControlMessageId::Unknown` here was a hard error. Decoded and
+/// when a `WhatsApp` message notification came in during a trial, and crashed
+/// the whole probe, since any `ControlMessageId::Unknown` here was a hard
+/// error. Decoded and
 /// logged only, no reply sent — `f-io/LIVI`'s `ControlChannel.ts`
 /// (`docs/protocol/livi-adoption.md`) documents this as "no response
 /// expected (matches aasdk + openauto behaviour)" for the ordinary
