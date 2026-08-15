@@ -52,10 +52,24 @@ impl VideoRenderPipeline {
         elements: PipelineElements,
         sink: RenderSink,
     ) -> Result<Self, GstreamerError> {
+        // `waylandsink` defaults `fullscreen` to `false` (confirmed via
+        // `gst-inspect-1.0 waylandsink`) and creates a plain toplevel window
+        // sized to the negotiated video resolution — never actually
+        // requesting fullscreen from the compositor. On the reference DSI
+        // display (800x480) this happened to look full-screen only because
+        // the negotiated 1280x720 video exceeds the panel size, an
+        // accident of resolution, not a real request; a real-hardware
+        // trial showed a session where the same 1280x720 negotiation did
+        // *not* visually cover the screen, confirming this was never
+        // reliable. `elements.sink` stays the plain "waylandsink" name
+        // (still required for `ElementFactory::find` lookups elsewhere,
+        // e.g. `GstreamerBackend::verify_pipeline_elements`); the
+        // `fullscreen=true` property is only added to this parse-launch
+        // description string.
         let sink_element = match sink {
-            RenderSink::Wayland => elements.sink,
-            RenderSink::Fake => "fakesink",
-            RenderSink::Gtk4Paintable => "gtk4paintablesink name=gtk_paintable_sink",
+            RenderSink::Wayland => format!("{} fullscreen=true", elements.sink),
+            RenderSink::Fake => "fakesink".to_string(),
+            RenderSink::Gtk4Paintable => "gtk4paintablesink name=gtk_paintable_sink".to_string(),
         };
         let description = format!(
             "appsrc name=src is-live=true format=time \
