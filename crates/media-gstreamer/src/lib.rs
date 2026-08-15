@@ -20,13 +20,24 @@ pub struct PipelineElements {
     pub decoder: &'static str,
     pub converter: &'static str,
     pub sink: &'static str,
+    /// `appsrc`'s caps string for this codec's Annex-B byte-stream framing
+    /// (`video/x-h264` or `video/x-h265`) — must match `parser`/`decoder`,
+    /// since an H.264-typed `appsrc` feeding `h265parse` (or vice versa) is
+    /// a caps mismatch, not a real sink.
+    pub caps: &'static str,
 }
 
 #[must_use]
 pub fn pipeline_elements(capability: &DecoderCapability) -> PipelineElements {
-    let parser = match capability.codec {
-        VideoCodec::H264 => "h264parse",
-        VideoCodec::Hevc => "h265parse",
+    let (parser, caps) = match capability.codec {
+        VideoCodec::H264 => (
+            "h264parse",
+            "video/x-h264,stream-format=byte-stream,alignment=au",
+        ),
+        VideoCodec::Hevc => (
+            "h265parse",
+            "video/x-h265,stream-format=byte-stream,alignment=au",
+        ),
     };
     let decoder = decoder_element(capability.codec, capability.kind);
     PipelineElements {
@@ -34,6 +45,7 @@ pub fn pipeline_elements(capability: &DecoderCapability) -> PipelineElements {
         decoder,
         converter: "videoconvert",
         sink: "waylandsink",
+        caps,
     }
 }
 
@@ -89,6 +101,7 @@ mod tests {
                 decoder: "avdec_h264",
                 converter: "videoconvert",
                 sink: "waylandsink",
+                caps: "video/x-h264,stream-format=byte-stream,alignment=au",
             }
         );
     }

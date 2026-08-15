@@ -1612,11 +1612,11 @@ fn log_video_focus_requested(body_len: usize) {
 }
 
 /// Handles `VideoSetupAction::Ready` (video `Start` accepted). Index 0 is
-/// H.264 (`ADVERTISED_H264_CONFIGURATION_INDEX`, `video_setup.rs`) — the
-/// only codec this probe's render pipeline can actually decode so far.
-/// Index 1 (H.265) is accepted at the wire level but has no decode path
-/// yet; starting the existing H.264-typed pipeline against H.265 bytes
-/// would be a caps mismatch, not a real sink.
+/// H.264, index 1 is H.265 (`ADVERTISED_H264_CONFIGURATION_INDEX`/
+/// `ADVERTISED_H265_CONFIGURATION_INDEX`, `video_setup.rs`) — both now have
+/// a real decode path (`crates/media-gstreamer`'s `pipeline_elements`
+/// already selected the matching parser/decoder/caps per codec; only this
+/// probe's own pipeline construction was hardcoded to H.264 before).
 fn handle_video_start_received(
     video_render: &mut VideoRenderState,
     session_id: i32,
@@ -1625,24 +1625,22 @@ fn handle_video_start_received(
     println!("probe_state=video_channel_start_received");
     println!("video_channel_session_id={session_id}");
     println!("video_channel_configuration_index={configuration_index}");
-    if configuration_index == 0 {
-        start_video_render_pipeline(video_render);
-    } else {
-        println!("probe_state=video_render_pipeline_not_started");
-        println!("video_render_reason=h265_decode_not_yet_implemented");
-    }
+    let codec = match configuration_index {
+        0 => DecoderVideoCodec::H264,
+        _ => DecoderVideoCodec::Hevc,
+    };
+    start_video_render_pipeline(video_render, codec);
 }
 
 /// Lazily builds and starts the real decode/render pipeline once (on the
-/// first `Start` that selects the H.264 configuration — see the caller in
-/// `handle_video_channel_message`, since `VideoSetupState::Ready`'s H.265
-/// path never calls this) for the advertised 800x480@30 H.264
+/// first `Start`, for whichever codec the phone actually selected — see the
+/// caller in `handle_video_channel_message`) for the advertised 1280x720
 /// configuration. Construction/start failure (most commonly: no reachable
 /// Wayland compositor) demotes `video_render` to `Failed` and is logged; it
 /// never returns an error or aborts the probe, since rendering is
 /// independent of protocol correctness (see `VideoRenderState`'s doc
 /// comment).
-fn start_video_render_pipeline(video_render: &mut VideoRenderState) {
+fn start_video_render_pipeline(video_render: &mut VideoRenderState, codec: DecoderVideoCodec) {
     if !matches!(video_render, VideoRenderState::NotStarted(_)) {
         return;
     }
@@ -1651,9 +1649,13 @@ fn start_video_render_pipeline(video_render: &mut VideoRenderState) {
     else {
         unreachable!("just matched NotStarted above");
     };
+    let id = match codec {
+        DecoderVideoCodec::H264 => "gstreamer:avdec_h264",
+        DecoderVideoCodec::Hevc => "gstreamer:avdec_h265",
+    };
     let capability = DecoderCapability {
-        id: "gstreamer:avdec_h264".into(),
-        codec: DecoderVideoCodec::H264,
+        id: id.into(),
+        codec,
         kind: DecoderKind::Software,
         // Descriptive only — the pipeline's own caps carry no explicit
         // width/height (see `render.rs`'s module doc comment), so these
@@ -1661,7 +1663,7 @@ fn start_video_render_pipeline(video_render: &mut VideoRenderState) {
         // actually advertised in `build_service_capabilities`.
         maximum_width: 1280,
         maximum_height: 720,
-        maximum_frames_per_second: 30,
+        maximum_frames_per_second: 60,
     };
     match backend.build_video_render_pipeline(&capability, RenderSink::Wayland) {
         Ok(pipeline) => match pipeline.start() {

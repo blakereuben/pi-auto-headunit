@@ -1,18 +1,21 @@
-//! Real (non-probing) H.264 decode-and-render pipeline execution.
+//! Real (non-probing) H.264/H.265 decode-and-render pipeline execution.
 //!
-//! Owns a `gst::Pipeline` shaped `appsrc ! h264parse ! avdec_h264 !
-//! videoconvert ! <sink>` and pushes raw encoded payload buffers (H.264
-//! `Data`/`CodecConfig` bytes, already stripped of AAP framing by
-//! `protocol_aap`) directly into it. Assumes Annex-B byte-stream H.264
-//! framing (start-code-delimited NAL units) — this project has never
-//! observed real phone `Data`/`CodecConfig` bytes to confirm this; `Data`
-//! frames' PTS is derived from the AAP timestamp field assuming
+//! Owns a `gst::Pipeline` shaped `appsrc ! {parser} ! {decoder} !
+//! videoconvert ! <sink>` (`h264parse`/`avdec_h264` or `h265parse`/
+//! `avdec_h265`, chosen by `PipelineElements`, which also picks the
+//! matching `appsrc` caps) and pushes raw encoded payload buffers
+//! (`Data`/`CodecConfig` bytes, already stripped of AAP framing by
+//! `protocol_aap`) directly into it. Assumes Annex-B byte-stream framing
+//! (start-code-delimited NAL units) for both codecs — this project has
+//! never observed real phone `Data`/`CodecConfig` bytes to confirm this;
+//! `Data` frames' PTS is derived from the AAP timestamp field assuming
 //! microseconds, also unconfirmed. Both are the least-assumption defaults
 //! available and fail closed (a bus `Error`, not corrupted output) if
 //! wrong; see `docs/protocol` for what has and hasn't been confirmed about
 //! `Data`/`CodecConfig` wire framing. `CodecConfig` is pushed through the
-//! same `appsrc` ahead of frame data, relying on `h264parse`'s in-band
-//! SPS/PPS extraction rather than out-of-band `codec_data` caps.
+//! same `appsrc` ahead of frame data, relying on the parser's in-band
+//! SPS/PPS (or VPS/SPS/PPS) extraction rather than out-of-band `codec_data`
+//! caps.
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -47,9 +50,9 @@ impl VideoRenderPipeline {
         };
         let description = format!(
             "appsrc name=src is-live=true format=time \
-             caps=\"video/x-h264,stream-format=byte-stream,alignment=au\" \
+             caps=\"{}\" \
              ! {} ! {} ! {} ! {sink_element} sync=false",
-            elements.parser, elements.decoder, elements.converter,
+            elements.caps, elements.parser, elements.decoder, elements.converter,
         );
         let element = gst::parse::launch(&description)
             .map_err(|error| GstreamerError::PipelineConstruction(error.to_string()))?;
@@ -176,22 +179,33 @@ mod tests {
         }
     }
 
-    /// Builds a tiny, fully self-generated H.264 Annex-B byte stream via
-    /// `videotestsrc ! openh264enc ! h264parse ! appsink`, constructed and
-    /// run directly as a `gst::Pipeline` in Rust (no `gst-launch-1.0`
+    fn hevc_capability() -> DecoderCapability {
+        DecoderCapability {
+            id: "gstreamer:avdec_h265".into(),
+            codec: VideoCodec::Hevc,
+            kind: DecoderKind::Software,
+            maximum_width: 1280,
+            maximum_height: 720,
+            maximum_frames_per_second: 60,
+        }
+    }
+
+    /// Builds a tiny, fully self-generated Annex-B byte stream via
+    /// `videotestsrc ! {encoder} ! {parser} ! appsink`, constructed and run
+    /// directly as a `gst::Pipeline` in Rust (no `gst-launch-1.0`
     /// subprocess). Never derived from a real phone capture — see
     /// `CLAUDE.md`'s user-content rule. Returns one `Vec<u8>` per encoded
     /// access unit; with `config-interval=-1`, every access unit already
-    /// carries in-band SPS/PPS, so the first element also doubles as this
-    /// test's `CodecConfig` stand-in.
-    fn synthetic_h264_access_units(count: u32) -> Vec<Vec<u8>> {
+    /// carries in-band parameter sets, so the first element also doubles as
+    /// this test's `CodecConfig` stand-in.
+    fn synthetic_access_units(count: u32, encoder: &str, parser: &str, caps: &str) -> Vec<Vec<u8>> {
         gst::init().expect("gstreamer available on this host");
         let description = format!(
             "videotestsrc num-buffers={count} \
              ! video/x-raw,width=64,height=48,framerate=30/1 \
-             ! openh264enc \
-             ! h264parse config-interval=-1 \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! {encoder} \
+             ! {parser} config-interval=-1 \
+             ! {caps} \
              ! appsink name=sink emit-signals=false sync=false"
         );
         let pipeline = gst::parse::launch(&description)
@@ -217,6 +231,24 @@ mod tests {
         access_units
     }
 
+    fn synthetic_h264_access_units(count: u32) -> Vec<Vec<u8>> {
+        synthetic_access_units(
+            count,
+            "openh264enc",
+            "h264parse",
+            "video/x-h264,stream-format=byte-stream,alignment=au",
+        )
+    }
+
+    fn synthetic_hevc_access_units(count: u32) -> Vec<Vec<u8>> {
+        synthetic_access_units(
+            count,
+            "x265enc",
+            "h265parse",
+            "video/x-h265,stream-format=byte-stream,alignment=au",
+        )
+    }
+
     #[test]
     fn decodes_and_runs_a_synthetic_h264_stream_end_to_end_with_fakesink() {
         let backend = GstreamerBackend::new().expect("gstreamer available on this host");
@@ -235,6 +267,30 @@ mod tests {
         for (index, frame) in frames.iter().enumerate() {
             pipeline
                 .push_frame(frame, (index as u64) * 33_333)
+                .expect("frame pushes");
+            assert!(pipeline.poll_bus_error().is_none(), "no pipeline errors");
+        }
+        pipeline.shutdown().expect("clean EOS shutdown");
+    }
+
+    #[test]
+    fn decodes_and_runs_a_synthetic_hevc_stream_end_to_end_with_fakesink() {
+        let backend = GstreamerBackend::new().expect("gstreamer available on this host");
+        let pipeline = backend
+            .build_video_render_pipeline(&hevc_capability(), RenderSink::Fake)
+            .expect("pipeline builds");
+        pipeline.start().expect("pipeline starts");
+
+        let access_units = synthetic_hevc_access_units(10);
+        let (codec_config, frames) = access_units
+            .split_first()
+            .expect("fixture produced at least one access unit");
+        pipeline
+            .push_codec_config(codec_config)
+            .expect("codec config pushes");
+        for (index, frame) in frames.iter().enumerate() {
+            pipeline
+                .push_frame(frame, (index as u64) * 16_667)
                 .expect("frame pushes");
             assert!(pipeline.poll_bus_error().is_none(), "no pipeline errors");
         }
