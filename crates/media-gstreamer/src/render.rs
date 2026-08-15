@@ -6,16 +6,20 @@
 //! matching `appsrc` caps) and pushes raw encoded payload buffers
 //! (`Data`/`CodecConfig` bytes, already stripped of AAP framing by
 //! `protocol_aap`) directly into it. Assumes Annex-B byte-stream framing
-//! (start-code-delimited NAL units) for both codecs — this project has
-//! never observed real phone `Data`/`CodecConfig` bytes to confirm this;
-//! `Data` frames' PTS is derived from the AAP timestamp field assuming
-//! microseconds, also unconfirmed. Both are the least-assumption defaults
-//! available and fail closed (a bus `Error`, not corrupted output) if
-//! wrong; see `docs/protocol` for what has and hasn't been confirmed about
-//! `Data`/`CodecConfig` wire framing. `CodecConfig` is pushed through the
-//! same `appsrc` ahead of frame data, relying on the parser's in-band
-//! SPS/PPS (or VPS/SPS/PPS) extraction rather than out-of-band `codec_data`
-//! caps.
+//! (start-code-delimited NAL units) for both codecs and that `Data`
+//! frames' PTS is the AAP timestamp field in microseconds — both were
+//! least-assumption defaults when first written, and are now real-
+//! hardware-confirmed correct against a live phone: 1,462 real H.265
+//! `Data` frames decoded and rendered with zero pipeline errors, with the
+//! operator directly confirming correct video on the head unit's own
+//! physical display (`MILESTONE_CHECKLIST.md` M4, "Display projected
+//! video..."). Both assumptions still fail closed (a bus `Error`, not
+//! corrupted output) if a future codec/phone combination violates them.
+//! `CodecConfig` is pushed through the same `appsrc` ahead of frame data,
+//! relying on the parser's in-band SPS/PPS (or VPS/SPS/PPS) extraction
+//! rather than out-of-band `codec_data` caps — implicitly confirmed by the
+//! same successful real decode, since H.264/H.265 decoding cannot succeed
+//! without a correctly-parsed parameter set.
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -118,8 +122,8 @@ impl VideoRenderPipeline {
     }
 
     /// Pushes one `Data` frame's payload, with PTS derived from the AAP
-    /// `Data` message's 8-byte timestamp (assumed microseconds — see
-    /// module doc comment; unconfirmed against real phone bytes).
+    /// `Data` message's 8-byte timestamp (microseconds — see module doc
+    /// comment; real-hardware-confirmed, not just assumed).
     pub fn push_frame(&self, payload: &[u8], timestamp: u64) -> Result<(), GstreamerError> {
         self.push_buffer(payload, Some(gst::ClockTime::from_useconds(timestamp)))
     }

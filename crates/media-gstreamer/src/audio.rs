@@ -6,16 +6,24 @@
 //! no decoder stage, since `MEDIA_CODEC_AUDIO_PCM` is the only audio codec
 //! this project's `ServiceDiscoveryResponse` ever advertises. Assumes
 //! signed 16-bit little-endian interleaved samples (`S16LE`) — the
-//! platform-standard raw layout, but this project has never observed real
-//! phone audio bytes to confirm it. Unlike the video pipeline's
-//! H.264/H.265 parsers, raw PCM has no in-stream parser to reject a wrong
-//! assumption: a wrong sample format would produce audible noise or
-//! garbled playback, not a clean pipeline `Error`, so this must be
-//! confirmed by ear on real hardware, not inferred from a clean bus alone.
+//! platform-standard raw layout. Unlike the video pipeline's H.264/H.265
+//! parsers, raw PCM has no in-stream parser to reject a wrong assumption:
+//! a wrong sample format would produce audible noise or garbled playback,
+//! not a clean pipeline `Error`, so this needed confirming by ear on real
+//! hardware, not inferred from a clean bus alone — and it has been: a
+//! real-hardware trial received 611 real `MediaAudio` PCM frames and the
+//! operator directly confirmed correct audible playback
+//! (`MILESTONE_CHECKLIST.md` M4, "Play media, navigation/system, and
+//! speech audio correctly"). That same item honestly records that
+//! playback *reliability* is separately unresolved (an intermittent
+//! root-vs-PipeWire `XDG_RUNTIME_DIR` conflict) — a pipeline-startup
+//! environment issue, not evidence against the `S16LE` format assumption
+//! itself, which is confirmed correct whenever the pipeline does start.
 //! `Data` frames' PTS is derived from the AAP timestamp field assuming
-//! microseconds, matching the video pipeline's identical, equally
-//! unconfirmed assumption. `CodecConfig` messages on an audio channel are
-//! not pushed into this pipeline — raw PCM has no parameter-set payload
+//! microseconds, matching the video pipeline's identical assumption,
+//! real-hardware-confirmed the same way. `CodecConfig` messages on an
+//! audio channel are not pushed into this pipeline — raw PCM has no
+//! parameter-set payload
 //! for a parser to extract, unlike H.264/H.265 SPS/PPS.
 
 use gstreamer as gst;
@@ -104,8 +112,8 @@ impl AudioPlaybackPipeline {
     }
 
     /// Pushes one `Data` frame's raw PCM payload, with PTS derived from the
-    /// AAP `Data` message's 8-byte timestamp (assumed microseconds — see
-    /// module doc comment; unconfirmed against real phone bytes).
+    /// AAP `Data` message's 8-byte timestamp (microseconds — see module
+    /// doc comment; real-hardware-confirmed, not just assumed).
     pub fn push_frame(&self, payload: &[u8], timestamp: u64) -> Result<(), GstreamerError> {
         self.push_buffer(payload, gst::ClockTime::from_useconds(timestamp))
     }
