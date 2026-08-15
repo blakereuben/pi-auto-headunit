@@ -12,6 +12,9 @@ mod auth_discovery_probe;
 #[cfg(target_os = "linux")]
 mod credentials;
 
+#[cfg(target_os = "linux")]
+mod session_supervisor;
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match run(&args) {
@@ -149,6 +152,57 @@ fn run(args: &[String]) -> Result<(), CliError> {
         {
             usb_auth_discovery_probe(selector, true)
         }
+        [group, command, device_flag, selector, allow]
+            if group == "usb"
+                && command == "session-supervisor"
+                && device_flag == "--device"
+                && allow == "--allow-live-aap" =>
+        {
+            usb_session_supervisor(selector, false, None)
+        }
+        [group, command, device_flag, selector, allow, compatibility]
+            if group == "usb"
+                && command == "session-supervisor"
+                && device_flag == "--device"
+                && allow == "--allow-live-aap"
+                && compatibility == "--tls12-compat" =>
+        {
+            usb_session_supervisor(selector, true, None)
+        }
+        [
+            group,
+            command,
+            device_flag,
+            selector,
+            allow,
+            cycles_flag,
+            cycles,
+        ] if group == "usb"
+            && command == "session-supervisor"
+            && device_flag == "--device"
+            && allow == "--allow-live-aap"
+            && cycles_flag == "--max-cycles" =>
+        {
+            usb_session_supervisor(selector, false, Some(parse_cycles(cycles)?))
+        }
+        [
+            group,
+            command,
+            device_flag,
+            selector,
+            allow,
+            compatibility,
+            cycles_flag,
+            cycles,
+        ] if group == "usb"
+            && command == "session-supervisor"
+            && device_flag == "--device"
+            && allow == "--allow-live-aap"
+            && compatibility == "--tls12-compat"
+            && cycles_flag == "--max-cycles" =>
+        {
+            usb_session_supervisor(selector, true, Some(parse_cycles(cycles)?))
+        }
         [] | [..] if args.iter().any(|arg| arg == "--help" || arg == "-h") => {
             print_help();
             Ok(())
@@ -183,6 +237,7 @@ fn print_help() {
            usb tls-probe --device BUS:ADDRESS --allow-live-aap --tls12-compat\n\
            usb credential-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
            usb auth-discovery-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
+           usb session-supervisor --device BUS:ADDRESS --allow-live-aap [--tls12-compat] [--max-cycles COUNT]\n\
          \n\
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
         env!("CARGO_PKG_VERSION")
@@ -907,6 +962,20 @@ fn usb_auth_discovery_probe(_: &str, _: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
+#[cfg(target_os = "linux")]
+fn usb_session_supervisor(
+    selector: &str,
+    tls12_compatibility: bool,
+    max_cycles: Option<u32>,
+) -> Result<(), CliError> {
+    session_supervisor::run(selector, tls12_compatibility, max_cycles)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn usb_session_supervisor(_: &str, _: bool, _: Option<u32>) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
+}
+
 fn reject_completed_generated_identity_probe() -> Result<(), CliError> {
     Err(CliError::Usage(
         "generated-identity phone probes are permanently disabled after the recorded Android Auto error-7 rejection"
@@ -1064,6 +1133,31 @@ mod tests {
         assert!(matches!(run(&args), Err(CliError::Usage(_))));
 
         let args = vec!["developer".into(), "auth-discovery-probe".into()];
+        assert!(matches!(run(&args), Err(CliError::Usage(_))));
+    }
+
+    #[test]
+    fn session_supervisor_requires_explicit_opt_in() {
+        let args = vec![
+            "usb".into(),
+            "session-supervisor".into(),
+            "--device".into(),
+            "1:2".into(),
+        ];
+        assert!(matches!(run(&args), Err(CliError::Usage(_))));
+    }
+
+    #[test]
+    fn session_supervisor_rejects_invalid_max_cycles() {
+        let args = vec![
+            "usb".into(),
+            "session-supervisor".into(),
+            "--device".into(),
+            "1:2".into(),
+            "--allow-live-aap".into(),
+            "--max-cycles".into(),
+            "0".into(),
+        ];
         assert!(matches!(run(&args), Err(CliError::Usage(_))));
     }
 

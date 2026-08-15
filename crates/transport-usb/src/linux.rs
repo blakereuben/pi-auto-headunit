@@ -170,6 +170,50 @@ impl LibUsbAoaBackend {
             write_id: 0,
         })
     }
+
+    /// Polls `list_devices()` every 100ms until `timeout`, returning the
+    /// first device satisfying `matches`. Shared by `wait_for_accessory`
+    /// (`AoaBackend`'s in-session MTP→accessory-mode reenumeration wait,
+    /// which additionally requires an accessory vendor/product ID) and
+    /// `wait_for_reconnect` (a full physical unplug/replug, where the phone
+    /// comes back in its normal, non-accessory mode and has no such
+    /// requirement).
+    fn poll_for_match(
+        &self,
+        timeout: Duration,
+        matches: impl Fn(&UsbDeviceId) -> bool,
+    ) -> Result<UsbDeviceId, AoaError> {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if let Some(candidate) = self.list_devices()?.into_iter().find(&matches) {
+                return Ok(candidate);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(AoaError::TimedOut(
+            transport_api::AoaState::WaitingForReenumeration,
+        ))
+    }
+
+    /// Polls for a device at the same physical USB port (`bus` +
+    /// `port_path`) to reappear after a genuine physical unplug, in *any*
+    /// USB mode — unlike `wait_for_accessory`, which is only correct for
+    /// the in-session reenumeration AASDK/AOA itself triggers (MTP mode →
+    /// accessory mode), a phone coming back from a real unplug
+    /// re-enumerates into its normal mode and needs the *entire* AOA
+    /// transition run again from scratch, not just a wait for its
+    /// accessory-mode reappearance.
+    pub fn wait_for_reconnect(
+        &self,
+        original: &UsbDeviceId,
+        timeout: Duration,
+    ) -> Result<UsbDeviceId, AoaError> {
+        self.poll_for_match(timeout, |candidate| {
+            !original.port_path.is_empty()
+                && candidate.bus == original.bus
+                && candidate.port_path == original.port_path
+        })
+    }
 }
 
 impl LibUsbBulkTransport {
@@ -362,21 +406,12 @@ impl AoaBackend for LibUsbAoaBackend {
         original: &UsbDeviceId,
         timeout: Duration,
     ) -> Result<UsbDeviceId, AoaError> {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
-            for candidate in self.list_devices()? {
-                let same_port = !original.port_path.is_empty()
-                    && candidate.bus == original.bus
-                    && candidate.port_path == original.port_path;
-                if same_port && is_accessory_id(candidate.vendor_id, candidate.product_id) {
-                    return Ok(candidate);
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        Err(AoaError::TimedOut(
-            transport_api::AoaState::WaitingForReenumeration,
-        ))
+        self.poll_for_match(timeout, |candidate| {
+            !original.port_path.is_empty()
+                && candidate.bus == original.bus
+                && candidate.port_path == original.port_path
+                && is_accessory_id(candidate.vendor_id, candidate.product_id)
+        })
     }
 
     fn open_bulk_transport(&mut self, device: &UsbDeviceId) -> Result<BulkTransportInfo, AoaError> {
