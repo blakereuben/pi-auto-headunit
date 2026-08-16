@@ -27,6 +27,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use transport_api::{AoaError, AoaIdentification, AoaMachine, TransportError, UsbDeviceId};
+use transport_usb::SoftResetOutcome;
 
 use crate::CliError;
 use crate::cancellation::CancellationFlag;
@@ -224,19 +225,45 @@ impl SupervisedSession {
                 .map_err(CliError::Aoa),
             1 => {
                 println!("probe_state=supervisor_soft_reset_attempt cycle={cycle}");
-                match backend.soft_reset(previous) {
-                    Ok(()) => {
+                // `Reenumerated` means libusb told us the device is about
+                // to disappear and come back — real-hardware-observed
+                // (2026-08-16): asking `wait_for_reconnect` to rediscover
+                // it immediately can win a race against the OS actually
+                // tearing the old device node down first, matching it
+                // right before it vanishes and failing the *next* step
+                // instead. `wait_for_physical_replug` (originally built for
+                // a human-paced wait) already has the right shape for
+                // this: wait for absence, then presence — reused here for
+                // a short, automated wait instead.
+                let reenumerated = match backend.soft_reset(previous) {
+                    Ok(SoftResetOutcome::Completed) => {
                         println!(
                             "probe_state=supervisor_soft_reset_result cycle={cycle} outcome=ok"
                         );
+                        false
                     }
-                    Err(error) => println!(
-                        "probe_state=supervisor_soft_reset_result cycle={cycle} outcome=failed reason={error}"
-                    ),
+                    Ok(SoftResetOutcome::Reenumerated) => {
+                        println!(
+                            "probe_state=supervisor_soft_reset_result cycle={cycle} outcome=ok_reenumerated"
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        println!(
+                            "probe_state=supervisor_soft_reset_result cycle={cycle} outcome=failed reason={error}"
+                        );
+                        false
+                    }
+                };
+                if reenumerated {
+                    backend
+                        .wait_for_physical_replug(previous, REDISCOVERY_TIMEOUT)
+                        .map_err(CliError::Aoa)
+                } else {
+                    backend
+                        .wait_for_reconnect(previous, REDISCOVERY_TIMEOUT)
+                        .map_err(CliError::Aoa)
                 }
-                backend
-                    .wait_for_reconnect(previous, REDISCOVERY_TIMEOUT)
-                    .map_err(CliError::Aoa)
             }
             _ => {
                 println!("probe_state=supervisor_physical_replug_requested cycle={cycle}");

@@ -1,5 +1,7 @@
 use crate::is_accessory_id;
-use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
+use rusb::{
+    Context, Device, DeviceHandle, Direction, Error as RusbError, TransferType, UsbContext,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use transport_api::{
@@ -51,6 +53,32 @@ pub struct LibUsbBulkTransport {
 pub enum HoldResult {
     Unplugged,
     TimedOut,
+}
+
+/// Outcome of [`LibUsbAoaBackend::soft_reset`]. `libusb_reset_device`'s own
+/// documentation (`libusb/core.c`, `libusb_reset_device`'s doc comment):
+/// "If the reset fails, the descriptors change, or the previous state
+/// cannot be restored, the device will appear to be disconnected and
+/// reconnected... A return code of `LIBUSB_ERROR_NOT_FOUND` indicates when
+/// this is the case." Real-hardware-observed (2026-08-16): this specific
+/// error is the *common* outcome for this project's actual use (an Android
+/// phone in AOA accessory mode), not a rare edge case — every real trial so
+/// far reset successfully in the sense that mattered (the device came back
+/// and was rediscoverable), but every one of them also hit this exact
+/// libusb return code, which this project's code previously logged as a
+/// plain failure. It isn't one: it's libusb's documented way of saying the
+/// reset caused genuine re-enumeration, which is exactly what a caller
+/// asking for a "replug without touching the cable" wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftResetOutcome {
+    /// The reset completed and the original device handle is still valid.
+    Completed,
+    /// `LIBUSB_ERROR_NOT_FOUND` — the device re-enumerated as a result of
+    /// the reset (almost certainly with a new address) and must be
+    /// rediscovered; the original handle is no longer usable. Treated as
+    /// success, not failure, since re-enumeration is exactly what a
+    /// software-triggered "replug" is meant to cause.
+    Reenumerated,
 }
 
 impl LibUsbAoaBackend {
@@ -225,15 +253,29 @@ impl LibUsbAoaBackend {
     /// completed`) even though the device never physically disconnected.
     /// This is `usb session-supervisor`'s first, software-only recovery
     /// attempt before it ever asks the operator to physically replug —
-    /// see `apps/aa-headunit-diagnostics/src/session_supervisor.rs`. Not
-    /// guaranteed to help: the reset is a USB-layer signal, and whether
-    /// the phone's own Android Auto app session state actually clears in
-    /// response is outside this project's control and untested against a
-    /// real repeat failure as of this addition — callers must still treat
-    /// a repeated failure as needing a real physical replug
-    /// (`wait_for_physical_replug`), not retry this indefinitely.
-    pub fn soft_reset(&self, device: &UsbDeviceId) -> Result<(), AoaError> {
-        self.open_device(device)?.reset().map_err(map_usb_error)
+    /// see `apps/aa-headunit-diagnostics/src/session_supervisor.rs`.
+    ///
+    /// Real-hardware-confirmed effective (2026-08-16, two separate
+    /// trials): every reset against a real phone in AOA accessory mode
+    /// returned [`SoftResetOutcome::Reenumerated`], and the device was
+    /// reliably rediscoverable afterward — see that variant's doc comment
+    /// for why this is libusb's documented success case, not a failure the
+    /// earlier version of this function mistakenly reported as one
+    /// (`outcome=failed reason=USB error: Entity not found` in
+    /// `session_supervisor.rs`'s log, despite the recovery actually
+    /// working). Whether the phone's own Android Auto app-level session
+    /// state clears as a result (as opposed to just its USB-level
+    /// connection) is still outside this project's control and not
+    /// separately provable — callers must still treat a repeated failure
+    /// as needing a real physical replug (`wait_for_physical_replug`), not
+    /// retry this indefinitely.
+    pub fn soft_reset(&self, device: &UsbDeviceId) -> Result<SoftResetOutcome, AoaError> {
+        let handle = self.open_device(device)?;
+        match handle.reset() {
+            Ok(()) => Ok(SoftResetOutcome::Completed),
+            Err(RusbError::NotFound) => Ok(SoftResetOutcome::Reenumerated),
+            Err(error) => Err(map_usb_error(error)),
+        }
     }
 
     /// Waits for `original` to become physically absent, then waits for a
