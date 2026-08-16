@@ -41,6 +41,7 @@ use transport_bluetooth::accept_wireless_bootstrap_connection;
 use transport_tcp::WirelessTcpTransport;
 
 use crate::CliError;
+use crate::cancellation;
 use crate::connection_state::{self, ConnectionState};
 
 const WLAN_INTERFACE: &str = "wlan0";
@@ -67,6 +68,7 @@ const AP_STARTUP_SETTLE: Duration = Duration::from_millis(1500);
 
 pub(crate) fn run(tls12_compatibility: bool) -> Result<(), CliError> {
     connection_state::report(ConnectionState::Ready);
+    let cancel = cancellation::install_ctrlc_handler()?;
     println!("probe_authorization=operator_confirmed");
     println!("probe_payload_logging=disabled");
 
@@ -112,6 +114,7 @@ pub(crate) fn run(tls12_compatibility: bool) -> Result<(), CliError> {
         tls12_compatibility,
         credentials.material,
         crate::auth_discovery_probe::VideoRenderTarget::Wayland,
+        &cancel,
     );
     if result.is_err() {
         connection_state::report(ConnectionState::Error);

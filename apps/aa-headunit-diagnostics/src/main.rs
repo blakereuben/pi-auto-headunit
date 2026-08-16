@@ -10,6 +10,9 @@ mod live_probe;
 mod auth_discovery_probe;
 
 #[cfg(target_os = "linux")]
+mod cancellation;
+
+#[cfg(target_os = "linux")]
 mod credentials;
 
 #[cfg(target_os = "linux")]
@@ -350,6 +353,7 @@ fn developer_auth_discovery_probe(tls12_compatibility: bool) -> Result<(), CliEr
     use std::time::Duration;
 
     connection_state::report(connection_state::ConnectionState::Ready);
+    let cancel = cancellation::install_ctrlc_handler()?;
     let result = (|| -> Result<(), CliError> {
         let paths = credential_store::CredentialPaths::from(
             credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
@@ -371,6 +375,7 @@ fn developer_auth_discovery_probe(tls12_compatibility: bool) -> Result<(), CliEr
             tls12_compatibility,
             credentials.material,
             auth_discovery_probe::VideoRenderTarget::Wayland,
+            &cancel,
         )
     })();
     if result.is_err() {
@@ -984,6 +989,7 @@ fn usb_auth_discovery_probe(selector: &str, tls12_compatibility: bool) -> Result
     const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
     connection_state::report(connection_state::ConnectionState::Ready);
+    let cancel = cancellation::install_ctrlc_handler()?;
     let result = (|| -> Result<(), CliError> {
         let paths = credential_store::CredentialPaths::from(
             credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
@@ -1018,6 +1024,7 @@ fn usb_auth_discovery_probe(selector: &str, tls12_compatibility: bool) -> Result
             tls12_compatibility,
             credentials.material,
             auth_discovery_probe::VideoRenderTarget::Wayland,
+            &cancel,
         )
     })();
     if result.is_err() {
@@ -1105,6 +1112,15 @@ enum CliError {
     #[cfg(target_os = "linux")]
     Credentials(String),
     Transport(transport_api::TransportError),
+    /// An operator-requested `SIGINT` (Ctrl-C) reached a probe's
+    /// cooperative-cancellation check (`cancellation::CancellationFlag`).
+    /// Distinct from every other variant here: it's not a failure, so it
+    /// gets its own exit code rather than reusing `Protocol`'s or being
+    /// folded into success — a caller (a human, or `session-supervisor`'s
+    /// retry loop) needs to be able to tell "the operator asked to stop"
+    /// apart from every other outcome.
+    #[cfg(target_os = "linux")]
+    Cancelled,
 }
 
 impl CliError {
@@ -1124,6 +1140,8 @@ impl CliError {
             #[cfg(target_os = "linux")]
             Self::Credentials(_) => 21,
             Self::Transport(_) => 20,
+            #[cfg(target_os = "linux")]
+            Self::Cancelled => 22,
         }
     }
 }
@@ -1144,6 +1162,8 @@ impl std::fmt::Display for CliError {
             #[cfg(target_os = "linux")]
             Self::Credentials(error) => write!(f, "credentials: {error}"),
             Self::Transport(error) => error.fmt(f),
+            #[cfg(target_os = "linux")]
+            Self::Cancelled => write!(f, "cancelled by operator (Ctrl-C)"),
         }
     }
 }

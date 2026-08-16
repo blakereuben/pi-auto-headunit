@@ -43,6 +43,7 @@ use transport_api::{AoaIdentification, AoaMachine};
 
 use crate::CliError;
 use crate::auth_discovery_probe::{Gtk4WindowHandoff, VideoRenderTarget};
+use crate::cancellation::{self, CancellationFlag};
 use crate::connection_state::{self, ConnectionState};
 
 const AOA_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -64,6 +65,7 @@ struct ActivationState {
     selector: String,
     tls12_compatibility: bool,
     handoff: Gtk4WindowHandoff,
+    cancel: CancellationFlag,
     session_result_sender: mpsc::Sender<Result<(), CliError>>,
     capability_receiver: mpsc::Receiver<DecoderCapability>,
     pipeline_sender: mpsc::Sender<Result<VideoRenderPipeline, GstreamerError>>,
@@ -71,6 +73,7 @@ struct ActivationState {
 }
 
 pub(crate) fn run(selector: &str, tls12_compatibility: bool) -> Result<(), CliError> {
+    let cancel = cancellation::install_ctrlc_handler()?;
     let (capability_sender, capability_receiver) = mpsc::channel::<DecoderCapability>();
     let (pipeline_sender, pipeline_receiver) = mpsc::channel();
     let (session_result_sender, session_result_receiver) = mpsc::channel::<Result<(), CliError>>();
@@ -82,6 +85,7 @@ pub(crate) fn run(selector: &str, tls12_compatibility: bool) -> Result<(), CliEr
             capability_sender,
             pipeline_receiver,
         },
+        cancel,
         session_result_sender,
         capability_receiver,
         pipeline_sender,
@@ -103,6 +107,7 @@ pub(crate) fn run(selector: &str, tls12_compatibility: bool) -> Result<(), CliEr
             selector,
             tls12_compatibility,
             handoff,
+            cancel,
             session_result_sender,
             capability_receiver,
             pipeline_sender,
@@ -131,7 +136,7 @@ pub(crate) fn run(selector: &str, tls12_compatibility: bool) -> Result<(), CliEr
         });
 
         thread::spawn(move || {
-            let result = run_session(&selector, tls12_compatibility, handoff);
+            let result = run_session(&selector, tls12_compatibility, handoff, &cancel);
             let _ = session_result_sender.send(result);
         });
 
@@ -215,6 +220,7 @@ fn run_session(
     selector: &str,
     tls12_compatibility: bool,
     handoff: Gtk4WindowHandoff,
+    cancel: &CancellationFlag,
 ) -> Result<(), CliError> {
     connection_state::report(ConnectionState::Ready);
     let paths = credential_store::CredentialPaths::from(
@@ -250,5 +256,6 @@ fn run_session(
         tls12_compatibility,
         credentials.material,
         VideoRenderTarget::Gtk4Window(handoff),
+        cancel,
     )
 }

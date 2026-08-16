@@ -986,6 +986,7 @@ pub fn run<T: SessionTransport>(
     tls12_compatibility: bool,
     credentials: CredentialMaterial,
     video_render_target: VideoRenderTarget,
+    cancel: &crate::cancellation::CancellationFlag,
 ) -> Result<(), CliError> {
     println!("probe_scope=version_tls_auth_and_service_discovery_summary");
     println!("probe_credentials=user_supplied_runtime");
@@ -1059,7 +1060,7 @@ pub fn run<T: SessionTransport>(
     let mut simple_channels: HashMap<u8, ChannelOpenStateMachine> = HashMap::new();
     let touch_source = open_touch_source();
 
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !cancel.is_set() {
         let size = match transport.receive(&mut read_buffer) {
             Ok(size) => size,
             Err(TransportError::TimedOut) => continue,
@@ -1105,16 +1106,23 @@ pub fn run<T: SessionTransport>(
         )?;
     }
 
-    finish_probe_after_timeout(channel_setup_complete, &tls)
+    finish_probe_after_loop(channel_setup_complete, cancel.is_set(), &tls)
 }
 
-/// `run()`'s outcome once its deadline is reached without an earlier
-/// explicit stop — split out purely to keep `run()` itself under
+/// `run()`'s outcome once its loop exits without an earlier explicit
+/// stop — either the deadline was reached or the operator cancelled
+/// (`Ctrl-C`) — split out purely to keep `run()` itself under
 /// `clippy::too_many_lines`.
-fn finish_probe_after_timeout(
+fn finish_probe_after_loop(
     channel_setup_complete: bool,
+    cancelled: bool,
     tls: &OpenSslTlsClient,
 ) -> Result<(), CliError> {
+    if cancelled {
+        println!("probe_state=cancelled_by_operator");
+        println!("probe_result=cancelled");
+        return Err(CliError::Cancelled);
+    }
     if channel_setup_complete {
         println!("probe_result=observation_window_complete");
         return Ok(());

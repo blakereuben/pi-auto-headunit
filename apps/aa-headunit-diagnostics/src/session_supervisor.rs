@@ -29,6 +29,7 @@ use std::time::Duration;
 use transport_api::{AoaError, AoaIdentification, AoaMachine, TransportError, UsbDeviceId};
 
 use crate::CliError;
+use crate::cancellation::CancellationFlag;
 
 /// How long `wait_for_reconnect` waits for the phone to reappear at the
 /// same physical port after a cycle ends in a retryable failure. A guess,
@@ -63,8 +64,10 @@ const fn is_retryable(error: &CliError) -> bool {
         )
         | CliError::Protocol(_) => true,
 
-        // Static host/config problems, or a real device capability limit —
-        // retrying changes nothing.
+        // Static host/config problems, a real device capability limit, or
+        // an operator-requested stop — retrying changes nothing, and a
+        // Ctrl-C during the supervisor loop should stop the whole loop,
+        // not just the current cycle.
         CliError::Aoa(
             AoaError::PermissionDenied(_)
             | AoaError::Unsupported(_)
@@ -76,7 +79,8 @@ const fn is_retryable(error: &CliError) -> bool {
         | CliError::UnsupportedPlatform
         | CliError::Io(_)
         | CliError::Media(_)
-        | CliError::Credentials(_) => false,
+        | CliError::Credentials(_)
+        | CliError::Cancelled => false,
     }
 }
 
@@ -138,6 +142,7 @@ struct SupervisedSession {
     selector_address: u8,
     tls12_compatibility: bool,
     last_known: Option<UsbDeviceId>,
+    cancel: CancellationFlag,
 }
 
 impl SupervisedSession {
@@ -190,6 +195,7 @@ impl SupervisedSession {
             self.tls12_compatibility,
             credentials.material,
             crate::auth_discovery_probe::VideoRenderTarget::Wayland,
+            &self.cancel,
         )
     }
 }
@@ -208,11 +214,13 @@ pub(crate) fn run(
     println!("probe_authorization=operator_confirmed");
     println!("probe_payload_logging=disabled");
     println!("probe_state=supervisor_started device={selector}");
+    let cancel = crate::cancellation::install_ctrlc_handler()?;
     let mut session = SupervisedSession {
         selector_bus: bus,
         selector_address: address,
         tls12_compatibility,
         last_known: None,
+        cancel,
     };
     supervise(|cycle| session.attempt(cycle), max_cycles, RETRY_BACKOFF)
 }
@@ -258,6 +266,7 @@ mod tests {
         assert!(!is_retryable(&CliError::Io(std::io::Error::other("io"))));
         assert!(!is_retryable(&CliError::Media("gst".into())));
         assert!(!is_retryable(&CliError::Credentials("missing".into())));
+        assert!(!is_retryable(&CliError::Cancelled));
     }
 
     fn scripted(results: Vec<Result<(), CliError>>) -> impl FnMut(u32) -> Result<(), CliError> {

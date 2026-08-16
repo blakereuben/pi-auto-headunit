@@ -17,6 +17,7 @@ transport-usb = { path = "../../crates/transport-usb" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 credential-store = { path = "../../crates/credential-store" }
+ctrlc = "3"
 gtk4 = "0.10.3"
 protocol-aap = { path = "../../crates/protocol-aap" }
 security-openssl = { path = "../../crates/security-openssl" }
