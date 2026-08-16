@@ -6,13 +6,15 @@ use crate::protobuf::{self, ProtobufDecodeError};
 // (protobuf/aap_protobuf/service/inputsource/InputMessageId.proto),
 // KeyBindingRequest/KeyBindingResponse protobuf schema
 // (protobuf/aap_protobuf/service/media/sink/message/KeyBindingRequest.proto,
-// KeyBindingResponse.proto), InputReport/TouchEvent/PointerAction protobuf
-// schema (protobuf/aap_protobuf/service/inputsource/message/InputReport.proto,
-// TouchEvent.proto, PointerAction.proto), the shared MessageStatus enum
-// (protobuf/aap_protobuf/shared/MessageStatus.proto), and
-// InputSourceService's messageHandler/sendKeyBindingResponse/sendInputReport
-// dispatch (src/Channel/InputSource/InputSourceService.cpp), at the pinned
-// project revision (9bf6adf933665dee26532201719fac14a047ccf1).
+// KeyBindingResponse.proto), InputReport/TouchEvent/PointerAction/KeyEvent
+// protobuf schema (protobuf/aap_protobuf/service/inputsource/message/
+// InputReport.proto, TouchEvent.proto, PointerAction.proto, KeyEvent.proto),
+// the car-specific KeyCode enum values
+// (protobuf/aap_protobuf/service/media/sink/message/KeyCode.proto), the
+// shared MessageStatus enum (protobuf/aap_protobuf/shared/MessageStatus.proto),
+// and InputSourceService's messageHandler/sendKeyBindingResponse/
+// sendInputReport dispatch (src/Channel/InputSource/InputSourceService.cpp),
+// at the pinned project revision (9bf6adf933665dee26532201719fac14a047ccf1).
 // Copyright (C) 2018 f1x.studio (Michal Szwaj)
 // Copyright (C) 2024 CubeOne (Simon Dean)
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -335,6 +337,67 @@ pub fn encode_touch_report(
     }
 }
 
+/// `aap_protobuf.service.media.sink.message.KeyCode` — only the four
+/// car-specific category-switch values this project sends (see
+/// `docs/protocol/aasdk-adoption.md`'s "`KeyCode` — car-specific values
+/// used" section for the full 278-value enum's scope and why only these
+/// four are modeled). No approved source describes a way to launch a
+/// specific named app — Android Auto only exposes switching to whichever
+/// app the phone has configured as default for a category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyCode {
+    Media,
+    Navigation,
+    Radio,
+    Tel,
+}
+
+impl KeyCode {
+    #[must_use]
+    pub const fn wire_value(self) -> u32 {
+        match self {
+            Self::Media => 65537,
+            Self::Navigation => 65538,
+            Self::Radio => 65539,
+            Self::Tel => 65540,
+        }
+    }
+}
+
+/// Encodes an `InputReport` carrying one `KeyEvent` with a single key
+/// press or release — the head unit asking the phone to switch app
+/// category (see [`KeyCode`]'s doc comment). A real key press is always
+/// two of these: `down: true` then `down: false`, matching a real
+/// physical button (see `docs/protocol/aasdk-adoption.md`'s `InputReport`
+/// section — `metastate` is always `0` here, `longpress` always omitted,
+/// since this project never generates modifier state or a genuine
+/// long-press hold).
+#[must_use]
+pub fn encode_key_event(timestamp: u64, keycode: KeyCode, down: bool) -> InputMessage {
+    let mut key = Vec::new();
+    // KeyEvent.Key.keycode (field 1, required uint32).
+    protobuf::write_uint32_field(&mut key, 1, keycode.wire_value());
+    // KeyEvent.Key.down (field 2, required bool).
+    protobuf::write_bool_field(&mut key, 2, down);
+    // KeyEvent.Key.metastate (field 3, required uint32) — always 0; this
+    // project never generates modifier-key state.
+    protobuf::write_uint32_field(&mut key, 3, 0);
+
+    let mut key_event = Vec::new();
+    // KeyEvent.keys (field 1, repeated Key).
+    protobuf::write_length_delimited_field(&mut key_event, 1, &key);
+
+    let mut body = Vec::new();
+    // InputReport.timestamp (field 1, required uint64).
+    protobuf::write_uint64_field(&mut body, 1, timestamp);
+    // InputReport.key_event (field 4, optional KeyEvent).
+    protobuf::write_length_delimited_field(&mut body, 4, &key_event);
+    InputMessage {
+        id: InputMessageId::InputReport,
+        body,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +588,70 @@ mod tests {
         // fields are present, in encounter order.
         assert!(message.body.windows(2).any(|w| w == [0x08, 10]));
         assert!(message.body.windows(2).any(|w| w == [0x08, 30]));
+    }
+
+    #[test]
+    fn key_code_wire_values_match_the_pinned_car_specific_block() {
+        // aap_protobuf.service.media.sink.message.KeyCode, values read
+        // directly from the pinned revision — see
+        // docs/protocol/aasdk-adoption.md's "KeyCode — car-specific
+        // values used" section.
+        assert_eq!(KeyCode::Media.wire_value(), 65537);
+        assert_eq!(KeyCode::Navigation.wire_value(), 65538);
+        assert_eq!(KeyCode::Radio.wire_value(), 65539);
+        assert_eq!(KeyCode::Tel.wire_value(), 65540);
+    }
+
+    #[test]
+    fn encodes_a_key_down_report_with_exact_bytes() {
+        let message = encode_key_event(5, KeyCode::Media, true);
+        assert_eq!(message.id, InputMessageId::InputReport);
+        // Key{keycode=65537, down=true, metastate=0}. keycode's varint is
+        // 3 bytes (65537 = 0b1_0000_0000_0000_0001, split into 7-bit
+        // groups [1, 0, 4] LSB-first): 0x81 0x80 0x04.
+        let expected_key = [0x08, 0x81, 0x80, 0x04, 0x10, 0x01, 0x18, 0x00];
+        assert_eq!(expected_key.len(), 8);
+        let mut expected_key_event = vec![0x0a, 8];
+        expected_key_event.extend_from_slice(&expected_key);
+        assert_eq!(expected_key_event.len(), 10);
+        // InputReport{timestamp=5, key_event=...}.
+        let mut expected_body = vec![0x08, 5, 0x22, 10];
+        expected_body.extend_from_slice(&expected_key_event);
+        assert_eq!(message.body, expected_body);
+    }
+
+    #[test]
+    fn a_key_release_round_trips_and_carries_down_false() {
+        let message = encode_key_event(9_999, KeyCode::Navigation, false);
+        let payload = message
+            .encode(DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE)
+            .expect("encode");
+        let decoded =
+            InputMessage::decode(&payload, DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE).expect("decode");
+        assert_eq!(decoded.id, InputMessageId::InputReport);
+        assert_eq!(decoded.body, message.body);
+        // Key.down (field 2) is 0x10, 0x00 for a release — present, not
+        // silently coalesced with the down=true case.
+        assert!(message.body.windows(2).any(|w| w == [0x10, 0x00]));
+    }
+
+    #[test]
+    fn every_key_code_produces_a_distinct_message() {
+        let bodies: Vec<Vec<u8>> = [
+            KeyCode::Media,
+            KeyCode::Navigation,
+            KeyCode::Radio,
+            KeyCode::Tel,
+        ]
+        .into_iter()
+        .map(|keycode| encode_key_event(0, keycode, true).body)
+        .collect();
+        for (index, body) in bodies.iter().enumerate() {
+            for (other_index, other_body) in bodies.iter().enumerate() {
+                if index != other_index {
+                    assert_ne!(body, other_body);
+                }
+            }
+        }
     }
 }

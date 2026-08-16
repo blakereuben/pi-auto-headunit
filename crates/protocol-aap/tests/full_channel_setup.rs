@@ -230,6 +230,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
             width: 800,
             height: 480,
             touch_type: TouchScreenType::Capacitive,
+            keycodes_supported: Vec::new(),
         }),
         media_audio: None,
         system_audio: None,

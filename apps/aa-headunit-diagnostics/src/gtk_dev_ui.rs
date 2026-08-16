@@ -748,6 +748,14 @@ fn dispatch_action(
             let next = next_rotation(current_rotation.get());
             apply_rotation(next, settings_panel, rotation_handle, current_rotation);
         }
+        // Sends a key event to the phone rather than touching local
+        // window/rotation state, so it's dispatched directly from the
+        // background protocol thread (the one with transport access) in
+        // `auth_discovery_probe.rs::service_touch_input`, not here.
+        Action::SwitchToMedia
+        | Action::SwitchToNavigation
+        | Action::SwitchToRadio
+        | Action::SwitchToPhone => {}
     }
 }
 

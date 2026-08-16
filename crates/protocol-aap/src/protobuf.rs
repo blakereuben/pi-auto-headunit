@@ -177,6 +177,34 @@ pub(crate) fn write_uint64_field(out: &mut Vec<u8>, field: u32, value: u64) {
     write_varint(out, value);
 }
 
+/// Writes a proto2 `bool` field — wire-identical to a varint (`0`/`1`),
+/// never sign-extended.
+pub(crate) fn write_bool_field(out: &mut Vec<u8>, field: u32, value: bool) {
+    write_tag(out, field, 0);
+    write_varint(out, u64::from(value));
+}
+
+/// Writes a packed-repeated `int32`/`uint32`/enum field: every value's raw
+/// varint, concatenated with no per-value tag, wrapped in one
+/// length-delimited field — proto2's `[packed=true]` wire format (see
+/// `InputSourceService.keycodes_supported`,
+/// `docs/protocol/aasdk-adoption.md`). Writes nothing at all for an empty
+/// slice, matching every other `optional`/`repeated` field in this crate
+/// being omitted rather than written as an empty/default value. A decoder
+/// must still accept the unpacked form too (`decode_key_binding_request`'s
+/// own doc comment) — that tolerance is a reader-side concern; a writer
+/// only needs to produce one correct, spec-preferred form.
+pub(crate) fn write_packed_uint32_field(out: &mut Vec<u8>, field: u32, values: &[u32]) {
+    if values.is_empty() {
+        return;
+    }
+    let mut packed = Vec::new();
+    for &value in values {
+        write_varint(&mut packed, u64::from(value));
+    }
+    write_length_delimited_field(out, field, &packed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +391,14 @@ mod tests {
         assert_eq!((field, wire_type), (7, 0));
         let value = read_varint::<TestError>(&out, &mut cursor).expect("value");
         assert_eq!(value, 300);
+    }
+
+    #[test]
+    fn write_bool_field_encodes_zero_and_one_never_ten_bytes() {
+        let mut out = Vec::new();
+        write_bool_field(&mut out, 2, true);
+        write_bool_field(&mut out, 3, false);
+        assert_eq!(out, vec![0x10, 0x01, 0x18, 0x00]);
     }
 
     #[test]

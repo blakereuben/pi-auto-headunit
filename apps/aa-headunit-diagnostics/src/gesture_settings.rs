@@ -48,20 +48,37 @@ pub const MAX_ARM_WINDOW_SECONDS: u32 = 30;
 /// the operator stuck with no gesture-driven way back to fullscreen video
 /// once triggered — the settings panel's own "Close" button doesn't touch
 /// window state at all, so it couldn't help either).
+///
+/// The four `SwitchTo*` actions send a car-specific `KeyCode` (`Media` /
+/// `Navigation` / `Radio` / `Tel`) to the phone via
+/// `protocol_aap::encode_key_event` — confirmed, sourced wire values
+/// (`docs/protocol/aasdk-adoption.md`'s `KeyCode` section), but the actual
+/// on-phone *effect* is an unverified assumption (switches to whichever
+/// app the phone has set as default for that category — no approved
+/// source describes launching a specific named app). Real-hardware-
+/// untested as of 2026-08-16; see `MILESTONE_CHECKLIST.md` M3.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     OpenSettings,
     ToggleFullscreen,
     CycleRotation,
+    SwitchToMedia,
+    SwitchToNavigation,
+    SwitchToRadio,
+    SwitchToPhone,
 }
 
 impl Action {
     #[must_use]
-    pub const fn all() -> [Action; 3] {
+    pub const fn all() -> [Action; 7] {
         [
             Action::OpenSettings,
             Action::ToggleFullscreen,
             Action::CycleRotation,
+            Action::SwitchToMedia,
+            Action::SwitchToNavigation,
+            Action::SwitchToRadio,
+            Action::SwitchToPhone,
         ]
     }
 
@@ -71,6 +88,23 @@ impl Action {
             Action::OpenSettings => "Open settings",
             Action::ToggleFullscreen => "Toggle fullscreen",
             Action::CycleRotation => "Cycle rotation",
+            Action::SwitchToMedia => "Switch to media",
+            Action::SwitchToNavigation => "Switch to navigation",
+            Action::SwitchToRadio => "Switch to radio",
+            Action::SwitchToPhone => "Switch to phone",
+        }
+    }
+
+    /// The `KeyCode` a `SwitchTo*` action sends, if it is one — `None` for
+    /// every other action (dispatched locally, no phone message).
+    #[must_use]
+    pub const fn key_code(self) -> Option<protocol_aap::KeyCode> {
+        match self {
+            Action::SwitchToMedia => Some(protocol_aap::KeyCode::Media),
+            Action::SwitchToNavigation => Some(protocol_aap::KeyCode::Navigation),
+            Action::SwitchToRadio => Some(protocol_aap::KeyCode::Radio),
+            Action::SwitchToPhone => Some(protocol_aap::KeyCode::Tel),
+            Action::OpenSettings | Action::ToggleFullscreen | Action::CycleRotation => None,
         }
     }
 
@@ -79,6 +113,10 @@ impl Action {
             Action::OpenSettings => "open_settings",
             Action::ToggleFullscreen => "toggle_fullscreen",
             Action::CycleRotation => "cycle_rotation",
+            Action::SwitchToMedia => "switch_to_media",
+            Action::SwitchToNavigation => "switch_to_navigation",
+            Action::SwitchToRadio => "switch_to_radio",
+            Action::SwitchToPhone => "switch_to_phone",
         }
     }
 
@@ -87,6 +125,10 @@ impl Action {
             "open_settings" => Some(Action::OpenSettings),
             "toggle_fullscreen" => Some(Action::ToggleFullscreen),
             "cycle_rotation" => Some(Action::CycleRotation),
+            "switch_to_media" => Some(Action::SwitchToMedia),
+            "switch_to_navigation" => Some(Action::SwitchToNavigation),
+            "switch_to_radio" => Some(Action::SwitchToRadio),
+            "switch_to_phone" => Some(Action::SwitchToPhone),
             _ => None,
         }
     }
@@ -96,8 +138,12 @@ impl Action {
 pub fn gesture_label(gesture: GestureId) -> &'static str {
     match gesture {
         GestureId::DoubleTap => "Double-tap",
-        GestureId::ThreeFingerTap => "Three-finger tap",
+        GestureId::TwoFingerTap => "Two-finger tap",
         GestureId::LongPress => "Long press",
+        GestureId::SwipeUp => "Swipe up",
+        GestureId::SwipeDown => "Swipe down",
+        GestureId::SwipeLeft => "Swipe left",
+        GestureId::SwipeRight => "Swipe right",
     }
 }
 
@@ -106,9 +152,17 @@ struct RawSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     double_tap: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    three_finger_tap: Option<String>,
+    two_finger_tap: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     long_press: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swipe_up: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swipe_down: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swipe_left: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swipe_right: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     arm_window_seconds: Option<u32>,
 }
@@ -117,8 +171,12 @@ impl RawSettings {
     fn get(&self, gesture: GestureId) -> Option<&str> {
         match gesture {
             GestureId::DoubleTap => self.double_tap.as_deref(),
-            GestureId::ThreeFingerTap => self.three_finger_tap.as_deref(),
+            GestureId::TwoFingerTap => self.two_finger_tap.as_deref(),
             GestureId::LongPress => self.long_press.as_deref(),
+            GestureId::SwipeUp => self.swipe_up.as_deref(),
+            GestureId::SwipeDown => self.swipe_down.as_deref(),
+            GestureId::SwipeLeft => self.swipe_left.as_deref(),
+            GestureId::SwipeRight => self.swipe_right.as_deref(),
         }
     }
 
@@ -126,8 +184,12 @@ impl RawSettings {
         let value = Some(action.key().to_string());
         match gesture {
             GestureId::DoubleTap => self.double_tap = value,
-            GestureId::ThreeFingerTap => self.three_finger_tap = value,
+            GestureId::TwoFingerTap => self.two_finger_tap = value,
             GestureId::LongPress => self.long_press = value,
+            GestureId::SwipeUp => self.swipe_up = value,
+            GestureId::SwipeDown => self.swipe_down = value,
+            GestureId::SwipeLeft => self.swipe_left = value,
+            GestureId::SwipeRight => self.swipe_right = value,
         }
     }
 }
@@ -140,16 +202,23 @@ pub struct GestureSettings {
 
 impl GestureSettings {
     /// Double-tap opens settings (the discoverable, always-safe default);
-    /// three-finger tap toggles fullscreen; long press cycles rotation —
-    /// chosen so every gesture does something distinct out of the box,
-    /// not because any one mapping is more "correct" than another. Fully
-    /// reassignable afterward.
+    /// two-finger tap toggles fullscreen; long press cycles rotation; the
+    /// four swipe directions default to the four category-switch actions
+    /// in a spatially obvious layout (up→navigation, down→media, matching
+    /// how a map sits above and music sits below on a typical AA home
+    /// screen; left→phone, right→radio) — chosen so every gesture does
+    /// something distinct out of the box, not because any one mapping is
+    /// more "correct" than another. Fully reassignable afterward.
     #[must_use]
     pub fn defaults() -> Self {
         let mut mappings = HashMap::new();
         mappings.insert(GestureId::DoubleTap, Action::OpenSettings);
-        mappings.insert(GestureId::ThreeFingerTap, Action::ToggleFullscreen);
+        mappings.insert(GestureId::TwoFingerTap, Action::ToggleFullscreen);
         mappings.insert(GestureId::LongPress, Action::CycleRotation);
+        mappings.insert(GestureId::SwipeUp, Action::SwitchToNavigation);
+        mappings.insert(GestureId::SwipeDown, Action::SwitchToMedia);
+        mappings.insert(GestureId::SwipeLeft, Action::SwitchToPhone);
+        mappings.insert(GestureId::SwipeRight, Action::SwitchToRadio);
         Self {
             mappings,
             arm_window_seconds: DEFAULT_ARM_WINDOW_SECONDS,
@@ -237,13 +306,70 @@ mod tests {
             Action::OpenSettings
         );
         assert_eq!(
-            settings.action_for(GestureId::ThreeFingerTap),
+            settings.action_for(GestureId::TwoFingerTap),
             Action::ToggleFullscreen
         );
         assert_eq!(
             settings.action_for(GestureId::LongPress),
             Action::CycleRotation
         );
+        assert_eq!(
+            settings.action_for(GestureId::SwipeUp),
+            Action::SwitchToNavigation
+        );
+        assert_eq!(
+            settings.action_for(GestureId::SwipeDown),
+            Action::SwitchToMedia
+        );
+        assert_eq!(
+            settings.action_for(GestureId::SwipeLeft),
+            Action::SwitchToPhone
+        );
+        assert_eq!(
+            settings.action_for(GestureId::SwipeRight),
+            Action::SwitchToRadio
+        );
+    }
+
+    #[test]
+    fn every_switch_to_action_carries_the_expected_key_code() {
+        assert_eq!(
+            Action::SwitchToMedia.key_code(),
+            Some(protocol_aap::KeyCode::Media)
+        );
+        assert_eq!(
+            Action::SwitchToNavigation.key_code(),
+            Some(protocol_aap::KeyCode::Navigation)
+        );
+        assert_eq!(
+            Action::SwitchToRadio.key_code(),
+            Some(protocol_aap::KeyCode::Radio)
+        );
+        assert_eq!(
+            Action::SwitchToPhone.key_code(),
+            Some(protocol_aap::KeyCode::Tel)
+        );
+        assert_eq!(Action::OpenSettings.key_code(), None);
+        assert_eq!(Action::ToggleFullscreen.key_code(), None);
+        assert_eq!(Action::CycleRotation.key_code(), None);
+    }
+
+    #[test]
+    fn a_swipe_gesture_reassignment_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-gesture-settings-swipe-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = GestureSettings::defaults();
+        settings.set_action(GestureId::SwipeUp, Action::SwitchToRadio);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = GestureSettings::load(&path);
+        assert_eq!(loaded.action_for(GestureId::SwipeUp), Action::SwitchToRadio);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -265,7 +391,7 @@ mod tests {
         );
         // Untouched mappings still round-trip correctly.
         assert_eq!(
-            loaded.action_for(GestureId::ThreeFingerTap),
+            loaded.action_for(GestureId::TwoFingerTap),
             Action::ToggleFullscreen
         );
 
@@ -326,7 +452,7 @@ mod tests {
     #[test]
     fn gesture_label_is_distinct_and_readable_per_gesture() {
         assert_eq!(gesture_label(GestureId::DoubleTap), "Double-tap");
-        assert_eq!(gesture_label(GestureId::ThreeFingerTap), "Three-finger tap");
+        assert_eq!(gesture_label(GestureId::TwoFingerTap), "Two-finger tap");
         assert_eq!(gesture_label(GestureId::LongPress), "Long press");
     }
 }

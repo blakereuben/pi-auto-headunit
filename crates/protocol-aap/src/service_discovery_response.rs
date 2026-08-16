@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::control::{ControlMessage, ControlMessageId};
+use crate::input_message::KeyCode;
 use crate::protobuf;
 use crate::sensor::SensorType;
 use crate::service_catalogue::{ServiceCatalogue, ServiceKind};
@@ -162,11 +163,21 @@ impl TouchScreenType {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TouchCapability {
     pub width: i32,
     pub height: i32,
     pub touch_type: TouchScreenType,
+    /// `InputSourceService.keycodes_supported` (field 1, a sibling of
+    /// `touchscreen` field 2 within the same service, not nested under
+    /// it — modeled here anyway to keep one capability struct per
+    /// `ServiceKind::Input`, matching this project's existing "one
+    /// capability struct per advertised service" shape). See
+    /// `docs/protocol/aasdk-adoption.md`'s `KeyCode` section: only the
+    /// four car-specific category-switch codes this project can
+    /// actually send (`input_message::encode_key_event`) are ever
+    /// advertised here.
+    pub keycodes_supported: Vec<KeyCode>,
 }
 
 /// `aap_protobuf.service.media.sink.message.AudioStreamType`.
@@ -387,8 +398,9 @@ fn encode_service(
         ServiceKind::Input => {
             let capability = capabilities
                 .touch
+                .clone()
                 .ok_or(ServiceDiscoveryResponseError::MissingCapability { channel_id, kind })?;
-            let input_source_service = encode_input_source_service(capability);
+            let input_source_service = encode_input_source_service(&capability);
             // Service.input_source_service (field 4).
             protobuf::write_length_delimited_field(&mut out, 4, &input_source_service);
         }
@@ -551,7 +563,7 @@ fn encode_media_sink_audio(capability: AudioCapability) -> Vec<u8> {
     media_sink_service
 }
 
-fn encode_input_source_service(capability: TouchCapability) -> Vec<u8> {
+fn encode_input_source_service(capability: &TouchCapability) -> Vec<u8> {
     let mut touch_screen = Vec::new();
     // TouchScreen.width (field 1, required int32).
     protobuf::write_int32_field(&mut touch_screen, 1, capability.width);
@@ -561,6 +573,16 @@ fn encode_input_source_service(capability: TouchCapability) -> Vec<u8> {
     protobuf::write_int32_field(&mut touch_screen, 3, capability.touch_type.wire_value());
 
     let mut input_source_service = Vec::new();
+    // InputSourceService.keycodes_supported (field 1, repeated packed
+    // int32) — written before touchscreen (field 2) to match field
+    // declaration order, though wire order doesn't matter to a
+    // spec-compliant decoder.
+    let keycodes: Vec<u32> = capability
+        .keycodes_supported
+        .iter()
+        .map(|keycode| keycode.wire_value())
+        .collect();
+    protobuf::write_packed_uint32_field(&mut input_source_service, 1, &keycodes);
     // InputSourceService.touchscreen (field 2, repeated TouchScreen).
     protobuf::write_length_delimited_field(&mut input_source_service, 2, &touch_screen);
     input_source_service
@@ -809,6 +831,7 @@ mod tests {
                 width: 2,
                 height: 3,
                 touch_type: TouchScreenType::Capacitive,
+                keycodes_supported: Vec::new(),
             }),
             media_audio: None,
             system_audio: None,
@@ -907,6 +930,7 @@ mod tests {
                 width: 800,
                 height: 480,
                 touch_type: TouchScreenType::Capacitive,
+                keycodes_supported: Vec::new(),
             }),
             media_audio: None,
             system_audio: None,
@@ -1134,6 +1158,7 @@ mod tests {
                 width: 800,
                 height: 480,
                 touch_type: TouchScreenType::Capacitive,
+                keycodes_supported: Vec::new(),
             }),
             media_audio: Some(AudioCapability {
                 sampling_rate: 48_000,

@@ -472,7 +472,7 @@ use protocol_aap::{
     DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
     DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE, DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption,
     FrameError, FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
-    HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus,
+    HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus, KeyCode,
     MediaMessageId, Message, MessageAssembler, MessageType, MicrophoneCapability, NavFocusType,
     PingConfiguration, PointerAction, ProtocolLimits, SensorCapability, SensorMessage,
     SensorMessageId, SensorType, ServiceAvailability, ServiceCandidate, ServiceCapabilities,
@@ -485,7 +485,7 @@ use protocol_aap::{
     decode_ping_response, decode_sensor_request, decode_voice_session_notification,
     encode_audio_focus_notification, encode_bluetooth_pairing_response, encode_byebye_response,
     encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
-    encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
+    encode_key_event, encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
     encode_ping_response, encode_sensor_response, encode_service_discovery_response,
     encode_touch_report, encode_video_focus_notification,
 };
@@ -1870,6 +1870,47 @@ fn report_settings_gesture_event(event: GestureEvent, touch_settings: &TouchSett
     let _ = touch_settings.gesture_sender.send(event);
 }
 
+/// If `gesture`'s currently-assigned action is one of the four
+/// `SwitchTo*` category switches, sends the matching real-key-press pair
+/// (`down=true` then `down=false`, per `encode_key_event`'s doc comment)
+/// on the already-open input channel. A no-op for every other action —
+/// those are dispatched locally by the GTK thread instead (see
+/// `gtk_dev_ui.rs::dispatch_action`'s doc comment for why the split), and
+/// this function has no window/rotation state to act on anyway. Runs on
+/// this background thread specifically because it's the one thread with
+/// transport/TLS access.
+fn dispatch_gesture_key_action<T: SessionTransport>(
+    gesture: platform_api::GestureId,
+    timestamp_micros: u64,
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let action = crate::gesture_settings::GestureSettings::load(std::path::Path::new(
+        crate::gesture_settings::DEFAULT_SETTINGS_PATH,
+    ))
+    .action_for(gesture);
+    let Some(keycode) = action.key_code() else {
+        return Ok(());
+    };
+    for down in [true, false] {
+        let message = encode_key_event(timestamp_micros, keycode, down);
+        let payload = message
+            .encode(DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE)
+            .map_err(|error| CliError::Protocol(error.to_string()))?;
+        send_encrypted(
+            transport,
+            tls,
+            INPUT_CHANNEL_ID,
+            MessageType::Specific,
+            &payload,
+            limits,
+        )?;
+    }
+    println!("probe_state=settings_gesture_key_sent gesture={gesture:?} key_code={keycode:?}");
+    Ok(())
+}
+
 /// Drains every touch frame queued since the last call and sends each as an
 /// `InputReport` — proactive, not a reply to anything the phone sent, so
 /// this only runs once the input channel has actually reached `Open`
@@ -1909,6 +1950,15 @@ fn service_touch_input<T: SessionTransport>(
     while let Some(frame) = touch_source.try_recv() {
         if let Some(touch_settings) = touch_settings {
             if let Some(event) = gesture_detector.push(&frame) {
+                if let GestureEvent::Completed(gesture) = event {
+                    dispatch_gesture_key_action(
+                        gesture,
+                        frame.timestamp_micros,
+                        transport,
+                        tls,
+                        limits,
+                    )?;
+                }
                 report_settings_gesture_event(event, touch_settings);
             }
         }
@@ -2168,6 +2218,16 @@ fn build_service_capabilities() -> ServiceCapabilities {
             width: TOUCH_COORDINATE_SPACE_WIDTH,
             height: TOUCH_COORDINATE_SPACE_HEIGHT,
             touch_type: TouchScreenType::Capacitive,
+            // The four car-specific category-switch codes this project
+            // can actually send (`send_category_switch_key_event`) —
+            // real-hardware-untested until M3's swipe-direction gestures
+            // are tried against a real phone (`MILESTONE_CHECKLIST.md`).
+            keycodes_supported: vec![
+                KeyCode::Media,
+                KeyCode::Navigation,
+                KeyCode::Radio,
+                KeyCode::Tel,
+            ],
         }),
         media_audio: Some(AudioCapability {
             sampling_rate: MEDIA_AUDIO_SAMPLING_RATE,

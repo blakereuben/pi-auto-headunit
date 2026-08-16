@@ -66,8 +66,8 @@ pub use control::{
 };
 pub use input_message::{
     DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE, InputMessage, InputMessageError, InputMessageId,
-    KeyBindingError, KeyBindingStatus, PointerAction, TouchPointer, decode_key_binding_request,
-    encode_key_binding_response, encode_touch_report,
+    KeyBindingError, KeyBindingStatus, KeyCode, PointerAction, TouchPointer,
+    decode_key_binding_request, encode_key_binding_response, encode_key_event, encode_touch_report,
 };
 pub use media_message::{
     DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE, MediaMessage, MediaMessageError, MediaMessageId,

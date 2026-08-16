@@ -204,6 +204,73 @@ Nested `InputSourceService.TouchPad`:
 | 7 | `tap_as_select` | optional | `bool` |
 | 8 | `sensitivity` | optional | `int32` |
 
+### `InputReport` (`aap_protobuf.service.inputsource.message.InputReport`, proto2)
+
+Mapped 2026-08-16 for `MILESTONE_CHECKLIST.md` M3's touch item (the
+head-unit-initiated key-event path, alongside the already-implemented
+`touch_event` field), read directly from the pinned revision via
+`protobuf/aap_protobuf/service/inputsource/message/InputReport.proto`:
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `timestamp` | required | `uint64` |
+| 2 | `disp_channel_id` | optional | `int32` (deprecated upstream) |
+| 3 | `touch_event` | optional | `message.TouchEvent` (already implemented) |
+| 4 | `key_event` | optional | `message.KeyEvent` (mapped below) |
+| 5 | `absolute_event` | optional | `message.AbsoluteEvent` (not yet mapped) |
+| 6 | `relative_event` | optional | `message.RelativeEvent` (not yet mapped) |
+| 7 | `touchpad_event` | optional | `message.TouchEvent` |
+
+`KeyEvent` (`aap_protobuf.service.inputsource.message.KeyEvent`, proto2,
+`service/inputsource/message/KeyEvent.proto`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `keys` | repeated | nested `Key` (below) |
+
+Nested `KeyEvent.Key`:
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `keycode` | required | `uint32` |
+| 2 | `down` | required | `bool` |
+| 3 | `metastate` | required | `uint32` |
+| 4 | `longpress` | optional | `bool` |
+
+A real key press/release is sent as two separate `InputReport`s (`down`
+`true` then `down` `false`), matching how a real physical button works —
+no evidence either way yet on whether the phone requires both, but this
+is the same shape every other real head-unit implementation uses, so it
+is what this project sends. `metastate` (modifier keys — Shift/Ctrl/etc.)
+is always `0` here; nothing in this project generates keyboard modifier
+state. `longpress` is omitted (`None`) — this project only ever sends a
+single quick press/release pair, never a genuine long-press key hold.
+
+### `KeyCode` (`aap_protobuf.service.media.sink.message.KeyCode`, enum) — car-specific values used
+
+Only the four car-specific category-switch values this project actually
+sends are read numerically here; the full 278-value enum is already
+described qualitatively above (`initial_content_keycode` mapping). Read
+directly from the pinned revision via
+`protobuf/aap_protobuf/service/media/sink/message/KeyCode.proto`:
+
+| Name | Value |
+|---|---|
+| `KEYCODE_MEDIA` | 65537 |
+| `KEYCODE_NAVIGATION` | 65538 |
+| `KEYCODE_RADIO` | 65539 |
+| `KEYCODE_TEL` | 65540 |
+
+No document in this project's approved sources describes the *effect* of
+sending one of these — the working assumption, consistent with how every
+other real head-unit implementation uses this same car-specific block, is
+that each switches Android Auto to the corresponding app category (media
+player / navigation / radio / phone) using whatever app the phone has
+configured as default for that category — not a way to launch a specific
+named app, which this project's approved sources document no mechanism
+for at all. This is a real-hardware-untested assumption until proven
+otherwise (`MILESTONE_CHECKLIST.md` M3).
+
 ### `MediaSourceService` (`aap_protobuf.service.media.source.MediaSourceService`, proto2)
 
 | # | Name | Label | Type |
