@@ -124,7 +124,19 @@ pub enum VideoSetupAction {
     SendMedia(MediaMessage),
     /// `Start` was received and accepted — the channel is now `Ready` and
     /// stays `Ready`; further `InboundMedia` events keep flowing to
-    /// `handle_media` rather than being rejected.
+    /// `handle_media` rather than being rejected. Also fires a second (or
+    /// later) time if the phone sends another `Start` while already
+    /// `Ready` — real-hardware-confirmed (2026-08-16, a 30-minute
+    /// interactive bench trial) when the foreground app changed on the
+    /// phone (Google Maps to `YouTube` Music) mid-session; this project has
+    /// no pinned-source citation for exactly why, only that a real phone
+    /// does it and the session must survive it rather than fail closed.
+    /// `session_id`/`configuration_index` are re-validated exactly as the
+    /// first time (`apply_start`); a caller that built a render pipeline on
+    /// the first `Ready` may see the same values again (safe as a no-op)
+    /// or a genuinely new `configuration_index` (a codec change mid-session
+    /// — not yet exercised by any real trial; callers should treat this as
+    /// a real possibility, not assume it can't happen).
     Ready {
         session_id: i32,
         configuration_index: u32,
@@ -394,18 +406,29 @@ impl VideoSetupStateMachine {
                 id: message.id,
             });
         }
+        let action = self.apply_start(message)?;
+        self.state = VideoSetupState::Ready;
+        Ok(vec![action])
+    }
+
+    /// Validates and applies a `Start` message's `session_id`/
+    /// `configuration_index`, shared by the initial `AwaitingStart` ->
+    /// `Ready` transition (`handle_start`) and a real-hardware-confirmed
+    /// re-`Start` while already `Ready` (`handle_media`) — see
+    /// `VideoSetupAction::Ready`'s doc comment. Never touches `self.state`;
+    /// callers decide the transition (or lack of one).
+    fn apply_start(&mut self, message: &MediaMessage) -> Result<VideoSetupAction, VideoSetupError> {
         let (session_id, configuration_index) = decode_start(&message.body)?;
         if Some(configuration_index) != self.offered_configuration_index {
             return Err(VideoSetupError::UnknownConfigurationIndex {
                 requested: configuration_index,
             });
         }
-        self.state = VideoSetupState::Ready;
         self.session_id = Some(session_id);
-        Ok(vec![VideoSetupAction::Ready {
+        Ok(VideoSetupAction::Ready {
             session_id,
             configuration_index,
-        }])
+        })
     }
 
     /// Handles traffic once `Ready` — the phone (as `MediaSinkService`
@@ -451,6 +474,11 @@ impl VideoSetupStateMachine {
                 )),
             ]),
             MediaMessageId::Stop => Ok(vec![VideoSetupAction::StopReceived]),
+            // Real-hardware-confirmed (see `VideoSetupAction::Ready`'s doc
+            // comment): the phone can resend `Start` while already `Ready`.
+            // Stays `Ready` either way — `apply_start` never touches
+            // `self.state`.
+            MediaMessageId::Start => Ok(vec![self.apply_start(message)?]),
             other => Err(VideoSetupError::UnexpectedMediaMessage {
                 state: self.state,
                 id: other,
@@ -759,13 +787,46 @@ mod tests {
             .advance(VideoSetupEvent::InboundMedia(&start_payload(7, 0)))
             .expect("start");
         assert_eq!(
-            machine.advance(VideoSetupEvent::InboundMedia(&start_payload(7, 0))),
+            machine.advance(VideoSetupEvent::InboundMedia(&media_message(
+                MediaMessageId::Setup,
+                setup_payload(MEDIA_CODEC_VIDEO_H264_BP),
+            ))),
             Err(VideoSetupError::UnexpectedMediaMessage {
                 state: VideoSetupState::Ready,
-                id: MediaMessageId::Start,
+                id: MediaMessageId::Setup,
             })
         );
         assert_eq!(machine.state(), VideoSetupState::Failed);
+    }
+
+    /// Real-hardware-confirmed 2026-08-16 (30-minute interactive bench
+    /// trial): a real phone resent `Start` on the video channel mid-session
+    /// after the foreground app changed (Google Maps -> `YouTube` Music).
+    /// The channel must survive this, not fail closed — see
+    /// `VideoSetupAction::Ready`'s doc comment.
+    #[test]
+    fn accepts_repeated_start_while_ready_as_reconfiguration() {
+        let mut machine = VideoSetupStateMachine::new();
+        machine
+            .advance(VideoSetupEvent::InboundMedia(&setup_payload(
+                MEDIA_CODEC_VIDEO_H264_BP,
+            )))
+            .expect("setup");
+        machine
+            .advance(VideoSetupEvent::InboundMedia(&start_payload(7, 0)))
+            .expect("start");
+        assert_eq!(machine.state(), VideoSetupState::Ready);
+        let actions = machine
+            .advance(VideoSetupEvent::InboundMedia(&start_payload(9, 0)))
+            .expect("repeated start is accepted");
+        assert_eq!(
+            actions,
+            vec![VideoSetupAction::Ready {
+                session_id: 9,
+                configuration_index: 0,
+            }]
+        );
+        assert_eq!(machine.state(), VideoSetupState::Ready);
     }
 
     #[test]

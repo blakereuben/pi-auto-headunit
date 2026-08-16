@@ -61,7 +61,12 @@ pub enum AudioSetupAction {
     SendMedia(MediaMessage),
     /// `Start` was received and accepted — the channel is now `Ready` and
     /// stays `Ready`; further `InboundMedia` events keep flowing to
-    /// `handle_media` rather than being rejected.
+    /// `handle_media` rather than being rejected. Also fires again if the
+    /// phone sends another `Start` while already `Ready` — see
+    /// `crate::VideoSetupAction::Ready`'s doc comment for the real-hardware
+    /// confirmation (video channel; the audio channels share the identical
+    /// design and the same fix is applied here defensively, not yet
+    /// separately observed on an audio channel specifically).
     Ready {
         session_id: i32,
         configuration_index: u32,
@@ -296,18 +301,29 @@ impl AudioSetupStateMachine {
                 id: message.id,
             });
         }
+        let action = self.apply_start(message)?;
+        self.state = AudioSetupState::Ready;
+        Ok(vec![action])
+    }
+
+    /// Validates and applies a `Start` message's `session_id`/
+    /// `configuration_index`, shared by the initial `AwaitingStart` ->
+    /// `Ready` transition (`handle_start`) and a repeated `Start` while
+    /// already `Ready` (`handle_media`) — see `AudioSetupAction::Ready`'s
+    /// doc comment. Never touches `self.state`; callers decide the
+    /// transition (or lack of one).
+    fn apply_start(&mut self, message: &MediaMessage) -> Result<AudioSetupAction, AudioSetupError> {
         let (session_id, configuration_index) = decode_start(&message.body)?;
         if configuration_index != ADVERTISED_CONFIGURATION_INDEX {
             return Err(AudioSetupError::UnknownConfigurationIndex {
                 requested: configuration_index,
             });
         }
-        self.state = AudioSetupState::Ready;
         self.session_id = Some(session_id);
-        Ok(vec![AudioSetupAction::Ready {
+        Ok(AudioSetupAction::Ready {
             session_id,
             configuration_index,
-        }])
+        })
     }
 
     /// Handles traffic once `Ready` — the phone (as `MediaSinkService`
@@ -345,6 +361,9 @@ impl AudioSetupStateMachine {
                 AudioSetupAction::SendMedia(encode_media_ack(session_id)),
             ]),
             MediaMessageId::Stop => Ok(vec![AudioSetupAction::StopReceived]),
+            // See `AudioSetupAction::Ready`'s doc comment: a repeated
+            // `Start` while already `Ready` is accepted, not rejected.
+            MediaMessageId::Start => Ok(vec![self.apply_start(message)?]),
             other => Err(AudioSetupError::UnexpectedMediaMessage {
                 state: self.state,
                 id: other,
@@ -569,13 +588,43 @@ mod tests {
             .advance(AudioSetupEvent::InboundMedia(&start_payload(7, 0)))
             .expect("start");
         assert_eq!(
-            machine.advance(AudioSetupEvent::InboundMedia(&start_payload(7, 0))),
+            machine.advance(AudioSetupEvent::InboundMedia(&media_message(
+                MediaMessageId::Setup,
+                setup_payload(MEDIA_CODEC_AUDIO_PCM),
+            ))),
             Err(AudioSetupError::UnexpectedMediaMessage {
                 state: AudioSetupState::Ready,
-                id: MediaMessageId::Start,
+                id: MediaMessageId::Setup,
             })
         );
         assert_eq!(machine.state(), AudioSetupState::Failed);
+    }
+
+    /// Mirrors `crate::video_setup`'s identical test — see
+    /// `AudioSetupAction::Ready`'s doc comment.
+    #[test]
+    fn accepts_repeated_start_while_ready_as_reconfiguration() {
+        let mut machine = AudioSetupStateMachine::new();
+        machine
+            .advance(AudioSetupEvent::InboundMedia(&setup_payload(
+                MEDIA_CODEC_AUDIO_PCM,
+            )))
+            .expect("setup");
+        machine
+            .advance(AudioSetupEvent::InboundMedia(&start_payload(7, 0)))
+            .expect("start");
+        assert_eq!(machine.state(), AudioSetupState::Ready);
+        let actions = machine
+            .advance(AudioSetupEvent::InboundMedia(&start_payload(9, 0)))
+            .expect("repeated start is accepted");
+        assert_eq!(
+            actions,
+            vec![AudioSetupAction::Ready {
+                session_id: 9,
+                configuration_index: 0,
+            }]
+        );
+        assert_eq!(machine.state(), AudioSetupState::Ready);
     }
 
     #[test]

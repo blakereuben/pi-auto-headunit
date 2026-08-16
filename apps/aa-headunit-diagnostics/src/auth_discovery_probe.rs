@@ -656,6 +656,22 @@ const PROACTIVE_WRITE_RESILIENCE_ENV_VAR: &str = "AA_HEADUNIT_SURVIVE_PROACTIVE_
 /// multiple reactive-triggered attempts. Off by default.
 const REACTIVE_TRIGGERED_PROACTIVE_SEND_ENV_VAR: &str =
     "AA_HEADUNIT_REACTIVE_TRIGGERED_PROACTIVE_SEND";
+/// `AA_HEADUNIT_OBSERVATION_WINDOW_SECONDS` (a positive integer number of
+/// seconds) — overrides `PROBE_TIMEOUT`/`PROACTIVE_WRITE_SURVIVAL_TIMEOUT`
+/// with an explicit operator-chosen observation window. Added for
+/// `MILESTONES.md`'s 30-minute interactive drive-bench exit gate ("a
+/// 30-minute interactive drive-bench scenario passes on the Pi 5 without
+/// crash, unbounded memory growth, or private payload logging") — every
+/// window length this probe has used until now was a temporary, hand-edited
+/// constant for a specific one-off experiment (see `PROBE_TIMEOUT`'s own
+/// doc-comment history above), which doesn't fit a scenario meant to be
+/// re-run for future soak/regression testing without editing source each
+/// time. Off by default (falls back to the existing `PROBE_TIMEOUT`/
+/// `PROACTIVE_WRITE_SURVIVAL_TIMEOUT` selection unchanged). An unparseable
+/// or zero value is a usage error, not silently ignored — an operator who
+/// set this explicitly should learn immediately if it didn't take effect,
+/// rather than unknowingly running the default short window instead.
+const OBSERVATION_WINDOW_SECONDS_ENV_VAR: &str = "AA_HEADUNIT_OBSERVATION_WINDOW_SECONDS";
 /// Advertised in `ServiceDiscoveryResponse.connection_configuration.ping_configuration`
 /// (`build_service_capabilities`). All four `PingConfiguration` sub-fields
 /// are now populated with LIVI's own confirmed values
@@ -945,9 +961,10 @@ struct ExperimentFlags {
     ping_isolation: bool,
     survive_proactive_write_timeout: bool,
     reactive_triggered_proactive_send: bool,
+    observation_window_override: Option<Duration>,
 }
 
-fn read_experiment_flags() -> ExperimentFlags {
+fn read_experiment_flags() -> Result<ExperimentFlags, CliError> {
     let ping_isolation = std::env::var_os(PING_ISOLATION_ENV_VAR).is_some();
     if ping_isolation {
         println!("probe_state=ping_isolation_experiment_enabled");
@@ -965,11 +982,34 @@ fn read_experiment_flags() -> ExperimentFlags {
     if survive_proactive_write_timeout {
         println!("probe_state=proactive_write_resilience_experiment_enabled");
     }
-    ExperimentFlags {
+    let observation_window_override = read_observation_window_override()?;
+    Ok(ExperimentFlags {
         ping_isolation,
         survive_proactive_write_timeout,
         reactive_triggered_proactive_send,
-    }
+        observation_window_override,
+    })
+}
+
+/// Parses `OBSERVATION_WINDOW_SECONDS_ENV_VAR` — see that constant's doc
+/// comment for why an invalid value is a hard usage error rather than a
+/// silently-ignored fallback.
+fn read_observation_window_override() -> Result<Option<Duration>, CliError> {
+    let Some(value) = std::env::var_os(OBSERVATION_WINDOW_SECONDS_ENV_VAR) else {
+        return Ok(None);
+    };
+    let seconds = value
+        .to_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "{OBSERVATION_WINDOW_SECONDS_ENV_VAR} must be a positive integer number of seconds"
+            ))
+        })?;
+    println!("probe_state=observation_window_override_enabled");
+    println!("observation_window_override_seconds={seconds}");
+    Ok(Some(Duration::from_secs(seconds)))
 }
 
 // `video_render_target` is only ever borrowed inside this function (passed
@@ -1014,7 +1054,7 @@ pub fn run<T: SessionTransport>(
     drop(credentials);
 
     let limits = ProtocolLimits::default();
-    let experiment_flags = read_experiment_flags();
+    let experiment_flags = read_experiment_flags()?;
     let mut handshake = HandshakeStateMachine::default();
     let mut actions: VecDeque<_> = handshake
         .advance(HandshakeEvent::Start)
@@ -1024,11 +1064,13 @@ pub fn run<T: SessionTransport>(
     println!("probe_state=version_request_sent");
 
     let deadline = Instant::now()
-        + if experiment_flags.survive_proactive_write_timeout {
-            PROACTIVE_WRITE_SURVIVAL_TIMEOUT
-        } else {
-            PROBE_TIMEOUT
-        };
+        + experiment_flags.observation_window_override.unwrap_or(
+            if experiment_flags.survive_proactive_write_timeout {
+                PROACTIVE_WRITE_SURVIVAL_TIMEOUT
+            } else {
+                PROBE_TIMEOUT
+            },
+        );
     // Not armed at session start (see `PingState`'s doc comment) — this
     // probe never sends a `PingRequest` until `ServiceDiscoveryResponse`
     // has actually been sent.
