@@ -49,6 +49,12 @@ fn run(args: &[String]) -> Result<(), CliError> {
         [command] if command == "wireless" => wireless(&[]),
         [command, rest @ ..] if command == "wireless" => wireless(rest),
         [group, command] if group == "media" && command == "probe" => media_probe(),
+        [group, command] if group == "media" && command == "mic-probe" => media_mic_probe(None),
+        [group, command, seconds_flag, seconds]
+            if group == "media" && command == "mic-probe" && seconds_flag == "--seconds" =>
+        {
+            media_mic_probe(Some(parse_mic_probe_seconds(seconds)?))
+        }
         [group, command, rest @ ..] if group == "credentials" => credentials_command(command, rest),
         [group, command] if group == "usb" && command == "list" => usb_list(),
         [group, command] if group == "developer" && command == "tcp-probe" => developer_tcp_probe(),
@@ -269,6 +275,7 @@ fn print_help() {
            preflight\n\
            wireless [--wifi auto|onboard|STABLE_ID] [--bluetooth auto|onboard|STABLE_ID]\n\
            media probe\n\
+           media mic-probe [--seconds N]\n\
            credentials check --certificate PATH --private-key PATH\n\
            credentials install --certificate PATH --private-key PATH\n\
            credentials status [--config PATH]\n\
@@ -533,6 +540,84 @@ fn media_probe() -> Result<(), CliError> {
 #[cfg(not(target_os = "linux"))]
 fn media_probe() -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
+}
+
+const DEFAULT_MIC_PROBE_SECONDS: u64 = 8;
+
+#[cfg(target_os = "linux")]
+fn media_mic_probe(seconds: Option<u64>) -> Result<(), CliError> {
+    use media_gstreamer::{AudioCaptureSource, AudioFormat};
+    use std::time::{Duration, Instant};
+
+    let seconds = seconds.unwrap_or(DEFAULT_MIC_PROBE_SECONDS);
+    let format = AudioFormat {
+        sampling_rate: 48_000,
+        channels: 1,
+    };
+    let backend = media_gstreamer::GstreamerBackend::new()
+        .map_err(|error| CliError::Media(error.to_string()))?;
+    let pipeline = backend
+        .build_audio_capture_pipeline(
+            format,
+            AudioCaptureSource::Pulse,
+            Duration::from_millis(200),
+        )
+        .map_err(|error| CliError::Media(error.to_string()))?;
+    pipeline
+        .start()
+        .map_err(|error| CliError::Media(error.to_string()))?;
+
+    println!("mic_probe_source=pipewire_pulse_default_input");
+    println!(
+        "mic_probe_rate={} mic_probe_channels={}",
+        format.sampling_rate, format.channels
+    );
+    println!("mic_probe_duration_seconds={seconds}");
+
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut max_peak_db = f64::NEG_INFINITY;
+    let mut max_rms_db = f64::NEG_INFINITY;
+    let mut messages = 0u32;
+    while Instant::now() < deadline {
+        match pipeline.next_level(Duration::from_secs(2)) {
+            Ok(Some(level)) => {
+                messages += 1;
+                max_peak_db = level.peak_db.iter().copied().fold(max_peak_db, f64::max);
+                max_rms_db = level.rms_db.iter().copied().fold(max_rms_db, f64::max);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = pipeline.shutdown();
+                return Err(CliError::Media(error.to_string()));
+            }
+        }
+    }
+    pipeline
+        .shutdown()
+        .map_err(|error| CliError::Media(error.to_string()))?;
+
+    println!("mic_probe_level_messages={messages}");
+    println!("mic_probe_peak_db={max_peak_db:.1}");
+    println!("mic_probe_rms_db={max_rms_db:.1}");
+    println!("mic_probe_result=complete");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn media_mic_probe(_seconds: Option<u64>) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
+}
+
+fn parse_mic_probe_seconds(value: &str) -> Result<u64, CliError> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| CliError::Usage(format!("invalid mic-probe duration: {value}")))?;
+    if !(1..=60).contains(&seconds) {
+        return Err(CliError::Usage(
+            "mic-probe duration must be between 1 and 60 seconds".into(),
+        ));
+    }
+    Ok(seconds)
 }
 
 fn usb_list() -> Result<(), CliError> {

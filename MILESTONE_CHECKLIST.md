@@ -86,7 +86,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [x] Implement and verify the GStreamer decoder-capability adapter on the Pi 5.
 - [x] Detect Pi 5 audio routes and document that the DSI reference setup exposes no usable onboard/HDMI sink.
 - [x] Test the USB sound card as an audio-output fallback.
-- [ ] Select and test a microphone input.
+- [x] Select and test a microphone input. **Real-hardware-confirmed 2026-08-16.** A new `media mic-probe [--seconds N]` diagnostic (`crates/media-gstreamer/src/capture.rs`) measures peak/RMS signal level via `GStreamer`'s `level` element from the `PipeWire`-Pulse default input device — a level meter, not a recorder, so raw captured audio never reaches this project's own code. Selected device: the same USB sound card already used as the Pi 5 audio-output fallback (`docs/hardware/evidence/pi5-2026-08-04.md`). An earlier trial with this exact device found only static, no intelligible speech; this trial found the opposite — a live loopback (`pulsesrc ! pulsesink`, ad hoc, not committed) let the operator directly confirm hearing their own voice clearly, and a `mic-probe` run with the operator speaking continuously showed a clear, non-clipping rise from the idle baseline (`-15.4 dB` idle peak to `-1.1 dB` speaking peak). Full detail: `docs/hardware/evidence/pi5-2026-08-16-microphone.md`. Wiring captured audio into the AAP microphone channel remains the separate, not-yet-started M4 item ("Capture microphone audio for voice interaction").
 - [ ] Measure video, audio, memory, CPU, and touch latency against provisional targets.
 
 ## M4 — Complete wired Android Auto on Pi 5

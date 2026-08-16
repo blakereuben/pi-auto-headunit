@@ -100,4 +100,13 @@ impl GstreamerBackend {
     ) -> Result<crate::AudioPlaybackPipeline, GstreamerError> {
         crate::AudioPlaybackPipeline::new(format, sink)
     }
+
+    pub fn build_audio_capture_pipeline(
+        &self,
+        format: crate::AudioFormat,
+        source: crate::AudioCaptureSource,
+        interval: std::time::Duration,
+    ) -> Result<crate::AudioCapturePipeline, GstreamerError> {
+        crate::AudioCapturePipeline::new(format, source, interval)
+    }
 }
