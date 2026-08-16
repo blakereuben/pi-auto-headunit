@@ -46,6 +46,12 @@ const AOA_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
 /// simplest option that still avoids spinning the CPU while the phone is
 /// genuinely gone.
 const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+/// How long the physical-replug popup (`replug_prompt::show_until_replugged`)
+/// waits for the operator to actually unplug and replug the phone.
+/// Generous — this is a human-paced wait, not a protocol timeout — but
+/// still bounded, matching this project's "never wait forever silently"
+/// discipline.
+const PHYSICAL_REPLUG_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Classifies a `CliError` from one supervised cycle as worth retrying
 /// (the phone/session didn't finish as hoped — unplug, timeout, transient
@@ -143,6 +149,13 @@ struct SupervisedSession {
     tls12_compatibility: bool,
     last_known: Option<UsbDeviceId>,
     cancel: CancellationFlag,
+    /// How many retryable failures have happened in a row, reset to 0 on
+    /// any successful cycle (`run()`'s wrapper around `attempt`, based on
+    /// `is_retryable`). Drives `resolve_device`'s escalation: 0 = normal
+    /// reconnect, 1 = try a software `soft_reset` first (Blake's explicit
+    /// instruction, 2026-08-16), 2+ = ask for a physical replug via
+    /// `replug_prompt`.
+    consecutive_failures: u32,
 }
 
 impl SupervisedSession {
@@ -165,19 +178,7 @@ impl SupervisedSession {
             .map_err(|error| CliError::Credentials(error.to_string()))?;
 
         let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
-        let candidate = match &self.last_known {
-            None => backend
-                .list_devices()
-                .map_err(CliError::Aoa)?
-                .into_iter()
-                .find(|device| {
-                    device.bus == self.selector_bus && device.address == self.selector_address
-                })
-                .ok_or(CliError::Aoa(AoaError::Unplugged))?,
-            Some(previous) => backend
-                .wait_for_reconnect(previous, REDISCOVERY_TIMEOUT)
-                .map_err(CliError::Aoa)?,
-        };
+        let candidate = self.resolve_device(&backend, cycle)?;
         println!("probe_state=supervisor_device_resolved cycle={cycle} device={candidate}");
         crate::connection_state::report(crate::connection_state::ConnectionState::Connecting);
         self.last_known = Some(candidate.clone());
@@ -197,6 +198,58 @@ impl SupervisedSession {
             crate::auth_discovery_probe::VideoRenderTarget::Wayland,
             &self.cancel,
         )
+    }
+
+    /// Resolves this cycle's device, escalating recovery based on
+    /// `self.consecutive_failures` (see that field's doc comment). Split
+    /// out of `attempt` purely to keep it under `clippy::too_many_lines`.
+    fn resolve_device(
+        &self,
+        backend: &transport_usb::LibUsbAoaBackend,
+        cycle: u32,
+    ) -> Result<UsbDeviceId, CliError> {
+        let Some(previous) = &self.last_known else {
+            return backend
+                .list_devices()
+                .map_err(CliError::Aoa)?
+                .into_iter()
+                .find(|device| {
+                    device.bus == self.selector_bus && device.address == self.selector_address
+                })
+                .ok_or(CliError::Aoa(AoaError::Unplugged));
+        };
+        match self.consecutive_failures {
+            0 => backend
+                .wait_for_reconnect(previous, REDISCOVERY_TIMEOUT)
+                .map_err(CliError::Aoa),
+            1 => {
+                println!("probe_state=supervisor_soft_reset_attempt cycle={cycle}");
+                match backend.soft_reset(previous) {
+                    Ok(()) => {
+                        println!(
+                            "probe_state=supervisor_soft_reset_result cycle={cycle} outcome=ok"
+                        );
+                    }
+                    Err(error) => println!(
+                        "probe_state=supervisor_soft_reset_result cycle={cycle} outcome=failed reason={error}"
+                    ),
+                }
+                backend
+                    .wait_for_reconnect(previous, REDISCOVERY_TIMEOUT)
+                    .map_err(CliError::Aoa)
+            }
+            _ => {
+                println!("probe_state=supervisor_physical_replug_requested cycle={cycle}");
+                let previous = previous.clone();
+                let wait_backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
+                let candidate = crate::replug_prompt::show_until_replugged(move || {
+                    wait_backend.wait_for_physical_replug(&previous, PHYSICAL_REPLUG_TIMEOUT)
+                })
+                .map_err(CliError::Aoa)?;
+                println!("probe_state=supervisor_physical_replug_confirmed cycle={cycle}");
+                Ok(candidate)
+            }
+        }
     }
 }
 
@@ -221,8 +274,21 @@ pub(crate) fn run(
         tls12_compatibility,
         last_known: None,
         cancel,
+        consecutive_failures: 0,
     };
-    supervise(|cycle| session.attempt(cycle), max_cycles, RETRY_BACKOFF)
+    supervise(
+        |cycle| {
+            let result = session.attempt(cycle);
+            match &result {
+                Ok(()) => session.consecutive_failures = 0,
+                Err(error) if is_retryable(error) => session.consecutive_failures += 1,
+                Err(_) => {}
+            }
+            result
+        },
+        max_cycles,
+        RETRY_BACKOFF,
+    )
 }
 
 #[cfg(test)]

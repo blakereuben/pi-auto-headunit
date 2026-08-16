@@ -214,6 +214,57 @@ impl LibUsbAoaBackend {
                 && candidate.port_path == original.port_path
         })
     }
+
+    /// Performs a software-only USB port reset (`libusb_reset_device`, via
+    /// `rusb`'s `DeviceHandle::reset`) — no physical unplug involved. Added
+    /// 2026-08-16 at Blake's explicit request: a phone left in a stale
+    /// post-session protocol state (still expecting encrypted post-
+    /// handshake traffic from a prior run) can make a fresh
+    /// `auth-discovery-probe` cycle fail immediately (real-hardware-
+    /// observed: `encrypted frame received before TLS handshake
+    /// completed`) even though the device never physically disconnected.
+    /// This is `usb session-supervisor`'s first, software-only recovery
+    /// attempt before it ever asks the operator to physically replug —
+    /// see `apps/aa-headunit-diagnostics/src/session_supervisor.rs`. Not
+    /// guaranteed to help: the reset is a USB-layer signal, and whether
+    /// the phone's own Android Auto app session state actually clears in
+    /// response is outside this project's control and untested against a
+    /// real repeat failure as of this addition — callers must still treat
+    /// a repeated failure as needing a real physical replug
+    /// (`wait_for_physical_replug`), not retry this indefinitely.
+    pub fn soft_reset(&self, device: &UsbDeviceId) -> Result<(), AoaError> {
+        self.open_device(device)?.reset().map_err(map_usb_error)
+    }
+
+    /// Waits for `original` to become physically absent, then waits for a
+    /// device to reappear at the same port. Unlike `wait_for_reconnect`,
+    /// which only waits for *reappearance* and matches immediately if the
+    /// device never actually left — the common case right after
+    /// `soft_reset`, which doesn't necessarily change the device's
+    /// enumerated bus/address — this confirms a genuine physical replug.
+    /// Used only once `soft_reset` has already been tried for the same
+    /// failure streak and the next cycle failed again, so a caller (the
+    /// popup in `replug_prompt.rs`) can honestly tell the operator a real
+    /// physical replug is what's actually needed, and know when it
+    /// happened.
+    pub fn wait_for_physical_replug(
+        &self,
+        original: &UsbDeviceId,
+        timeout: Duration,
+    ) -> Result<UsbDeviceId, AoaError> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let present = self.list_devices()?.iter().any(|candidate| {
+                candidate.bus == original.bus && candidate.address == original.address
+            });
+            if !present {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        self.wait_for_reconnect(original, remaining)
+    }
 }
 
 impl LibUsbBulkTransport {

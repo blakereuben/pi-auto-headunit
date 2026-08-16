@@ -19,6 +19,9 @@ mod credentials;
 mod session_supervisor;
 
 #[cfg(target_os = "linux")]
+mod replug_prompt;
+
+#[cfg(target_os = "linux")]
 mod connection_state;
 
 #[cfg(target_os = "linux")]
