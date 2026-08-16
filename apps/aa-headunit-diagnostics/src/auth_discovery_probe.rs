@@ -848,12 +848,29 @@ enum AudioPlaybackState {
     /// Backend is ready; pipeline not yet built (waiting for `Ready`).
     NotStarted(GstreamerBackend),
     /// Pipeline built and playing.
-    Running(AudioPlaybackPipeline),
+    Running(RunningAudioPipeline),
     /// Construction, start, or a later push/bus error occurred — no
     /// further attempts are made this run, but the probe (and acking)
     /// keeps going. The error is printed at the point of failure, not
     /// retained here.
     Failed,
+}
+
+/// A running audio pipeline plus the bookkeeping needed to measure this
+/// channel's real start latency exactly once: `started_at` is recorded the
+/// instant the pipeline reaches `Playing`
+/// (`start_audio_playback_pipeline`), and `first_frame_latency_logged`
+/// latches after the first real `MediaDataReceived` push
+/// (`apply_to_running_audio_pipeline`) so the metric is reported once per
+/// channel, not once per frame. This is `MILESTONE_CHECKLIST.md` M3's
+/// "measure ... audio ... latency against provisional targets" — the PRD's
+/// "audio start latency below 150 ms" target — measuring software dispatch
+/// latency (`Start` handled/pipeline started to first real frame pushed),
+/// not glass-to-glass audible time, which no in-process timestamp can see.
+struct RunningAudioPipeline {
+    pipeline: AudioPlaybackPipeline,
+    started_at: std::time::Instant,
+    first_frame_latency_logged: bool,
 }
 
 /// Bundles every real media pipeline's lifecycle state together — purely
@@ -2392,7 +2409,11 @@ fn start_audio_playback_pipeline(
         Ok(pipeline) => match pipeline.start() {
             Ok(()) => {
                 println!("probe_state={label}_playback_pipeline_started");
-                *audio_playback = AudioPlaybackState::Running(pipeline);
+                *audio_playback = AudioPlaybackState::Running(RunningAudioPipeline {
+                    pipeline,
+                    started_at: std::time::Instant::now(),
+                    first_frame_latency_logged: false,
+                });
             }
             Err(error) => {
                 println!("probe_state={label}_playback_pipeline_start_failed");
@@ -2408,6 +2429,32 @@ fn start_audio_playback_pipeline(
     }
 }
 
+/// Pushes into an already-`Running` pipeline and, on the first successful
+/// push only, logs this channel's start latency (see
+/// `RunningAudioPipeline`'s doc comment). Returns the same
+/// `Some((state, error))`/`None` shape `apply_to_running_audio_pipeline`
+/// reports upward.
+fn push_and_check_running_audio_pipeline(
+    running: &mut RunningAudioPipeline,
+    label: &str,
+    push: impl FnOnce(&AudioPlaybackPipeline) -> Result<(), media_gstreamer::GstreamerError>,
+) -> Option<(&'static str, media_gstreamer::GstreamerError)> {
+    if let Err(error) = push(&running.pipeline) {
+        return Some(("playback_push_failed", error));
+    }
+    if !running.first_frame_latency_logged {
+        running.first_frame_latency_logged = true;
+        println!(
+            "probe_metric={label}_audio_start_latency_ms={}",
+            running.started_at.elapsed().as_millis()
+        );
+    }
+    running
+        .pipeline
+        .poll_bus_error()
+        .map(|error| ("playback_pipeline_error", error))
+}
+
 /// Runs `push` against the pipeline only if `audio_playback` is currently
 /// `Running`; a no-op otherwise. Mirrors `apply_to_running_pipeline`; a
 /// push error or a bus error observed right after demotes `audio_playback`
@@ -2419,12 +2466,9 @@ fn apply_to_running_audio_pipeline(
     push: impl FnOnce(&AudioPlaybackPipeline) -> Result<(), media_gstreamer::GstreamerError>,
 ) {
     let failure = match audio_playback {
-        AudioPlaybackState::Running(pipeline) => match push(pipeline) {
-            Err(error) => Some(("playback_push_failed", error)),
-            Ok(()) => pipeline
-                .poll_bus_error()
-                .map(|error| ("playback_pipeline_error", error)),
-        },
+        AudioPlaybackState::Running(running) => {
+            push_and_check_running_audio_pipeline(running, label, push)
+        }
         _ => None,
     };
     if let Some((state, error)) = failure {
