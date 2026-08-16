@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+# Real deployment finding (2026-08): running the diagnostics CLI as root
+# (needed only because `/etc/aa-headunit` was root-only) breaks audio
+# playback outright — PulseAudio/PipeWire refuse a connection from a uid
+# that doesn't own the caller's own `XDG_RUNTIME_DIR`. USB access already
+# works unprivileged via the `plugdev` udev rule (see
+# `packaging/udev/70-aa-headunit.rules`); this makes credential access work
+# unprivileged too, via a dedicated `aa-headunit` group rather than loosening
+# any single file's own permissions. The private key file itself keeps its
+# existing strict, no-group/no-other 0600 check
+# (`crates/credential-store/src/linux.rs`) unchanged — this only widens who
+# can traverse/write the *parent* directory to create their own credential
+# files there, once, unprivileged.
+
+case "$1" in
+    configure)
+        if ! getent group aa-headunit >/dev/null 2>&1; then
+            addgroup --system aa-headunit
+        fi
+        if [ -d /etc/aa-headunit ]; then
+            chown root:aa-headunit /etc/aa-headunit
+            chmod 0770 /etc/aa-headunit
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

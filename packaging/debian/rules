@@ -14,11 +14,5 @@ override_dh_auto_install:
 		debian/aa-headunit-diagnostics/usr/bin/aa-headunit-diagnostics
 	install -D -m0644 config/default.toml \
 		debian/aa-headunit-diagnostics/etc/aa-headunit/config.toml
-	install -d -m0700 \
-		debian/aa-headunit-diagnostics/etc/aa-headunit/credentials
 	install -D -m0644 packaging/udev/70-aa-headunit.rules \
 		debian/aa-headunit-diagnostics/usr/lib/udev/rules.d/70-aa-headunit.rules
-
-override_dh_fixperms:
-	dh_fixperms
-	chmod 0700 debian/aa-headunit-diagnostics/etc/aa-headunit/credentials

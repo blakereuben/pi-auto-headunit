@@ -19,35 +19,51 @@ The check reads bounded regular files, verifies current certificate dates, verif
 
 ## System installation
 
-Install an authorised pair using:
+**One-time group setup**: the package's `postinst` creates a dedicated `aa-headunit` system group and makes `/etc/aa-headunit` group-writable (`root:aa-headunit`, `0770`) so that authorised operators never need `sudo`/root for day-to-day credential or probe commands. Add yourself once, then start a fresh login session (group membership only takes effect in new sessions):
 
 ```sh
-sudo aa-headunit-diagnostics credentials install \
+sudo usermod -aG aa-headunit "$USER"
+# log out and back in (or `newgrp aa-headunit` for the current shell only)
+```
+
+Install an authorised pair — no `sudo` needed once the group membership above is active:
+
+```sh
+aa-headunit-diagnostics credentials install \
   --certificate /path/to/headunit.crt \
   --private-key /path/to/headunit.key
 ```
 
-The command installs new files at:
+The command creates `/etc/aa-headunit/credentials` itself, owned by the invoking user, and installs new files at:
 
 - `/etc/aa-headunit/credentials/headunit.crt` with mode `0644`;
-- `/etc/aa-headunit/credentials/headunit.key` with mode `0600`.
+- `/etc/aa-headunit/credentials/headunit.key` with mode `0600`, owned solely by the user who ran the command — `crates/credential-store`'s loader rejects any group- or other-readable private key regardless of group membership, so group access to the parent directory never weakens the key file's own protection.
 
 It refuses to overwrite an existing installation. Credential rotation will be a separate explicit operation so an interrupted setup cannot silently replace a working identity.
 
 Check the configured installation without opening USB or network transport:
 
 ```sh
-sudo aa-headunit-diagnostics credentials status
+aa-headunit-diagnostics credentials status
 ```
 
-The default paths are declared in `/etc/aa-headunit/config.toml`. The `.deb` creates the empty credential directory with mode `0700`; it never installs credential contents.
+The default paths are declared in `/etc/aa-headunit/config.toml`.
+
+**Migrating a pair installed before this change**: earlier installs (via `sudo credentials install`) left `/etc/aa-headunit/credentials` and its files owned by `root`, which still requires `sudo` regardless of group membership — file ownership, not group access, is what the private-key check keys off. To move an existing pair onto the unprivileged path, re-own it to the real operating user (replace `USER` and adjust the filenames if different), then confirm with `credentials status` unprivileged:
+
+```sh
+sudo chown -R "$USER:aa-headunit" /etc/aa-headunit/credentials
+aa-headunit-diagnostics credentials status
+```
+
+This changes ownership metadata only — it never reads, prints, or otherwise touches the certificate/private-key contents.
 
 ## Bounded interoperability probe
 
-After an authorised pair is installed, the diagnostics application can load it at runtime for an explicitly selected, bounded USB interoperability probe:
+After an authorised pair is installed, the diagnostics application can load it at runtime for an explicitly selected, bounded USB interoperability probe — unprivileged, once the group membership above is active:
 
 ```text
-sudo aa-headunit-diagnostics usb credential-probe \
+aa-headunit-diagnostics usb credential-probe \
   --device BUS:ADDRESS \
   --allow-live-aap
 ```
