@@ -268,8 +268,23 @@ that each switches Android Auto to the corresponding app category (media
 player / navigation / radio / phone) using whatever app the phone has
 configured as default for that category — not a way to launch a specific
 named app, which this project's approved sources document no mechanism
-for at all. This is a real-hardware-untested assumption until proven
-otherwise (`MILESTONE_CHECKLIST.md` M3).
+for at all.
+
+**Real-hardware result, 2026-08-16** (`docs/hardware/evidence/pi5-2026-08-16-swipe-category-switch.md`):
+confirmed correct for three of the four — `KEYCODE_MEDIA`,
+`KEYCODE_NAVIGATION`, and `KEYCODE_TEL` each visibly switched the phone's
+Android Auto screen to that category. `KEYCODE_RADIO` did not: the phone
+responded "AA was not available" even with a working, AA-registered radio
+app (RadioPlayer) installed and separately confirmed functional inside
+Android Auto — ruling out the original "no radio app registered" theory.
+`KeyCode` lives under `service.media.sink.message`, alongside ordinary
+media-transport keys (play/pause/skip/etc., see the qualitative
+description above); the current best guess is that `KEYCODE_RADIO`
+specifically targets a real broadcast-radio tuner/HAL integration this
+software-only head unit doesn't provide, rather than acting as a generic
+app-category switch the way the other three do — genuinely unconfirmed,
+no approved source describes it either way, and not investigated further
+this session.
 
 ### `MediaSourceService` (`aap_protobuf.service.media.source.MediaSourceService`, proto2)
 

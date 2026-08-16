@@ -40,18 +40,31 @@ operator on the physical screen and the phone, not inferred from logs:
   on the head-unit side (armed, completed, key event sent — no local
   error), but the phone responded with **"AA was not available"**. The
   video/audio session was not otherwise disrupted; this was specific to
-  the radio action. Given the other three category codes worked
-  correctly using the same mechanism, the most likely explanation is that
-  this phone simply has no Android-Auto-compatible radio app registered
-  as the default handler for that category, not a defect in the encoding
-  or dispatch path — genuinely unconfirmed, not investigated further this
-  session.
+  the radio action.
+
+### Follow-up trial: radio app installed
+
+The operator installed RadioPlayer (an Android Auto-compatible radio
+app) on the test phone and confirmed it works correctly *inside* Android
+Auto (opened and used it directly). Re-ran the same swipe-right gesture
+afterward, same 001:034 device, `AA_HEADUNIT_OBSERVATION_WINDOW_SECONDS=120`
+for a longer trial window: **swipe-right still produced "AA not
+available"**, confirmed directly by the operator. This rules out the
+original "no radio app registered" theory — the app exists, is
+AA-registered, and works. The current best guess (see
+`docs/protocol/aasdk-adoption.md`'s `KeyCode` section) is that
+`KEYCODE_RADIO` targets a real broadcast-radio tuner/HAL this
+software-only head unit doesn't provide, distinct from the generic
+app-category switching the other three car-specific codes perform — not
+confirmed by any approved source, not investigated further this session.
 
 ## Outcome
 
 Three of four category-switch actions (navigation, media, phone) are now
 real-hardware-confirmed working end to end: gesture → key event → real
-app switch on the phone. The radio action is real-hardware-tested but
-inconclusive (phone-side "not available" response, not a local failure)
-— left as a known, documented open question rather than treated as a
-proven success or a bug to chase blindly.
+app switch on the phone. The radio action is real-hardware-confirmed
+*not* to work as a generic app-category switch, even with a working
+AA-registered radio app installed — genuinely refuted, not just
+inconclusive, and left as an open protocol question (likely a
+tuner-hardware-specific key, not an app switch) rather than a bug to
+chase blindly.
