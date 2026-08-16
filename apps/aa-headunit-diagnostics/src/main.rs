@@ -21,6 +21,9 @@ mod connection_state;
 #[cfg(target_os = "linux")]
 mod gtk_dev_ui;
 
+#[cfg(target_os = "linux")]
+mod wireless_bootstrap;
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match run(&args) {
@@ -226,6 +229,21 @@ fn run(args: &[String]) -> Result<(), CliError> {
         {
             usb_gtk_dev_ui(selector, true)
         }
+        [group, command, allow]
+            if group == "usb"
+                && command == "wireless-bootstrap-probe"
+                && allow == "--allow-live-aap" =>
+        {
+            usb_wireless_bootstrap_probe(false)
+        }
+        [group, command, allow, compatibility]
+            if group == "usb"
+                && command == "wireless-bootstrap-probe"
+                && allow == "--allow-live-aap"
+                && compatibility == "--tls12-compat" =>
+        {
+            usb_wireless_bootstrap_probe(true)
+        }
         [] | [..] if args.iter().any(|arg| arg == "--help" || arg == "-h") => {
             print_help();
             Ok(())
@@ -262,6 +280,7 @@ fn print_help() {
            usb auth-discovery-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
            usb session-supervisor --device BUS:ADDRESS --allow-live-aap [--tls12-compat] [--max-cycles COUNT]\n\
            usb gtk-dev-ui --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
+           usb wireless-bootstrap-probe --allow-live-aap [--tls12-compat]\n\
          \n\
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
         env!("CARGO_PKG_VERSION")
@@ -1033,6 +1052,16 @@ fn usb_gtk_dev_ui(selector: &str, tls12_compatibility: bool) -> Result<(), CliEr
 
 #[cfg(not(target_os = "linux"))]
 fn usb_gtk_dev_ui(_: &str, _: bool) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+fn usb_wireless_bootstrap_probe(tls12_compatibility: bool) -> Result<(), CliError> {
+    wireless_bootstrap::run(tls12_compatibility)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn usb_wireless_bootstrap_probe(_: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 

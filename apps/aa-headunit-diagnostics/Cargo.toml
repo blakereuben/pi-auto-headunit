@@ -20,6 +20,7 @@ credential-store = { path = "../../crates/credential-store" }
 gtk4 = "0.10.3"
 protocol-aap = { path = "../../crates/protocol-aap" }
 security-openssl = { path = "../../crates/security-openssl" }
+transport-bluetooth = { version = "0.1.0", path = "../../crates/transport-bluetooth" }
 
 [lints]
 workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "transport-bluetooth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+transport-api = { path = "../transport-api" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["rfcomm", "bluetoothd"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

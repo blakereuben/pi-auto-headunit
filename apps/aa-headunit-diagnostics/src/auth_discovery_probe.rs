@@ -466,8 +466,9 @@ use platform_linux::touch::{EvdevTouchSource, discover_touchscreen};
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
     AudioSetupAction, AudioSetupEvent, AudioSetupStateMachine, AudioStreamType,
-    BluetoothCapability, ByeByeReason, ChannelOpenAction, ChannelOpenEvent, ChannelOpenState,
-    ChannelOpenStateMachine, ControlMessage, ControlMessageId, DEFAULT_MAX_CONTROL_BODY_SIZE,
+    BluetoothCapability, BluetoothMessageId, BluetoothServiceMessage, ByeByeReason,
+    ChannelOpenAction, ChannelOpenEvent, ChannelOpenState, ChannelOpenStateMachine, ControlMessage,
+    ControlMessageId, DEFAULT_MAX_BLUETOOTH_MESSAGE_BODY_SIZE, DEFAULT_MAX_CONTROL_BODY_SIZE,
     DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE, DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE,
     DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE, DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption,
     FrameError, FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
@@ -479,13 +480,14 @@ use protocol_aap::{
     TouchCapability, TouchPointer, TouchScreenType, UiConfig, VideoCapability,
     VideoCodecResolution, VideoCodecType, VideoFocusMode, VideoFrameRate, VideoSetupAction,
     VideoSetupEvent, VideoSetupState, VideoSetupStateMachine, decode_audio_focus_request,
-    decode_byebye_request, decode_frame, decode_key_binding_request, decode_nav_focus_request,
+    decode_bluetooth_pairing_request, decode_byebye_request, decode_frame,
+    decode_key_binding_request, decode_nav_focus_request, decode_ping_request,
     decode_ping_response, decode_sensor_request, decode_voice_session_notification,
-    encode_audio_focus_notification, encode_byebye_response,
+    encode_audio_focus_notification, encode_bluetooth_pairing_response, encode_byebye_response,
     encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
     encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
-    encode_sensor_response, encode_service_discovery_response, encode_touch_report,
-    encode_video_focus_notification,
+    encode_ping_response, encode_sensor_response, encode_service_discovery_response,
+    encode_touch_report, encode_video_focus_notification,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
 use std::collections::{HashMap, VecDeque};
@@ -1253,6 +1255,15 @@ fn arm_channels_after_service_discovery(
     }
 }
 
+fn simple_channel_is_open(
+    simple_channels: &HashMap<u8, ChannelOpenStateMachine>,
+    channel_id: u8,
+) -> bool {
+    simple_channels
+        .get(&channel_id)
+        .is_some_and(|machine| machine.state() == ChannelOpenState::Open)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_message<T: SessionTransport>(
     message: &Message,
@@ -1346,11 +1357,13 @@ fn handle_message<T: SessionTransport>(
     } else if message.channel_id == SENSORS_CHANNEL_ID {
         handle_sensors_channel_message(message, sensors_channel, tls, transport, limits)?;
     } else if message.channel_id == INPUT_CHANNEL_ID
-        && simple_channels
-            .get(&INPUT_CHANNEL_ID)
-            .is_some_and(|machine| machine.state() == ChannelOpenState::Open)
+        && simple_channel_is_open(simple_channels, INPUT_CHANNEL_ID)
     {
         handle_input_channel_message(message, tls, transport, limits)?;
+    } else if message.channel_id == BLUETOOTH_CHANNEL_ID
+        && simple_channel_is_open(simple_channels, BLUETOOTH_CHANNEL_ID)
+    {
+        handle_bluetooth_channel_message(message, tls, transport, limits)?;
     } else {
         handle_simple_channel_message(
             message.channel_id,
@@ -1362,9 +1375,7 @@ fn handle_message<T: SessionTransport>(
         )?;
     }
 
-    let input_open = simple_channels
-        .get(&INPUT_CHANNEL_ID)
-        .is_some_and(|machine| machine.state() == ChannelOpenState::Open);
+    let input_open = simple_channel_is_open(simple_channels, INPUT_CHANNEL_ID);
     let video_ready = matches!(
         video_channel,
         Some(VideoChannel::Open(machine)) if machine.state() == VideoSetupState::Ready
@@ -1379,8 +1390,8 @@ fn handle_message<T: SessionTransport>(
 /// Handles control-channel traffic that arrives after `HandshakeStateMachine`
 /// has already reached `ServiceDiscoveryReceived` (which has nothing further
 /// to do — see `docs/protocol/error-2-investigation.md`). `AudioFocusRequest`,
-/// `PingResponse`, `NavFocusRequest`, `VoiceSessionNotification`, and
-/// `ByeByeRequest` are handled; anything else fails closed with a clear,
+/// `PingResponse`, `PingRequest`, `NavFocusRequest`, `VoiceSessionNotification`,
+/// and `ByeByeRequest` are handled; anything else fails closed with a clear,
 /// distinct error naming the unexpected message, so if the phone sends
 /// something new next, that's immediately visible rather than silently
 /// swallowed. Returns `Some(reason)` only for `ByeByeRequest` — the
@@ -1399,6 +1410,18 @@ fn handle_message<T: SessionTransport>(
 /// module doc comment for the full citation, including the separate
 /// head-unit-initiated push-to-talk path this project has no working
 /// microphone hardware to exercise.
+///
+/// `PingRequest` arriving from the phone (not just the `PingResponse` this
+/// probe expects after its own proactive `PingRequest`, see
+/// `PING_INTERVAL`) was found the same way, in the first successful
+/// wireless-bootstrap trial: the session had already reached
+/// `connection_state=connected` with video rendering, then the phone sent
+/// its own `PingRequest` and this probe treated it as an unmapped control
+/// message and aborted the whole session over it — a real, previously-
+/// unseen defect, not specific to wireless. AASDK's `ControlServiceChannel`
+/// handles `PingRequest` from either side; replying with a `PingResponse`
+/// echoing the phone's own timestamp (`crates/protocol-aap/src/ping.rs`)
+/// mirrors exactly what this probe already does when it's the initiator.
 fn handle_post_discovery_control_message<T: SessionTransport>(
     message: &Message,
     ping_state: &mut Option<PingState>,
@@ -1436,6 +1459,19 @@ fn handle_post_discovery_control_message<T: SessionTransport>(
             if let Some(state) = ping_state.as_mut() {
                 state.last_pong = Instant::now();
             }
+            Ok(None)
+        }
+        ControlMessageId::PingRequest => {
+            let requested_timestamp = decode_ping_request(&control_message.body)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            println!("probe_state=phone_ping_request_received");
+            println!("phone_ping_requested_timestamp={requested_timestamp}");
+            let response = encode_ping_response(requested_timestamp);
+            let payload = response
+                .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits)?;
+            println!("probe_state=phone_ping_response_sent");
             Ok(None)
         }
         ControlMessageId::NavFocusRequest => {
@@ -2895,6 +2931,60 @@ fn handle_input_channel_message<T: SessionTransport>(
         }
         other => Err(CliError::Protocol(format!(
             "unexpected input message {other:?} after open"
+        ))),
+    }
+}
+
+/// Handles traffic on the Bluetooth channel after it opens. Until a real
+/// wireless-bootstrap trial (first successful run, real hardware) this
+/// channel had never been observed carrying anything beyond
+/// `ChannelOpenRequest` — the earlier research pass in
+/// `docs/protocol/wireless-source-assessment.md` concluded (from reading
+/// only `.proto`/README sources, not real traffic) that it was likely only
+/// used by an already-connected session bootstrapping a *future* reconnect,
+/// not something a phone would use mid-session. That assumption was wrong:
+/// a real phone sent a genuine `BluetoothPairingRequest` shortly after
+/// video frames started flowing. This probe has no real classic-Bluetooth
+/// audio pairing implemented, so it declines gracefully — see
+/// `encode_bluetooth_pairing_response`'s doc comment — rather than
+/// attempting or faking a pairing exchange.
+fn handle_bluetooth_channel_message<T: SessionTransport>(
+    message: &Message,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    if message.message_type != MessageType::Specific {
+        return Err(CliError::Protocol(
+            "unexpected message type on bluetooth channel after open".into(),
+        ));
+    }
+    let bluetooth_message =
+        BluetoothServiceMessage::decode(&message.payload, DEFAULT_MAX_BLUETOOTH_MESSAGE_BODY_SIZE)
+            .map_err(|error| CliError::Protocol(error.to_string()))?;
+    match bluetooth_message.id {
+        BluetoothMessageId::PairingRequest => {
+            let pairing_method = decode_bluetooth_pairing_request(&bluetooth_message.body)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            println!("probe_state=bluetooth_pairing_requested");
+            println!("bluetooth_pairing_requested_method={pairing_method:?}");
+            let response = encode_bluetooth_pairing_response();
+            let payload = response
+                .encode(DEFAULT_MAX_BLUETOOTH_MESSAGE_BODY_SIZE)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            send_encrypted(
+                transport,
+                tls,
+                BLUETOOTH_CHANNEL_ID,
+                MessageType::Specific,
+                &payload,
+                limits,
+            )?;
+            println!("probe_state=bluetooth_pairing_response_sent");
+            Ok(())
+        }
+        other => Err(CliError::Protocol(format!(
+            "unexpected bluetooth message {other:?} after open"
         ))),
     }
 }

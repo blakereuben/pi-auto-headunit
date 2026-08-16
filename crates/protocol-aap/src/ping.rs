@@ -86,6 +86,23 @@ pub fn encode_ping_request(timestamp_millis: i64) -> ControlMessage {
 /// required int64) — the exact value this probe sent in the matching
 /// `PingRequest`, per AASDK's `sendPingResponse`.
 pub fn decode_ping_response(body: &[u8]) -> Result<i64, PingError> {
+    decode_ping_timestamp(body)
+}
+
+/// Decodes a phone-initiated `PingRequest` and returns its `timestamp`
+/// (field 1, required int64). AASDK's `ControlServiceChannel` handles
+/// `PingRequest` arriving from either side — this probe previously only
+/// ever sent one and decoded the matching `PingResponse`; a real phone
+/// was observed sending its own `PingRequest` mid-session (real-hardware
+/// wireless trial, see `docs/protocol/error-2-investigation.md`-style
+/// finding logged in project history), which this probe rejected as an
+/// unexpected control message. Same wire shape as `PingResponse`, so this
+/// shares the same decode logic.
+pub fn decode_ping_request(body: &[u8]) -> Result<i64, PingError> {
+    decode_ping_timestamp(body)
+}
+
+fn decode_ping_timestamp(body: &[u8]) -> Result<i64, PingError> {
     let mut cursor = 0;
     let mut timestamp = None;
     while cursor < body.len() {
@@ -106,6 +123,18 @@ pub fn decode_ping_response(body: &[u8]) -> Result<i64, PingError> {
         }
     }
     timestamp.ok_or(PingError::MissingTimestamp)
+}
+
+/// Encodes `PingResponse` echoing back the `timestamp` (field 1) from a
+/// phone-initiated `PingRequest`, per AASDK's `sendPingResponse`.
+#[must_use]
+pub fn encode_ping_response(timestamp_millis: i64) -> ControlMessage {
+    let mut body = Vec::new();
+    protobuf::write_int64_field(&mut body, 1, timestamp_millis);
+    ControlMessage {
+        id: ControlMessageId::PingResponse,
+        body,
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +168,21 @@ mod tests {
         protobuf::write_int64_field(&mut body, 2, 99);
         protobuf::write_int64_field(&mut body, 1, 7);
         assert_eq!(decode_ping_response(&body), Ok(7));
+    }
+
+    #[test]
+    fn decodes_phone_initiated_ping_request() {
+        let mut body = Vec::new();
+        protobuf::write_int64_field(&mut body, 1, 55);
+        assert_eq!(decode_ping_request(&body), Ok(55));
+    }
+
+    #[test]
+    fn encodes_response_echoing_exact_timestamp() {
+        let message = encode_ping_response(1_700_000_000_123);
+        assert_eq!(message.id, ControlMessageId::PingResponse);
+        let mut expected = Vec::new();
+        protobuf::write_int64_field(&mut expected, 1, 1_700_000_000_123);
+        assert_eq!(message.body, expected);
     }
 }

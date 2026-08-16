@@ -13,9 +13,11 @@
 
 use std::fmt;
 
+mod aaw;
 mod assembly;
 mod audio_focus;
 mod audio_setup;
+mod bluetooth_service;
 mod byebye;
 mod channel_open;
 mod control;
@@ -32,6 +34,13 @@ mod tls;
 mod video_setup;
 mod voice_session;
 
+pub use aaw::{
+    AawError, AawMessageId, AawStatus, AccessPointType, DecodedAawMessage, WifiConnectionStatus,
+    WifiInfoResponse, WifiSecurityMode, WifiStartRequest, WifiStartResponse, WifiVersionResponse,
+    decode_aaw_message, decode_wifi_connection_status, decode_wifi_start_response,
+    decode_wifi_version_response, encode_aaw_message, encode_wifi_info_response,
+    encode_wifi_start_request,
+};
 pub use assembly::{AssemblyError, Message, MessageAssembler};
 pub use audio_focus::{
     AudioFocusError, AudioFocusRequestType, AudioFocusStateType, decode_audio_focus_request,
@@ -39,6 +48,11 @@ pub use audio_focus::{
 };
 pub use audio_setup::{
     AudioSetupAction, AudioSetupError, AudioSetupEvent, AudioSetupState, AudioSetupStateMachine,
+};
+pub use bluetooth_service::{
+    BluetoothMessageId, BluetoothPairingMethod, BluetoothServiceError, BluetoothServiceMessage,
+    DEFAULT_MAX_BLUETOOTH_MESSAGE_BODY_SIZE, decode_bluetooth_pairing_request,
+    encode_bluetooth_pairing_response,
 };
 pub use byebye::{ByeByeError, ByeByeReason, decode_byebye_request, encode_byebye_response};
 pub use channel_open::{
@@ -61,7 +75,9 @@ pub use media_message::{
 pub use nav_focus::{
     NavFocusError, NavFocusType, decode_nav_focus_request, encode_nav_focus_notification,
 };
-pub use ping::{PingError, decode_ping_response, encode_ping_request};
+pub use ping::{
+    PingError, decode_ping_request, decode_ping_response, encode_ping_request, encode_ping_response,
+};
 pub use sensor::{
     DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE, SensorError, SensorMessage, SensorMessageId, SensorType,
     decode_sensor_request, encode_driving_status_unrestricted_batch, encode_night_mode_batch,
