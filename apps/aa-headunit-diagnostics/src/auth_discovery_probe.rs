@@ -461,8 +461,8 @@ use media_gstreamer::{
     AudioFormat, AudioPlaybackPipeline, AudioSink, GstreamerBackend, GstreamerError, RenderSink,
     VideoRenderPipeline,
 };
-use platform_api::TouchPhase;
-use platform_linux::touch::{EvdevTouchSource, discover_touchscreen};
+use platform_api::{ArmedGestureDetector, GestureEvent, TouchPhase};
+use platform_linux::touch::{EvdevTouchSource, Rotation, SharedRotation, discover_touchscreen};
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
     AudioSetupAction, AudioSetupEvent, AudioSetupStateMachine, AudioStreamType,
@@ -672,6 +672,17 @@ const REACTIVE_TRIGGERED_PROACTIVE_SEND_ENV_VAR: &str =
 /// set this explicitly should learn immediately if it didn't take effect,
 /// rather than unknowingly running the default short window instead.
 const OBSERVATION_WINDOW_SECONDS_ENV_VAR: &str = "AA_HEADUNIT_OBSERVATION_WINDOW_SECONDS";
+/// Opt-in, off-by-default touch rotation override (`0`/`90`/`180`/`270`,
+/// `wl_output.transform` convention — see `platform_linux::touch::Rotation`).
+/// `MILESTONE_CHECKLIST.md` M3's "verify touch rotation ... in every
+/// supported screen orientation" needs a way to exercise rotations other
+/// than the reference rig's actual physical mounting (`Rotate0`); this env
+/// var is that way, matching `OBSERVATION_WINDOW_SECONDS_ENV_VAR`'s
+/// established pattern for an opt-in real-hardware experiment knob. Unset
+/// defaults to `Rotate0` (current behavior, unchanged); an unparseable
+/// value is a hard usage error, not a silent fallback, for the same reason
+/// `read_observation_window_override` treats one as an error.
+const TOUCH_ROTATION_ENV_VAR: &str = "AA_HEADUNIT_TOUCH_ROTATION";
 /// Advertised in `ServiceDiscoveryResponse.connection_configuration.ping_configuration`
 /// (`build_service_capabilities`). All four `PingConfiguration` sub-fields
 /// are now populated with LIVI's own confirmed values
@@ -718,6 +729,15 @@ const TOUCH_COORDINATE_SPACE_HEIGHT: i32 = 720;
 /// coordinates are actually scaled into (`open_touch_source`).
 const TOUCH_COORDINATE_SPACE_WIDTH_PIXELS: u32 = TOUCH_COORDINATE_SPACE_WIDTH.unsigned_abs();
 const TOUCH_COORDINATE_SPACE_HEIGHT_PIXELS: u32 = TOUCH_COORDINATE_SPACE_HEIGHT.unsigned_abs();
+/// The four-finger arming swipe (`platform_api::ArmedGestureDetector`)
+/// must travel at least this far (straight-line displacement, not
+/// specifically "downward" — see that crate's own doc comment for why)
+/// before lifting to count — short enough to be an easy deliberate
+/// gesture, long enough that ordinary incidental finger movement during
+/// real AA use (which never involves four simultaneous fingers anyway)
+/// can't trigger it by accident. A quarter of the negotiated video
+/// height's worth of physical panel travel.
+const SETTINGS_GESTURE_SWIPE_THRESHOLD_PIXELS: u32 = TOUCH_COORDINATE_SPACE_HEIGHT_PIXELS / 4;
 /// `OpenAuto`'s `ServiceFactory` defaults (`MediaAudioService`: 2ch/16-bit/48kHz;
 /// `SpeechAudioService`/`SystemAudioService`/`AudioInputService`: 1ch/16-bit/16kHz),
 /// not invented values.
@@ -785,7 +805,7 @@ enum VideoRenderState {
 /// itself, keeping GTK confined to `gtk_dev_ui.rs`.
 pub(crate) enum VideoRenderTarget {
     Wayland,
-    Gtk4Window(Gtk4WindowHandoff),
+    Gtk4Window(Gtk4WindowHandoff, TouchSettingsHandoff),
 }
 
 /// One-shot request/response channel pair, used at most once per session
@@ -802,6 +822,28 @@ pub(crate) enum VideoRenderTarget {
 pub(crate) struct Gtk4WindowHandoff {
     pub(crate) capability_sender: mpsc::Sender<DecoderCapability>,
     pub(crate) pipeline_receiver: mpsc::Receiver<Result<VideoRenderPipeline, GstreamerError>>,
+}
+
+/// Bridges the background protocol thread's touch handling to the GTK
+/// thread's settings panel (`gtk_dev_ui.rs`). `rotation_sender` fires at
+/// most once, as soon as the touchscreen (if any) is opened, carrying a
+/// live-adjustable [`SharedRotation`] handle — `None` if no touchscreen
+/// was found, so the GTK side can disable rotation controls rather than
+/// hang waiting for a handle that will never arrive. `arm_window_sender`
+/// fires once the same way, carrying the live-adjustable
+/// [`platform_api::SharedArmWindow`] handle so the settings panel's
+/// timeout control has something to change. `gesture_sender` fires every
+/// time `ArmedGestureDetector` reports an armed/disarmed/completed event;
+/// the GTK thread owns `gesture_settings::GestureSettings` and decides
+/// what a completed gesture actually does, since that mapping is
+/// head-unit/UI policy, not something the protocol/touch layer should
+/// know about — it only needs the armed/disarmed events to show/hide its
+/// own "listening" indicator.
+#[allow(clippy::struct_field_names)]
+pub(crate) struct TouchSettingsHandoff {
+    pub(crate) rotation_sender: mpsc::Sender<Option<SharedRotation>>,
+    pub(crate) arm_window_sender: mpsc::Sender<platform_api::SharedArmWindow>,
+    pub(crate) gesture_sender: mpsc::Sender<GestureEvent>,
 }
 
 /// Well under `PING_WATCHDOG_TIMEOUT` (5s) — deliberately, not just
@@ -979,6 +1021,7 @@ struct ExperimentFlags {
     survive_proactive_write_timeout: bool,
     reactive_triggered_proactive_send: bool,
     observation_window_override: Option<Duration>,
+    touch_rotation: Rotation,
 }
 
 fn read_experiment_flags() -> Result<ExperimentFlags, CliError> {
@@ -1000,18 +1043,42 @@ fn read_experiment_flags() -> Result<ExperimentFlags, CliError> {
         println!("probe_state=proactive_write_resilience_experiment_enabled");
     }
     let observation_window_override = read_observation_window_override()?;
+    let touch_rotation = read_touch_rotation()?;
     Ok(ExperimentFlags {
         ping_isolation,
         survive_proactive_write_timeout,
         reactive_triggered_proactive_send,
         observation_window_override,
+        touch_rotation,
     })
+}
+
+/// Parses `TOUCH_ROTATION_ENV_VAR` — see that constant's doc comment.
+fn read_touch_rotation() -> Result<Rotation, CliError> {
+    let Some(value) = std::env::var_os(TOUCH_ROTATION_ENV_VAR) else {
+        return Ok(Rotation::Rotate0);
+    };
+    let text = value.to_str().unwrap_or("");
+    let rotation = match text {
+        "0" => Rotation::Rotate0,
+        "90" => Rotation::Rotate90,
+        "180" => Rotation::Rotate180,
+        "270" => Rotation::Rotate270,
+        _ => {
+            return Err(CliError::Usage(format!(
+                "{TOUCH_ROTATION_ENV_VAR} must be one of 0, 90, 180, 270"
+            )));
+        }
+    };
+    println!("probe_state=touch_rotation_override_enabled");
+    println!("touch_rotation_override_degrees={text}");
+    Ok(rotation)
 }
 
 /// Parses `OBSERVATION_WINDOW_SECONDS_ENV_VAR` — see that constant's doc
 /// comment for why an invalid value is a hard usage error rather than a
 /// silently-ignored fallback.
-fn read_observation_window_override() -> Result<Option<Duration>, CliError> {
+pub(crate) fn read_observation_window_override() -> Result<Option<Duration>, CliError> {
     let Some(value) = std::env::var_os(OBSERVATION_WINDOW_SECONDS_ENV_VAR) else {
         return Ok(None);
     };
@@ -1080,14 +1147,7 @@ pub fn run<T: SessionTransport>(
     process_actions(&mut actions, &mut handshake, &mut tls, transport, limits)?;
     println!("probe_state=version_request_sent");
 
-    let deadline = Instant::now()
-        + experiment_flags.observation_window_override.unwrap_or(
-            if experiment_flags.survive_proactive_write_timeout {
-                PROACTIVE_WRITE_SURVIVAL_TIMEOUT
-            } else {
-                PROBE_TIMEOUT
-            },
-        );
+    let deadline = Instant::now() + observation_window(&experiment_flags);
     // Not armed at session start (see `PingState`'s doc comment) — this
     // probe never sends a `PingRequest` until `ServiceDiscoveryResponse`
     // has actually been sent.
@@ -1117,7 +1177,9 @@ pub fn run<T: SessionTransport>(
     // ServiceDiscoveryResponse is sent, then populated with one entry per
     // advertised channel_id.
     let mut simple_channels: HashMap<u8, ChannelOpenStateMachine> = HashMap::new();
-    let touch_source = open_touch_source();
+    let touch_source = open_touch_source(experiment_flags.touch_rotation);
+    let touch_settings = touch_settings_handoff(&video_render_target);
+    let mut gesture_detector = setup_settings_gesture(touch_source.as_ref(), touch_settings);
 
     while Instant::now() < deadline && !cancel.is_set() {
         let size = match transport.receive(&mut read_buffer) {
@@ -1158,6 +1220,8 @@ pub fn run<T: SessionTransport>(
             &experiment_flags,
             reactive_frame_processed,
             touch_source.as_ref(),
+            &mut gesture_detector,
+            touch_settings,
             &simple_channels,
             transport,
             &mut tls,
@@ -1659,6 +1723,8 @@ fn service_proactive_sends<T: SessionTransport>(
     flags: &ExperimentFlags,
     reactive_frame_processed: bool,
     touch_source: Option<&EvdevTouchSource>,
+    gesture_detector: &mut ArmedGestureDetector,
+    touch_settings: Option<&TouchSettingsHandoff>,
     simple_channels: &HashMap<u8, ChannelOpenStateMachine>,
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
@@ -1675,7 +1741,71 @@ fn service_proactive_sends<T: SessionTransport>(
     let input_open = simple_channels
         .get(&INPUT_CHANNEL_ID)
         .is_some_and(|machine| machine.state() == ChannelOpenState::Open);
-    service_touch_input(touch_source, input_open, transport, tls, limits)
+    service_touch_input(
+        touch_source,
+        gesture_detector,
+        touch_settings,
+        input_open,
+        transport,
+        tls,
+        limits,
+    )
+}
+
+/// `Some` only when running under `VideoRenderTarget::Gtk4Window` — the
+/// plain `Wayland` path has no window/desktop concept for a settings panel
+/// to belong to, so the settings-gesture machinery is simply not driven at
+/// all there (see `service_touch_input`).
+fn touch_settings_handoff(target: &VideoRenderTarget) -> Option<&TouchSettingsHandoff> {
+    match target {
+        VideoRenderTarget::Wayland => None,
+        VideoRenderTarget::Gtk4Window(_, touch_settings) => Some(touch_settings),
+    }
+}
+
+/// Resolves how long the receive loop's deadline should be from `run()`'s
+/// own start, given the operator's chosen experiment flags. Extracted
+/// purely to keep `run()` itself under `clippy::too_many_lines`.
+fn observation_window(experiment_flags: &ExperimentFlags) -> Duration {
+    experiment_flags.observation_window_override.unwrap_or(
+        if experiment_flags.survive_proactive_write_timeout {
+            PROACTIVE_WRITE_SURVIVAL_TIMEOUT
+        } else {
+            PROBE_TIMEOUT
+        },
+    )
+}
+
+/// Sends the touchscreen's live-adjustable rotation handle (if any
+/// touchscreen and any `TouchSettingsHandoff` exist) exactly once, builds
+/// the `ArmedGestureDetector` `run()`'s loop feeds every touch frame into
+/// (its arm-window duration seeded from the persisted
+/// `gesture_settings::GestureSettings`, so a previous session's
+/// customized timeout survives a restart), and sends its live-adjustable
+/// arm-window handle too. Extracted purely to keep `run()` itself under
+/// `clippy::too_many_lines`.
+fn setup_settings_gesture(
+    touch_source: Option<&EvdevTouchSource>,
+    touch_settings: Option<&TouchSettingsHandoff>,
+) -> ArmedGestureDetector {
+    if let Some(touch_settings) = touch_settings {
+        let rotation_handle = touch_source.map(EvdevTouchSource::rotation_handle);
+        let _ = touch_settings.rotation_sender.send(rotation_handle);
+    }
+    let arm_window_seconds = crate::gesture_settings::GestureSettings::load(std::path::Path::new(
+        crate::gesture_settings::DEFAULT_SETTINGS_PATH,
+    ))
+    .arm_window_seconds();
+    let detector = ArmedGestureDetector::new(
+        SETTINGS_GESTURE_SWIPE_THRESHOLD_PIXELS,
+        u64::from(arm_window_seconds) * 1_000_000,
+    );
+    if let Some(touch_settings) = touch_settings {
+        let _ = touch_settings
+            .arm_window_sender
+            .send(detector.arm_window_handle());
+    }
+    detector
 }
 
 /// Best-effort touchscreen discovery, run once before the receive loop
@@ -1683,7 +1813,7 @@ fn service_proactive_sends<T: SessionTransport>(
 /// unopenable touchscreen is logged and never fails the probe — the head
 /// unit may simply not be attached to a display yet (e.g. an SSH-only
 /// session), and touch input has no bearing on protocol correctness.
-fn open_touch_source() -> Option<EvdevTouchSource> {
+fn open_touch_source(rotation: Rotation) -> Option<EvdevTouchSource> {
     let path = match discover_touchscreen() {
         Ok(Some(path)) => path,
         Ok(None) => {
@@ -1699,6 +1829,7 @@ fn open_touch_source() -> Option<EvdevTouchSource> {
         &path,
         TOUCH_COORDINATE_SPACE_WIDTH_PIXELS,
         TOUCH_COORDINATE_SPACE_HEIGHT_PIXELS,
+        rotation,
     ) {
         Ok(source) => {
             println!(
@@ -1727,6 +1858,18 @@ const fn touch_wire_action(phase: TouchPhase) -> PointerAction {
     }
 }
 
+/// Logs and forwards one `ArmedGestureDetector` event to the GTK thread.
+fn report_settings_gesture_event(event: GestureEvent, touch_settings: &TouchSettingsHandoff) {
+    match event {
+        GestureEvent::Armed => println!("probe_state=settings_gesture_armed"),
+        GestureEvent::Disarmed => println!("probe_state=settings_gesture_disarmed"),
+        GestureEvent::Completed(gesture) => {
+            println!("probe_state=settings_gesture_detected gesture={gesture:?}");
+        }
+    }
+    let _ = touch_settings.gesture_sender.send(event);
+}
+
 /// Drains every touch frame queued since the last call and sends each as an
 /// `InputReport` — proactive, not a reply to anything the phone sent, so
 /// this only runs once the input channel has actually reached `Open`
@@ -1734,6 +1877,8 @@ const fn touch_wire_action(phase: TouchPhase) -> PointerAction {
 /// has no reason to expect).
 fn service_touch_input<T: SessionTransport>(
     touch_source: Option<&EvdevTouchSource>,
+    gesture_detector: &mut ArmedGestureDetector,
+    touch_settings: Option<&TouchSettingsHandoff>,
     input_open: bool,
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
@@ -1745,7 +1890,28 @@ fn service_touch_input<T: SessionTransport>(
     let Some(touch_source) = touch_source else {
         return Ok(());
     };
+    if let Some(touch_settings) = touch_settings {
+        // Independent of whether any frame arrives this call — an armed
+        // window with no further touch input at all still needs to
+        // disarm eventually (see `ArmedGestureDetector::tick`'s doc
+        // comment).
+        let now_micros = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
+        if let Some(event) = gesture_detector.tick(now_micros) {
+            report_settings_gesture_event(event, touch_settings);
+        }
+    }
     while let Some(frame) = touch_source.try_recv() {
+        if let Some(touch_settings) = touch_settings {
+            if let Some(event) = gesture_detector.push(&frame) {
+                report_settings_gesture_event(event, touch_settings);
+            }
+        }
         let pointers: Vec<TouchPointer> = frame
             .points
             .iter()
@@ -2329,7 +2495,7 @@ fn start_video_render_pipeline(
                 }
             }
         }
-        VideoRenderTarget::Gtk4Window(handoff) => match handoff.request(capability) {
+        VideoRenderTarget::Gtk4Window(handoff, _) => match handoff.request(capability) {
             Ok(pipeline) => {
                 println!("probe_state=video_render_pipeline_started");
                 *video_render = VideoRenderState::Running(pipeline);

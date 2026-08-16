@@ -12,6 +12,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::SystemTime;
@@ -37,23 +39,100 @@ pub fn discover_touchscreen() -> io::Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// How the touch panel is physically mounted relative to how video is
+/// rendered, matching Wayland's `wl_output.transform` convention (rotation
+/// is anti-clockwise) so a compositor-side `wlr-randr --transform` and this
+/// rotation can be set to the same value and stay visually consistent.
+/// `Rotate90`/`Rotate270` swap which raw axis feeds the target X vs Y
+/// coordinate; all four also reverse one or both axes as needed so the
+/// rotated mapping still lands on the correct rendered pixel. Real-hardware
+/// verification of anything but `Rotate0` needs the DSI panel actually
+/// mounted rotated (not available on this project's reference rig — see
+/// `MILESTONE_CHECKLIST.md` M3's touch item) or a software-only check:
+/// rotate the Wayland output digitally (`wlr-randr --transform`) to match,
+/// then confirm taps land correctly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rotation {
+    Rotate0,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+}
+
+impl Rotation {
+    fn encode(self) -> u8 {
+        match self {
+            Self::Rotate0 => 0,
+            Self::Rotate90 => 1,
+            Self::Rotate180 => 2,
+            Self::Rotate270 => 3,
+        }
+    }
+
+    fn decode(value: u8) -> Self {
+        match value {
+            1 => Self::Rotate90,
+            2 => Self::Rotate180,
+            3 => Self::Rotate270,
+            _ => Self::Rotate0,
+        }
+    }
+}
+
+/// A [`Rotation`] that can be changed live while the reader thread it's
+/// shared with keeps running — built for the head unit's own settings
+/// panel (`gtk_dev_ui.rs`), where an operator picks a rotation while a
+/// session is already active rather than only at startup. Cheap to clone
+/// (an `Arc` around a single atomic byte); `set` takes effect on the very
+/// next raw touch sample the reader thread processes, with no restart.
+#[derive(Clone)]
+pub struct SharedRotation(Arc<AtomicU8>);
+
+impl SharedRotation {
+    #[must_use]
+    pub fn new(initial: Rotation) -> Self {
+        Self(Arc::new(AtomicU8::new(initial.encode())))
+    }
+
+    pub fn set(&self, rotation: Rotation) {
+        self.0.store(rotation.encode(), Ordering::SeqCst);
+    }
+
+    fn get(&self) -> Rotation {
+        Rotation::decode(self.0.load(Ordering::SeqCst))
+    }
+}
+
 /// A live touch source feeding [`TouchFrame`]s from a background reader
 /// thread, scaled from the device's own reported coordinate range into
 /// `target_width`/`target_height` — the same dimensions advertised to the
 /// phone in `ServiceDiscoveryResponse`'s `TouchCapability`, since the phone
 /// interprets `TouchEvent` coordinates in that space, not the touch
-/// controller's native resolution.
+/// controller's native resolution. `rotation` compensates for how the panel
+/// is physically mounted; `target_width`/`target_height` never change with
+/// rotation, since they describe the phone's own video frame, not the
+/// panel.
 pub struct EvdevTouchSource {
     receiver: mpsc::Receiver<TouchFrame>,
+    rotation: SharedRotation,
 }
 
 impl EvdevTouchSource {
-    pub fn open(path: &Path, target_width: u32, target_height: u32) -> io::Result<Self> {
+    pub fn open(
+        path: &Path,
+        target_width: u32,
+        target_height: u32,
+        rotation: Rotation,
+    ) -> io::Result<Self> {
         let device = Device::open(path)?;
-        let scale = AxisScale::from_device(&device, target_width, target_height)?;
+        let scale = AxisScale::from_device(&device, target_width, target_height, rotation)?;
+        let rotation_handle = scale.rotation.clone();
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || run_reader(device, scale, &sender));
-        Ok(Self { receiver })
+        thread::spawn(move || run_reader(device, &scale, &sender));
+        Ok(Self {
+            receiver,
+            rotation: rotation_handle,
+        })
     }
 
     /// Drains one queued frame, if any, without blocking — safe to call
@@ -62,9 +141,16 @@ impl EvdevTouchSource {
     pub fn try_recv(&self) -> Option<TouchFrame> {
         self.receiver.try_recv().ok()
     }
+
+    /// A cloneable handle that can change this already-running source's
+    /// rotation live — see [`SharedRotation`].
+    #[must_use]
+    pub fn rotation_handle(&self) -> SharedRotation {
+        self.rotation.clone()
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 struct AxisScale {
     x_min: i32,
     x_span: i32,
@@ -72,10 +158,16 @@ struct AxisScale {
     y_span: i32,
     target_width: u32,
     target_height: u32,
+    rotation: SharedRotation,
 }
 
 impl AxisScale {
-    fn from_device(device: &Device, target_width: u32, target_height: u32) -> io::Result<Self> {
+    fn from_device(
+        device: &Device,
+        target_width: u32,
+        target_height: u32,
+        rotation: Rotation,
+    ) -> io::Result<Self> {
         let x_info = device
             .get_absinfo()?
             .find(|(code, _)| *code == AbsoluteAxisCode::ABS_MT_POSITION_X)
@@ -103,15 +195,48 @@ impl AxisScale {
             y_span: (y_info.maximum() - y_info.minimum()).max(1),
             target_width,
             target_height,
+            rotation: SharedRotation::new(rotation),
         })
     }
 
-    fn scale_x(self, raw: i32) -> u32 {
-        scale(raw, self.x_min, self.x_span, self.target_width)
+    /// Builds the correctly-tagged event for a raw `ABS_MT_POSITION_X`
+    /// sample. Under `Rotate0`/`Rotate180` this still feeds the target X
+    /// coordinate; under `Rotate90`/`Rotate270` the raw X axis actually
+    /// determines the target *Y* coordinate instead, since the panel's own
+    /// X/Y axes are swapped relative to the rendered video once rotated —
+    /// see [`Rotation`]'s doc comment. Reads the current rotation fresh on
+    /// every call, so a live change via [`SharedRotation::set`] takes
+    /// effect on the very next sample.
+    fn event_for_position_x(&self, raw: i32) -> RawTouchEvent {
+        let scaled_to_width = scale(raw, self.x_min, self.x_span, self.target_width);
+        let scaled_to_height = scale(raw, self.x_min, self.x_span, self.target_height);
+        match self.rotation.get() {
+            Rotation::Rotate0 => RawTouchEvent::PositionX(scaled_to_width),
+            Rotation::Rotate180 => {
+                RawTouchEvent::PositionX(reverse(scaled_to_width, self.target_width))
+            }
+            Rotation::Rotate90 => {
+                RawTouchEvent::PositionY(reverse(scaled_to_height, self.target_height))
+            }
+            Rotation::Rotate270 => RawTouchEvent::PositionY(scaled_to_height),
+        }
     }
 
-    fn scale_y(self, raw: i32) -> u32 {
-        scale(raw, self.y_min, self.y_span, self.target_height)
+    /// Mirrors [`Self::event_for_position_x`] for a raw `ABS_MT_POSITION_Y`
+    /// sample.
+    fn event_for_position_y(&self, raw: i32) -> RawTouchEvent {
+        let scaled_to_height = scale(raw, self.y_min, self.y_span, self.target_height);
+        let scaled_to_width = scale(raw, self.y_min, self.y_span, self.target_width);
+        match self.rotation.get() {
+            Rotation::Rotate0 => RawTouchEvent::PositionY(scaled_to_height),
+            Rotation::Rotate180 => {
+                RawTouchEvent::PositionY(reverse(scaled_to_height, self.target_height))
+            }
+            Rotation::Rotate90 => RawTouchEvent::PositionX(scaled_to_width),
+            Rotation::Rotate270 => {
+                RawTouchEvent::PositionX(reverse(scaled_to_width, self.target_width))
+            }
+        }
     }
 }
 
@@ -125,7 +250,11 @@ fn scale(raw: i32, min: i32, span: i32, target: u32) -> u32 {
     scaled.min(target.saturating_sub(1))
 }
 
-fn run_reader(mut device: Device, scale: AxisScale, sender: &mpsc::Sender<TouchFrame>) {
+fn reverse(value: u32, target: u32) -> u32 {
+    target.saturating_sub(1).saturating_sub(value)
+}
+
+fn run_reader(mut device: Device, scale: &AxisScale, sender: &mpsc::Sender<TouchFrame>) {
     let mut tracker = MultiTouchTracker::new();
     loop {
         let Ok(events) = device.fetch_events() else {
@@ -141,10 +270,10 @@ fn run_reader(mut device: Device, scale: AxisScale, sender: &mpsc::Sender<TouchF
                     RawTouchEvent::TrackingId((value >= 0).then(|| value.unsigned_abs())),
                 ),
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_X, value) => {
-                    Some(RawTouchEvent::PositionX(scale.scale_x(value)))
+                    Some(scale.event_for_position_x(value))
                 }
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_Y, value) => {
-                    Some(RawTouchEvent::PositionY(scale.scale_y(value)))
+                    Some(scale.event_for_position_y(value))
                 }
                 EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
                     Some(RawTouchEvent::Sync { timestamp_micros })
@@ -185,5 +314,112 @@ mod tests {
     fn scale_clamps_out_of_range_input() {
         assert_eq!(scale(-10, 0, 4095, 800), 0);
         assert_eq!(scale(5000, 0, 4095, 800), 799);
+    }
+
+    fn axis_scale(rotation: Rotation) -> AxisScale {
+        AxisScale {
+            x_min: 0,
+            x_span: 4095,
+            y_min: 0,
+            y_span: 4095,
+            target_width: 800,
+            target_height: 480,
+            rotation: SharedRotation::new(rotation),
+        }
+    }
+
+    #[test]
+    fn rotate0_leaves_axes_unchanged() {
+        let scale = axis_scale(Rotation::Rotate0);
+        assert_eq!(scale.event_for_position_x(0), RawTouchEvent::PositionX(0));
+        assert_eq!(
+            scale.event_for_position_x(4095),
+            RawTouchEvent::PositionX(799)
+        );
+        assert_eq!(scale.event_for_position_y(0), RawTouchEvent::PositionY(0));
+        assert_eq!(
+            scale.event_for_position_y(4095),
+            RawTouchEvent::PositionY(479)
+        );
+    }
+
+    #[test]
+    fn rotate180_reverses_both_axes_without_swapping_them() {
+        let scale = axis_scale(Rotation::Rotate180);
+        assert_eq!(scale.event_for_position_x(0), RawTouchEvent::PositionX(799));
+        assert_eq!(
+            scale.event_for_position_x(4095),
+            RawTouchEvent::PositionX(0)
+        );
+        assert_eq!(scale.event_for_position_y(0), RawTouchEvent::PositionY(479));
+        assert_eq!(
+            scale.event_for_position_y(4095),
+            RawTouchEvent::PositionY(0)
+        );
+    }
+
+    #[test]
+    fn rotate90_swaps_axes() {
+        let scale = axis_scale(Rotation::Rotate90);
+        // Raw X now determines target Y, raw Y now determines target X.
+        assert_eq!(scale.event_for_position_x(0), RawTouchEvent::PositionY(479));
+        assert_eq!(
+            scale.event_for_position_x(4095),
+            RawTouchEvent::PositionY(0)
+        );
+        assert_eq!(scale.event_for_position_y(0), RawTouchEvent::PositionX(0));
+        assert_eq!(
+            scale.event_for_position_y(4095),
+            RawTouchEvent::PositionX(799)
+        );
+    }
+
+    #[test]
+    fn rotate270_swaps_axes_the_other_way_from_rotate90() {
+        let scale = axis_scale(Rotation::Rotate270);
+        assert_eq!(scale.event_for_position_x(0), RawTouchEvent::PositionY(0));
+        assert_eq!(
+            scale.event_for_position_x(4095),
+            RawTouchEvent::PositionY(479)
+        );
+        assert_eq!(scale.event_for_position_y(0), RawTouchEvent::PositionX(799));
+        assert_eq!(
+            scale.event_for_position_y(4095),
+            RawTouchEvent::PositionX(0)
+        );
+    }
+
+    #[test]
+    fn all_four_rotations_are_pairwise_distinct_for_the_same_input() {
+        // A real regression this guards against: accidentally implementing
+        // two rotation cases identically (e.g. copy-paste leaving Rotate270
+        // behaving like Rotate90) would silently pass every other test
+        // above, since each is checked in isolation.
+        let corner = (4095, 0);
+        let outputs: Vec<(RawTouchEvent, RawTouchEvent)> = [
+            Rotation::Rotate0,
+            Rotation::Rotate90,
+            Rotation::Rotate180,
+            Rotation::Rotate270,
+        ]
+        .into_iter()
+        .map(|rotation| {
+            let scale = axis_scale(rotation);
+            (
+                scale.event_for_position_x(corner.0),
+                scale.event_for_position_y(corner.1),
+            )
+        })
+        .collect();
+        for (index, pair) in outputs.iter().enumerate() {
+            for (other_index, other_pair) in outputs.iter().enumerate() {
+                if index != other_index {
+                    assert_ne!(
+                        pair, other_pair,
+                        "rotations at indices {index} and {other_index} produced identical output"
+                    );
+                }
+            }
+        }
     }
 }

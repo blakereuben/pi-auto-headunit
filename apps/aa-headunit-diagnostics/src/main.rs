@@ -25,6 +25,9 @@ mod replug_prompt;
 mod connection_state;
 
 #[cfg(target_os = "linux")]
+mod gesture_settings;
+
+#[cfg(target_os = "linux")]
 mod gtk_dev_ui;
 
 #[cfg(target_os = "linux")]

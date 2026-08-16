@@ -21,6 +21,8 @@ ctrlc = "3"
 gtk4 = "0.10.3"
 protocol-aap = { path = "../../crates/protocol-aap" }
 security-openssl = { path = "../../crates/security-openssl" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 transport-bluetooth = { version = "0.1.0", path = "../../crates/transport-bluetooth" }
 
 [lints]

@@ -23,6 +23,14 @@ case "$1" in
             chown root:aa-headunit /etc/aa-headunit
             chmod 0770 /etc/aa-headunit
         fi
+        # Mutable operator state (currently just the gesture-settings
+        # file, `gesture_settings.rs`) lives here per ARCHITECTURE.md §8's
+        # /etc (admin config) vs /var/lib (mutable state) split — same
+        # unprivileged-group pattern as /etc/aa-headunit above, so saving
+        # settings never needs sudo either.
+        mkdir -p /var/lib/aa-headunit
+        chown root:aa-headunit /var/lib/aa-headunit
+        chmod 0770 /var/lib/aa-headunit
         ;;
 esac
 

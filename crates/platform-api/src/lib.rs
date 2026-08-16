@@ -2,7 +2,9 @@
 
 use std::fmt;
 
+mod gesture;
 mod touch;
+pub use gesture::{ArmedGestureDetector, GestureEvent, GestureId, SharedArmWindow};
 pub use touch::{MultiTouchTracker, RawTouchEvent, TouchFrame, TouchPhase, TouchPoint};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
