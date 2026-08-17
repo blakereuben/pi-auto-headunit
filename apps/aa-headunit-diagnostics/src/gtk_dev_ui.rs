@@ -956,14 +956,20 @@ fn dispatch_action(
             let next = next_rotation(current_rotation.get());
             apply_rotation(next, settings_panel, rotation_handle, current_rotation);
         }
-        // Sends a key event to the phone rather than touching local
-        // window/rotation state, so it's dispatched directly from the
-        // background protocol thread (the one with transport access) in
-        // `auth_discovery_probe.rs::service_touch_input`, not here.
+        // All no-ops here, dispatched instead from the background protocol
+        // thread (`auth_discovery_probe.rs::service_touch_input`), for two
+        // different reasons: `SwitchTo*` sends a key event to the phone,
+        // so it needs that thread's `transport` access; `ScreenOff`
+        // touches neither the phone nor GTK window state, but must still
+        // run there since that thread's `service_touch_input` is the only
+        // place that can swallow the touch used to wake the screen back
+        // up — see `gesture_settings::Action::ScreenOff`'s doc comment and
+        // `auth_discovery_probe.rs`'s `ScreenPowerState`.
         Action::SwitchToMedia
         | Action::SwitchToNavigation
         | Action::SwitchToRadio
-        | Action::SwitchToPhone => {}
+        | Action::SwitchToPhone
+        | Action::ScreenOff => {}
     }
 }
 

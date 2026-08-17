@@ -16,18 +16,32 @@
 //! capability/data layer per `ARCHITECTURE.md`'s dependency rule) — see
 //! `apps/aa-headunit-diagnostics/src/gesture_settings.rs`.
 //!
-//! Every single-finger outcome (tap, long-press, or one of the four swipe
-//! directions) is classified by one unified [`SingleFingerGestureRecognizer`]
-//! rather than several independent recognizers racing each other — see
-//! [`SingleFingerOutcome`]'s doc comment for the real bug this replaced.
-//! [`TwoFingerTapRecognizer`] runs alongside it as the one genuinely
-//! independent recognizer, since a two-finger tap (down together, up
-//! together) can never be confused with any single-finger outcome by
-//! finger count alone (deliberately chosen 2026-08-16, renamed from an
-//! original three-finger design once the operator pointed out two fingers
-//! weren't used by anything else here) — a real touch frame's
-//! `points.len()` can only ever match one of the two recognizers' finger
-//! counts at a time, never both.
+//! Every single-finger outcome (tap, long-press, one of the four swipe
+//! directions, or [`GestureId::Circle`]) is classified by one unified
+//! [`SingleFingerGestureRecognizer`] rather than several independent
+//! recognizers racing each other — see [`SingleFingerOutcome`]'s doc
+//! comment for the real bug this replaced. [`TwoFingerTapRecognizer`]
+//! runs alongside it as the one genuinely independent recognizer, since a
+//! real touch frame's `points.len()` can only ever match one of the two
+//! recognizers' target finger counts at a time, never both — a two-finger
+//! tap (down together, up together) can never be confused with any
+//! single-finger outcome by finger count alone.
+//!
+//! **`Circle` replaced an earlier three-finger-double-tap gesture,
+//! 2026-08-17/18.** That design worked (see this module's `git` history
+//! for the removed `ThreeFingerDoubleTapRecognizer`) but real-hardware
+//! testing found it genuinely hard for a human to trigger reliably —
+//! coordinating three fingers landing and lifting together, twice in a
+//! row, sometimes got misrecognized as a plain [`GestureId::TwoFingerTap`]
+//! instead. `Circle` sidesteps multi-finger coordination entirely: it's a
+//! single continuous finger motion (a circle *or* a spiral — nothing here
+//! requires a fixed radius, only consistent net rotation around the
+//! path's own centroid), classified from the complete recorded path once
+//! the finger lifts, the same "decide once, at release" way `Tap`/
+//! `LongPress`/`Swipe*` already are — see `is_circle_or_spiral`'s doc
+//! comment for the actual algorithm and its three threshold constants
+//! (explicitly flagged there as a reasoned starting point pending a real
+//! trial, not yet measured against a real finger).
 //!
 //! Pure and timestamp-driven (`TouchFrame.timestamp_micros`, not wall-clock
 //! `Instant`), matching `ARCHITECTURE.md`'s testing architecture ("Pure
@@ -83,6 +97,7 @@ pub enum GestureId {
     SwipeDown,
     SwipeLeft,
     SwipeRight,
+    Circle,
 }
 
 impl GestureId {
@@ -91,7 +106,7 @@ impl GestureId {
     /// parallel while armed, and by callers (the settings UI) that need to
     /// list every assignable gesture.
     #[must_use]
-    pub const fn all() -> [GestureId; 7] {
+    pub const fn all() -> [GestureId; 8] {
         [
             GestureId::DoubleTap,
             GestureId::TwoFingerTap,
@@ -100,6 +115,7 @@ impl GestureId {
             GestureId::SwipeDown,
             GestureId::SwipeLeft,
             GestureId::SwipeRight,
+            GestureId::Circle,
         ]
     }
 }
@@ -188,6 +204,10 @@ enum SingleFingerOutcome {
     /// duration doesn't matter (a slow swipe is still a swipe, not a
     /// long press, since it moved).
     Swipe(GestureId),
+    /// The recorded path swept a consistent, sufficiently large rotation
+    /// around its own centroid — a circle or a spiral (radius need not be
+    /// fixed). See [`is_circle_or_spiral`]'s doc comment.
+    Circle,
     /// Matched none of the above (e.g. moved a little but not far enough,
     /// or held for a duration in the dead zone between a tap and a long
     /// press) — not a valid outcome on its own.
@@ -200,9 +220,19 @@ fn classify_single_finger_touch(
     end_y: u32,
     end_at_micros: u64,
     swipe_threshold_squared: u64,
+    path: &[(u32, u32)],
 ) -> SingleFingerOutcome {
     let duration_micros = end_at_micros.saturating_sub(touch.down_at_micros);
     let distance_squared = squared_distance(touch.start_x, touch.start_y, end_x, end_y);
+    // Checked before the swipe test: a spiral that drifts outward as it
+    // goes can have large net start-to-end displacement (satisfying the
+    // swipe threshold too) — a genuine circular motion should win that
+    // ambiguity. This check is self-gating (see `is_circle_or_spiral`'s
+    // own thresholds), so an ordinary swipe or stationary tap/long-press
+    // fails it naturally without needing careful sequencing here.
+    if is_circle_or_spiral(path) {
+        return SingleFingerOutcome::Circle;
+    }
     if distance_squared >= swipe_threshold_squared {
         let dx = i64::from(end_x) - i64::from(touch.start_x);
         let dy = i64::from(end_y) - i64::from(touch.start_y);
@@ -219,6 +249,88 @@ fn classify_single_finger_touch(
         }
     }
     SingleFingerOutcome::Ambiguous
+}
+
+/// Minimum net rotation, around the path's own centroid, to count as a
+/// circle/spiral — chosen below a full 360° to tolerate a loop that
+/// doesn't quite close.
+const CIRCLE_MIN_ROTATION_DEGREES: f64 = 300.0;
+/// Maximum allowed ratio of total *absolute* per-step rotation to net
+/// (signed) rotation. Close to `1.0` for a clean one-direction sweep;
+/// rejects a back-and-forth scribble that touches a lot of angles without
+/// committing to one rotational direction.
+const CIRCLE_MAX_JITTER_RATIO: f64 = 1.35;
+/// Minimum average distance from the path's centroid, in the negotiated
+/// touch coordinate space (`TOUCH_COORDINATE_SPACE_WIDTH`/`HEIGHT` in
+/// `auth_discovery_probe.rs`, not the physical panel's own native
+/// resolution). Rejects a small in-place hand tremor (e.g. during an
+/// attempted long-press) from accidentally accumulating enough angular
+/// noise to look like a tiny fast circle.
+const CIRCLE_MIN_AVERAGE_RADIUS_PIXELS: f64 = 40.0;
+/// Below this many recorded samples there isn't enough path to reliably
+/// measure a sweep at all.
+const CIRCLE_MIN_SAMPLE_COUNT: usize = 8;
+
+/// Classifies a recorded single-finger path as a circle or spiral: does it
+/// sweep a large, consistent net rotation around its own centroid? A true
+/// spiral (radius growing or shrinking as the finger moves) is
+/// deliberately still accepted — nothing here requires a *fixed* radius,
+/// only consistent rotational direction, which is exactly what a spiral
+/// has too.
+///
+/// **Provisional thresholds, not yet measured against a real finger** —
+/// added 2026-08-18 to replace an earlier three-finger-double-tap gesture
+/// that real-hardware testing found unreliable (see this module's doc
+/// comment). Flagged as the first constants to revisit if a real trial
+/// shows the gesture too hard to trigger deliberately, or (less likely,
+/// given how self-gating these checks are together) triggers by accident.
+fn is_circle_or_spiral(path: &[(u32, u32)]) -> bool {
+    if path.len() < CIRCLE_MIN_SAMPLE_COUNT {
+        return false;
+    }
+    // `path` is bounded by the same 5-second episode cap that already
+    // bounds every single-finger touch — nowhere near f64's 52-bit
+    // mantissa limit.
+    #[allow(clippy::cast_precision_loss)]
+    let count = path.len() as f64;
+    let (sum_x, sum_y) = path.iter().fold((0.0_f64, 0.0_f64), |(sx, sy), &(x, y)| {
+        (sx + f64::from(x), sy + f64::from(y))
+    });
+    let (centroid_x, centroid_y) = (sum_x / count, sum_y / count);
+
+    let mut total_rotation = 0.0_f64;
+    let mut total_absolute_rotation = 0.0_f64;
+    let mut total_radius = 0.0_f64;
+    let mut previous_angle: Option<f64> = None;
+    for &(x, y) in path {
+        let dx = f64::from(x) - centroid_x;
+        let dy = f64::from(y) - centroid_y;
+        total_radius += dx.hypot(dy);
+        let angle = dy.atan2(dx);
+        if let Some(previous) = previous_angle {
+            let mut delta = angle - previous;
+            while delta > std::f64::consts::PI {
+                delta -= 2.0 * std::f64::consts::PI;
+            }
+            while delta <= -std::f64::consts::PI {
+                delta += 2.0 * std::f64::consts::PI;
+            }
+            total_rotation += delta;
+            total_absolute_rotation += delta.abs();
+        }
+        previous_angle = Some(angle);
+    }
+
+    let average_radius = total_radius / count;
+    if average_radius < CIRCLE_MIN_AVERAGE_RADIUS_PIXELS {
+        return false;
+    }
+    if total_rotation.abs().to_degrees() < CIRCLE_MIN_ROTATION_DEGREES {
+        return false;
+    }
+    // `total_rotation.abs()` is provably positive here (it just cleared
+    // `CIRCLE_MIN_ROTATION_DEGREES`), so this division is always safe.
+    (total_absolute_rotation / total_rotation.abs()) <= CIRCLE_MAX_JITTER_RATIO
 }
 
 /// Larger axis of displacement wins; ties go horizontal. `dy` follows this
@@ -251,13 +363,20 @@ enum SingleFingerStage {
 }
 
 /// Classifies every single-finger touch episode while armed into exactly
-/// one outcome (tap / long press / one of four swipe directions), and
-/// separately counts consecutive taps toward [`GestureId::DoubleTap`] —
-/// see [`SingleFingerOutcome`]'s doc comment for why this replaced two
-/// independent recognizers.
+/// one outcome (tap / long press / one of four swipe directions / circle
+/// or spiral), and separately counts consecutive taps toward
+/// [`GestureId::DoubleTap`] — see [`SingleFingerOutcome`]'s doc comment
+/// for why this replaced independent racing recognizers.
 struct SingleFingerGestureRecognizer {
     stage: SingleFingerStage,
     swipe_threshold_squared: u64,
+    /// Every point recorded during the current touch-down episode, reset
+    /// at the start of each one — see [`is_circle_or_spiral`]. Bounded by
+    /// the same [`LONG_PRESS_MAX_DURATION_MICROS`] cap that already
+    /// bounds every single-finger episode (`advance_touch` resets to
+    /// `Idle`, discarding this buffer, once a touch is held past that
+    /// long), so this never grows unboundedly.
+    path: Vec<(u32, u32)>,
 }
 
 impl SingleFingerGestureRecognizer {
@@ -265,11 +384,13 @@ impl SingleFingerGestureRecognizer {
         Self {
             stage: SingleFingerStage::Idle,
             swipe_threshold_squared,
+            path: Vec::new(),
         }
     }
 
     fn reset(&mut self) {
         self.stage = SingleFingerStage::Idle;
+        self.path.clear();
     }
 
     fn push(&mut self, frame: &TouchFrame) -> Option<GestureId> {
@@ -281,6 +402,8 @@ impl SingleFingerGestureRecognizer {
                         start_y: frame.points[0].y,
                         down_at_micros: frame.timestamp_micros,
                     });
+                    self.path.clear();
+                    self.path.push((frame.points[0].x, frame.points[0].y));
                 }
                 None
             }
@@ -302,6 +425,8 @@ impl SingleFingerGestureRecognizer {
                         start_y: frame.points[0].y,
                         down_at_micros: frame.timestamp_micros,
                     });
+                    self.path.clear();
+                    self.path.push((frame.points[0].x, frame.points[0].y));
                 }
                 None
             }
@@ -330,6 +455,7 @@ impl SingleFingerGestureRecognizer {
             self.stage = SingleFingerStage::Idle;
             return None;
         }
+        self.path.push((frame.points[0].x, frame.points[0].y));
         if !is_tap_up(frame, 1) {
             return None;
         }
@@ -339,11 +465,16 @@ impl SingleFingerGestureRecognizer {
             frame.points[0].y,
             frame.timestamp_micros,
             self.swipe_threshold_squared,
+            &self.path,
         );
         match outcome {
             SingleFingerOutcome::Swipe(gesture) => {
                 self.stage = SingleFingerStage::Idle;
                 Some(gesture)
+            }
+            SingleFingerOutcome::Circle => {
+                self.stage = SingleFingerStage::Idle;
+                Some(GestureId::Circle)
             }
             SingleFingerOutcome::LongPress if !is_second_touch => {
                 self.stage = SingleFingerStage::Idle;
@@ -671,6 +802,61 @@ mod tests {
         frame(timestamp_micros, TouchPhase::PointerUp, vec![(0, 50, 50)])
     }
 
+    /// Synthetic points sampled roughly around a circle of `radius`
+    /// pixels centered at `(center_x, center_y)`, one per
+    /// `sample_count`th of a full turn — enough samples, spread over a
+    /// consistent single direction, to satisfy `is_circle_or_spiral`.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn circle_path(
+        center_x: i64,
+        center_y: i64,
+        radius: f64,
+        sample_count: usize,
+    ) -> Vec<(u32, u32)> {
+        (0..sample_count)
+            .map(|index| {
+                let angle =
+                    2.0 * std::f64::consts::PI * (index as f64) / (sample_count as f64 - 1.0);
+                let x = center_x + (radius * angle.cos()).round() as i64;
+                let y = center_y + (radius * angle.sin()).round() as i64;
+                (u32::try_from(x).unwrap_or(0), u32::try_from(y).unwrap_or(0))
+            })
+            .collect()
+    }
+
+    /// Feeds a synthetic path into the detector as a single-finger
+    /// down → move* → up episode and returns the result of the final
+    /// (`Up`-tagged) push — the same shape `swipe`'s own follow-up frames
+    /// use, just with every intermediate point included so
+    /// `is_circle_or_spiral` has a real path to classify.
+    fn push_single_finger_path(
+        detector: &mut ArmedGestureDetector,
+        start_micros: u64,
+        step_micros: u64,
+        path: &[(u32, u32)],
+    ) -> Option<GestureEvent> {
+        let (first_x, first_y) = path[0];
+        assert_eq!(
+            detector.push(&frame(
+                start_micros,
+                TouchPhase::Down,
+                vec![(0, first_x, first_y)]
+            )),
+            None
+        );
+        let mut last_result = None;
+        for (index, &(x, y)) in path.iter().enumerate().skip(1) {
+            let timestamp = start_micros + (index as u64) * step_micros;
+            let phase = if index == path.len() - 1 {
+                TouchPhase::Up
+            } else {
+                TouchPhase::Moved
+            };
+            last_result = detector.push(&frame(timestamp, phase, vec![(0, x, y)]));
+        }
+        last_result
+    }
+
     #[test]
     fn swipe_then_double_tap_fires_double_tap() {
         let mut detector = ArmedGestureDetector::new(200, ARM_WINDOW_MICROS);
@@ -910,7 +1096,7 @@ mod tests {
     #[test]
     fn all_lists_every_variant_exactly_once() {
         let all = GestureId::all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         assert!(all.contains(&GestureId::DoubleTap));
         assert!(all.contains(&GestureId::TwoFingerTap));
         assert!(all.contains(&GestureId::LongPress));
@@ -918,6 +1104,7 @@ mod tests {
         assert!(all.contains(&GestureId::SwipeDown));
         assert!(all.contains(&GestureId::SwipeLeft));
         assert!(all.contains(&GestureId::SwipeRight));
+        assert!(all.contains(&GestureId::Circle));
     }
 
     #[test]
@@ -960,5 +1147,100 @@ mod tests {
             detector.push(&frame(2_900_000, TouchPhase::Up, vec![(0, 400, 400)])),
             Some(GestureEvent::Completed(GestureId::SwipeDown))
         );
+    }
+
+    #[test]
+    fn swipe_then_a_clean_circle_fires_circle() {
+        let mut detector = ArmedGestureDetector::new(200, ARM_WINDOW_MICROS);
+        swipe(&mut detector);
+        let path = circle_path(400, 400, 150.0, 20);
+        assert_eq!(
+            push_single_finger_path(&mut detector, 2_100_000, 20_000, &path),
+            Some(GestureEvent::Completed(GestureId::Circle))
+        );
+    }
+
+    /// A true spiral — radius grows every sample while still sweeping a
+    /// consistent single rotational direction — must also fire `Circle`,
+    /// proving the detector doesn't require a fixed radius.
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn swipe_then_a_spiral_fires_circle() {
+        let mut detector = ArmedGestureDetector::new(200, ARM_WINDOW_MICROS);
+        swipe(&mut detector);
+        let sample_count = 24_usize;
+        let path: Vec<(u32, u32)> = (0..sample_count)
+            .map(|index| {
+                let angle = 2.0 * std::f64::consts::PI * (index as f64) / 6.0;
+                let radius = 60.0 + 6.0 * (index as f64);
+                let x = 400_i64 + (radius * angle.cos()).round() as i64;
+                let y = 400_i64 + (radius * angle.sin()).round() as i64;
+                (u32::try_from(x).unwrap_or(0), u32::try_from(y).unwrap_or(0))
+            })
+            .collect();
+        assert_eq!(
+            push_single_finger_path(&mut detector, 2_100_000, 20_000, &path),
+            Some(GestureEvent::Completed(GestureId::Circle))
+        );
+    }
+
+    /// An ordinary straight swipe (large net displacement, essentially no
+    /// rotation) must still fire the matching `Swipe*` direction, not
+    /// `Circle` — the circle check is self-gating and must not steal this.
+    #[test]
+    fn a_straight_swipe_still_fires_swipe_not_circle() {
+        let mut detector = ArmedGestureDetector::new(200, ARM_WINDOW_MICROS);
+        swipe(&mut detector);
+        let path: Vec<(u32, u32)> = (0..20)
+            .map(|index| (400 + index * 20, 100 + index * 15))
+            .collect();
+        assert_eq!(
+            push_single_finger_path(&mut detector, 2_100_000, 20_000, &path),
+            Some(GestureEvent::Completed(GestureId::SwipeRight))
+        );
+    }
+
+    /// A stationary tap/long-press must still fire as such, not `Circle` —
+    /// the minimum-average-radius guard rejects a barely-moving path.
+    #[test]
+    fn a_stationary_long_press_still_fires_long_press_not_circle() {
+        let mut detector = ArmedGestureDetector::new(200, ARM_WINDOW_MICROS);
+        swipe(&mut detector);
+        assert_eq!(detector.push(&tap_down(2_100_000)), None);
+        let long_press_up = frame(3_000_000, TouchPhase::Up, vec![(0, 52, 51)]);
+        assert_eq!(
+            detector.push(&long_press_up),
+            Some(GestureEvent::Completed(GestureId::LongPress))
+        );
+    }
+
+    /// A back-and-forth zigzag can sweep a lot of *cumulative* angle
+    /// without ever committing to one rotational direction — the
+    /// jitter-ratio guard must reject it rather than firing `Circle`.
+    #[test]
+    fn a_zigzag_path_does_not_fire_circle() {
+        let mut detector = ArmedGestureDetector::new(200, ARM_WINDOW_MICROS);
+        swipe(&mut detector);
+        let mut path = Vec::new();
+        for step in 0..20_u32 {
+            let x = 400 + if step % 2 == 0 { 100 } else { 0 };
+            let y = 400 + step * 10;
+            path.push((x, y));
+        }
+        let result = push_single_finger_path(&mut detector, 2_100_000, 20_000, &path);
+        assert_ne!(result, Some(GestureEvent::Completed(GestureId::Circle)));
+    }
+
+    /// A tiny in-place circular wiggle (radius well under
+    /// `CIRCLE_MIN_AVERAGE_RADIUS_PIXELS`) must not fire `Circle` — guards
+    /// against hand tremor during an attempted long-press being
+    /// misdetected as a fast, tiny circle.
+    #[test]
+    fn a_too_small_circular_wiggle_does_not_fire_circle() {
+        let mut detector = ArmedGestureDetector::new(200, ARM_WINDOW_MICROS);
+        swipe(&mut detector);
+        let path = circle_path(400, 400, 5.0, 20);
+        let result = push_single_finger_path(&mut detector, 2_100_000, 20_000, &path);
+        assert_ne!(result, Some(GestureEvent::Completed(GestureId::Circle)));
     }
 }

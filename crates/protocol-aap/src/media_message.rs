@@ -39,10 +39,15 @@ const MESSAGE_ID_SIZE: usize = 2;
 /// channel immediately after an `AudioFocusRequest::GainTransientMayDuck`),
 /// confirmed unacknowledged from the pinned AASDK source
 /// (`VideoMediaSinkService::handleStopIndication` parses and forwards it to
-/// the app layer, but never calls `send()`). The rest (microphone, UI
-/// config, audio underflow) are out of scope until something decodes or
-/// sends them, matching `Unknown` surviving round-trip the same way
-/// `ControlMessageId::Unknown` already does.
+/// the app layer, but never calls `send()`). `MicrophoneRequest`/
+/// `MicrophoneResponse` are specific to the microphone `MediaSourceService`
+/// channel (`protocol_aap::microphone_setup`) — the phone requests the mic
+/// be opened/closed, the head unit replies, then (only for
+/// `open: true`) itself sends `Start`/`Data` the other direction, reversed
+/// from every sink channel above. The rest (UI config, audio underflow)
+/// are out of scope until something decodes or sends them, matching
+/// `Unknown` surviving round-trip the same way `ControlMessageId::Unknown`
+/// already does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaMessageId {
     Data,
@@ -52,6 +57,8 @@ pub enum MediaMessageId {
     Stop,
     Config,
     Ack,
+    MicrophoneRequest,
+    MicrophoneResponse,
     VideoFocusRequest,
     VideoFocusNotification,
     Unknown(u16),
@@ -68,6 +75,8 @@ impl MediaMessageId {
             Self::Stop => 32770,
             Self::Config => 32771,
             Self::Ack => 32772,
+            Self::MicrophoneRequest => 32773,
+            Self::MicrophoneResponse => 32774,
             Self::VideoFocusRequest => 32775,
             Self::VideoFocusNotification => 32776,
             Self::Unknown(value) => value,
@@ -83,6 +92,8 @@ impl MediaMessageId {
             32770 => Self::Stop,
             32771 => Self::Config,
             32772 => Self::Ack,
+            32773 => Self::MicrophoneRequest,
+            32774 => Self::MicrophoneResponse,
             32775 => Self::VideoFocusRequest,
             32776 => Self::VideoFocusNotification,
             value => Self::Unknown(value),
@@ -181,6 +192,25 @@ pub(crate) fn decode_media_data(body: &[u8]) -> Option<(u64, &[u8])> {
     Some((u64::from_be_bytes(timestamp_bytes), &body[TIMESTAMP_SIZE..]))
 }
 
+/// Encodes `Data`'s framing — the outbound mirror of [`decode_media_data`]:
+/// an 8-byte big-endian timestamp prefix followed by the raw payload.
+/// Currently used only by the microphone channel
+/// (`protocol_aap::microphone_setup`), the first channel in this crate
+/// where the head unit originates `Data` rather than only decoding it from
+/// the phone. `payload` must never be logged whole by callers — only its
+/// length — matching the same rule already applied to every inbound
+/// `Data`/`CodecConfig` payload in this crate.
+#[must_use]
+pub(crate) fn encode_media_data(timestamp: u64, payload: &[u8]) -> MediaMessage {
+    let mut body = Vec::with_capacity(8 + payload.len());
+    body.extend_from_slice(&timestamp.to_be_bytes());
+    body.extend_from_slice(payload);
+    MediaMessage {
+        id: MediaMessageId::Data,
+        body,
+    }
+}
+
 /// Encodes `Ack` (`aap_protobuf.service.media.source.message.Ack`) — sent
 /// unconditionally after every `Data`/`CodecConfig` received, on every AV
 /// sink channel (video and all three audio channels). `session_id` (field
@@ -235,6 +265,15 @@ mod tests {
     }
 
     #[test]
+    fn encodes_media_data_with_exact_bytes() {
+        let message = encode_media_data(42, &[0xaa, 0xbb, 0xcc]);
+        assert_eq!(message.id, MediaMessageId::Data);
+        let mut expected = 42_u64.to_be_bytes().to_vec();
+        expected.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(message.body, expected);
+    }
+
+    #[test]
     fn known_ids_round_trip_through_their_wire_values() {
         for id in [
             MediaMessageId::Data,
@@ -244,6 +283,8 @@ mod tests {
             MediaMessageId::Stop,
             MediaMessageId::Config,
             MediaMessageId::Ack,
+            MediaMessageId::MicrophoneRequest,
+            MediaMessageId::MicrophoneResponse,
             MediaMessageId::VideoFocusRequest,
             MediaMessageId::VideoFocusNotification,
         ] {

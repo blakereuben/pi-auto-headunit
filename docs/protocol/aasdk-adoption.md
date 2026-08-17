@@ -294,6 +294,38 @@ this session.
 | 2 | `audio_config` | optional | `media.shared.message.AudioConfiguration` (mapped below) |
 | 3 | `available_while_in_call` | optional | `bool` |
 
+#### `MicrophoneRequest`/`MicrophoneResponse` (`aap_protobuf.service.media.source.message.{MicrophoneRequest,MicrophoneResponse}`, proto2, own files under `protobuf/aap_protobuf/service/media/source/message/`) and the source-side `Ack`
+
+Runtime messages on the `MediaSourceService`-bound channel (this project's `Microphone` service, `crates/protocol_aap::microphone_setup`), beyond the discovery-time capability table above — added 2026-08-17, implementing `MILESTONE_CHECKLIST.md` M4's "Capture microphone audio for voice interaction".
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `open` | required | `bool` |
+| 2 | `anc_enabled` | optional | `bool` |
+| 3 | `ec_enabled` | optional | `bool` |
+| 4 | `max_unacked` | optional | `int32` |
+
+`MicrophoneResponse`:
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `status` | required | `int32` — no named enum anywhere in this repo; `0` ("OK") is the only value ever produced |
+| 2 | `session_id` | optional | `int32` |
+
+Source-side `Ack` (`aap_protobuf.service.media.source.message.Ack`, its own file — a **distinct schema** from the sink-side `Ack` this project already encodes in `media_message::encode_media_ack`):
+
+| # | Name | Label | Type |
+|---|---|---|---|
+| 1 | `session_id` | required | `int32` |
+| 2 | `ack` | optional | `uint32` |
+| 3 | `receive_timestamp_ns` | repeated | `uint64` |
+
+**AASDK's own C++ for this exact channel has two confirmed defects, and is missing `Start`/`Stop` handling entirely — treat `f-io/LIVI` (`docs/protocol/livi-adoption.md`), not AASDK, as the behaviourally-correct reference for this specific channel.** `src/Channel/MediaSource/MediaSourceService.cpp`'s `sendChannelSetupResponse` tags its `Config` reply with the `Setup` message id (32768) instead of `Config` (32771); its `sendMicrophoneOpenResponse` tags `MicrophoneResponse` with the `MicrophoneRequest` id (32773) instead of the dedicated `MicrophoneResponse` id (32774, otherwise unreferenced anywhere in that repository). `IMediaSourceService` has no send-`Start` method at all, and the class's `messageHandler` switch has no `MEDIA_MESSAGE_START`/`MEDIA_MESSAGE_STOP` cases — unlike its sink-service sibling (`AudioMediaSinkService`), which handles both correctly one file over. This project's implementation reproduces neither defect and does implement `Start`/`Stop`, sourced instead from LIVI's real, working `MicChannel.ts`: `Start`/`Data` are head-unit-initiated on this channel (reversed from every sink channel elsewhere in this project, where the phone sends them), the head unit originates `session_id` itself (no phone-provided value to echo), and the exchange order was assumed to be `Setup`→`Config`→`MicrophoneRequest`→`MicrophoneResponse`→(`Start` only if `open: true`)→`Data`/`Ack`. No LIVI code is reproduced, only the wire shape and behavioural facts, cross-checked against the pinned AASDK schema above.
+
+**`Setup`/`Config` is optional, not a required precondition — real-hardware-confirmed 2026-08-17, correcting the assumed exchange order above.** A real phone sent `MicrophoneRequest` directly on this channel with no `Setup` ever sent at all, well into an otherwise-healthy live session (video/audio streaming normally for several minutes first) — this crashed the initial implementation, which had modelled `Setup`→`Config` as a required gate before `MicrophoneRequest`, mirroring the sink channels. In hindsight this tracks: the sink channels' `Setup` negotiates *which* of several advertised codecs/configs to use, but this channel's `ServiceDiscoveryResponse` only ever advertises one `AudioConfiguration` (`MicrophoneCapability`) — there is nothing to negotiate, so apparently a real phone may skip asking. `crates/protocol-aap/src/microphone_setup.rs`'s `MicrophoneSetupStateMachine` now accepts `MicrophoneRequest` directly from its initial state (still replying to `Setup` with `Config` if a phone does send it, just not requiring it first).
+
+**Genuinely unconfirmed pending real-hardware evidence** (recorded honestly rather than guessed): `MicrophoneResponse.status`'s non-zero values, if any; whether `Ack.ack` is a per-message increment or a cumulative counter (this project's implementation assumes per-message); whether real captured audio is actually recognized as intelligible speech end to end (the `Setup`-optional fix above was found and corrected before this was ever reached in a trial).
+
 ### `BluetoothService` (`aap_protobuf.service.bluetooth.BluetoothService`, proto2)
 
 | # | Name | Label | Type |

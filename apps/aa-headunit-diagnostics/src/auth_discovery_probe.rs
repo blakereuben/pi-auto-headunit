@@ -458,8 +458,8 @@
 use credential_store::CredentialMaterial;
 use media_api::{DecoderCapability, DecoderKind, VideoCodec as DecoderVideoCodec};
 use media_gstreamer::{
-    AudioFormat, AudioPlaybackPipeline, AudioSink, GstreamerBackend, GstreamerError, RenderSink,
-    VideoRenderPipeline,
+    AudioCaptureSource, AudioFormat, AudioPlaybackPipeline, AudioSink, GstreamerBackend,
+    GstreamerError, MicrophoneCapturePipeline, RenderSink, VideoRenderPipeline,
 };
 use platform_api::{ArmedGestureDetector, GestureEvent, TouchPhase};
 use platform_linux::touch::{EvdevTouchSource, Rotation, SharedRotation, discover_touchscreen};
@@ -473,17 +473,19 @@ use protocol_aap::{
     DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE, DEFAULT_MAX_SERVICE_CANDIDATES, DecodedFrame, Encryption,
     FrameError, FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
     HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus, KeyCode,
-    MediaMessageId, Message, MessageAssembler, MessageType, MicrophoneCapability, NavFocusType,
-    PingConfiguration, PointerAction, ProtocolLimits, RadioCapability, RadioType, SensorCapability,
-    SensorMessage, SensorMessageId, SensorType, ServiceAvailability, ServiceCandidate,
-    ServiceCapabilities, ServiceCatalogue, ServiceDiscoveryRequestSummary, ServiceKind, TlsClient,
-    TlsProgress, TouchCapability, TouchPointer, TouchScreenType, UiConfig, VideoCapability,
-    VideoCodecResolution, VideoCodecType, VideoFocusMode, VideoFrameRate, VideoSetupAction,
-    VideoSetupEvent, VideoSetupState, VideoSetupStateMachine, decode_audio_focus_request,
-    decode_bluetooth_pairing_request, decode_byebye_request, decode_frame,
-    decode_key_binding_request, decode_nav_focus_request, decode_ping_request,
-    decode_ping_response, decode_sensor_request, decode_voice_session_notification,
-    encode_audio_focus_notification, encode_bluetooth_pairing_response, encode_byebye_response,
+    MediaMessageId, Message, MessageAssembler, MessageType, MicrophoneCapability,
+    MicrophoneSendOutcome, MicrophoneSetupAction, MicrophoneSetupEvent, MicrophoneSetupState,
+    MicrophoneSetupStateMachine, NavFocusType, PingConfiguration, PointerAction, ProtocolLimits,
+    RadioCapability, RadioType, SensorCapability, SensorMessage, SensorMessageId, SensorType,
+    ServiceAvailability, ServiceCandidate, ServiceCapabilities, ServiceCatalogue,
+    ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress, TouchCapability,
+    TouchPointer, TouchScreenType, UiConfig, VideoCapability, VideoCodecResolution, VideoCodecType,
+    VideoFocusMode, VideoFrameRate, VideoSetupAction, VideoSetupEvent, VideoSetupState,
+    VideoSetupStateMachine, decode_audio_focus_request, decode_bluetooth_pairing_request,
+    decode_byebye_request, decode_frame, decode_key_binding_request, decode_nav_focus_request,
+    decode_ping_request, decode_ping_response, decode_sensor_request,
+    decode_voice_session_notification, encode_audio_focus_notification,
+    encode_bluetooth_pairing_response, encode_byebye_response,
     encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
     encode_key_event, encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
     encode_ping_response, encode_sensor_response, encode_service_discovery_response,
@@ -896,13 +898,19 @@ impl Gtk4WindowHandoff {
 /// (`MediaAudio`/`SystemAudio`/`SpeechAudio` each get their own instance),
 /// independent of that channel's own protocol state — same shape and same
 /// reasoning as `VideoRenderState` (a pipeline failure must never affect
-/// protocol-level correctness). Built lazily on `AudioSetupAction::Ready`.
+/// protocol-level correctness). Built as soon as the channel reaches
+/// `ChannelOpenState::Open` (not lazily on `AudioSetupAction::Ready`,
+/// which is often minutes later on `SpeechAudio` specifically — a real
+/// phone doesn't send `Start` on that channel until it actually has
+/// something to say) — see the real-hardware finding on
+/// `AUDIO_KEEPALIVE_SILENCE_INTERVAL`'s doc comment for why early,
+/// continuously-warm pipelines matter here.
 enum AudioPlaybackState {
     /// `GstreamerBackend::new()` itself failed for this channel's backend —
     /// never attempted again this run. The error is printed at the point
     /// of failure, not retained here.
     Unavailable,
-    /// Backend is ready; pipeline not yet built (waiting for `Ready`).
+    /// Backend is ready; pipeline not yet built.
     NotStarted(GstreamerBackend),
     /// Pipeline built and playing.
     Running(RunningAudioPipeline),
@@ -913,9 +921,12 @@ enum AudioPlaybackState {
     Failed,
 }
 
-/// A running audio pipeline plus the bookkeeping needed to measure this
-/// channel's real start latency exactly once: `started_at` is recorded the
-/// instant the pipeline reaches `Playing`
+/// A running audio pipeline plus the bookkeeping needed to (a) measure
+/// this channel's real start latency exactly once and (b) keep it
+/// continuously fed so the underlying `PipeWire`/ALSA device never goes
+/// idle long enough to be suspended — see
+/// `AUDIO_KEEPALIVE_SILENCE_INTERVAL`'s doc comment. `started_at` is
+/// recorded the instant the pipeline reaches `Playing`
 /// (`start_audio_playback_pipeline`), and `first_frame_latency_logged`
 /// latches after the first real `MediaDataReceived` push
 /// (`apply_to_running_audio_pipeline`) so the metric is reported once per
@@ -926,8 +937,11 @@ enum AudioPlaybackState {
 /// not glass-to-glass audible time, which no in-process timestamp can see.
 struct RunningAudioPipeline {
     pipeline: AudioPlaybackPipeline,
+    format: AudioFormat,
     started_at: std::time::Instant,
     first_frame_latency_logged: bool,
+    /// Updated on every push — real or keep-alive silence.
+    last_push_at: std::time::Instant,
 }
 
 /// Bundles every real media pipeline's lifecycle state together — purely
@@ -940,6 +954,7 @@ struct MediaPipelines {
     media_audio_playback: AudioPlaybackState,
     system_audio_playback: AudioPlaybackState,
     speech_audio_playback: AudioPlaybackState,
+    microphone_capture: MicrophoneCaptureState,
 }
 
 impl MediaPipelines {
@@ -949,6 +964,7 @@ impl MediaPipelines {
             media_audio_playback: new_audio_playback_state("media_audio"),
             system_audio_playback: new_audio_playback_state("system_audio"),
             speech_audio_playback: new_audio_playback_state("speech_audio"),
+            microphone_capture: new_microphone_capture_state(),
         }
     }
 }
@@ -995,6 +1011,42 @@ enum SpeechAudioChannel {
 enum SensorsChannel {
     AwaitingOpen(ChannelOpenStateMachine),
     Open,
+}
+
+/// Per-channel progress for the `Microphone` channel, driven once
+/// `ServiceDiscoveryResponse` has been sent. Same shape as
+/// `MediaAudioChannel`/`VideoChannel` — `Open` covers the entire post-open
+/// lifecycle, including repeated `Streaming`/close cycles within one
+/// session (`protocol_aap::microphone_setup`) — unlike every sink channel
+/// above, this channel's `Data`/`Start` flow head-unit-to-phone, not the
+/// reverse.
+enum MicrophoneChannel {
+    AwaitingOpen(ChannelOpenStateMachine),
+    Open(MicrophoneSetupStateMachine),
+}
+
+/// Lifecycle of the real microphone capture pipeline, independent of
+/// `MicrophoneChannel`'s own protocol state — same shape and reasoning as
+/// `AudioPlaybackState`. Unlike the audio-output pipelines (built once per
+/// session), this channel can legitimately open→stream→close→reopen
+/// several times within one session (once per voice interaction), so
+/// `stop_microphone_capture_pipeline` tears the pipeline fully down on
+/// `StreamingStopped` and rebuilds a fresh backend for the next
+/// `Streaming`, rather than merely pausing.
+enum MicrophoneCaptureState {
+    /// `GstreamerBackend::new()` itself failed — never attempted again
+    /// this run. The error is printed at the point of failure, not
+    /// retained here.
+    Unavailable,
+    /// Backend is ready; pipeline not yet built (waiting for `Streaming`).
+    NotStarted(GstreamerBackend),
+    /// Pipeline built and capturing.
+    Running(MicrophoneCapturePipeline),
+    /// Construction or start failed for this `Streaming` entry — reset to
+    /// a fresh `NotStarted` backend on the next `StreamingStopped`, unlike
+    /// `AudioPlaybackState::Failed`'s permanent give-up (see this enum's
+    /// doc comment on why this channel rebuilds instead).
+    Failed,
 }
 
 /// What happened while routing one assembled message, as returned by
@@ -1119,7 +1171,13 @@ pub(crate) fn read_observation_window_override() -> Result<Option<Duration>, Cli
 // holds a non-`Clone` `mpsc::Receiver`), so a `&VideoRenderTarget`
 // parameter here would just push the same ownership decision onto every
 // caller instead.
-#[allow(clippy::needless_pass_by_value)]
+// One continuous, inherently sequential session setup (TLS, handshake,
+// per-channel state, touch/gesture/screen-power locals) followed by the
+// main receive loop — splitting this further would thread many more
+// mutable references through helper functions without adding clarity,
+// matching the same `#[allow(clippy::too_many_lines)]` precedent already
+// used in `main.rs` for this kind of top-level orchestration function.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn run<T: SessionTransport>(
     transport: &mut T,
     tls12_compatibility: bool,
@@ -1171,9 +1229,10 @@ pub fn run<T: SessionTransport>(
     let mut read_buffer = vec![0_u8; AASDK_MAX_FRAME_PAYLOAD_SIZE + 8];
     // Control channel (0) + video channel + input channel + MediaAudio
     // channel + SystemAudio channel + SpeechAudio channel + Sensors channel
-    // can each independently be mid-fragmentation once channel setup starts.
+    // + Microphone channel can each independently be mid-fragmentation once
+    // channel setup starts.
     let mut assembler =
-        MessageAssembler::new(7).map_err(|error| CliError::Protocol(error.to_string()))?;
+        MessageAssembler::new(8).map_err(|error| CliError::Protocol(error.to_string()))?;
 
     // Set once ChannelSetupComplete is first reached; no longer stops the
     // probe (see report_probe_outcome) — the loop keeps running to observe
@@ -1185,6 +1244,7 @@ pub fn run<T: SessionTransport>(
     let mut speech_audio_channel: Option<SpeechAudioChannel> = None;
     let mut media_pipelines = MediaPipelines::new();
     let mut sensors_channel: Option<SensorsChannel> = None;
+    let mut microphone_channel: Option<MicrophoneChannel> = None;
     // Every channel that only ever needs to reach ChannelOpenState::Open —
     // input/touch plus two of the six non-video channels this experiment
     // adds (MediaAudio, SystemAudio, SpeechAudio, and Sensors now have their
@@ -1195,6 +1255,7 @@ pub fn run<T: SessionTransport>(
     let touch_source = open_touch_source(experiment_flags.touch_rotation);
     let touch_settings = touch_settings_handoff(&video_render_target);
     let mut gesture_detector = setup_settings_gesture(touch_source.as_ref(), touch_settings);
+    let mut screen_power = ScreenPowerState::On;
 
     while Instant::now() < deadline && !cancel.is_set() {
         let size = match transport.receive(&mut read_buffer) {
@@ -1220,6 +1281,7 @@ pub fn run<T: SessionTransport>(
             &mut media_pipelines,
             &video_render_target,
             &mut sensors_channel,
+            &mut microphone_channel,
             &mut simple_channels,
             &mut ping_state,
             &mut channel_setup_complete,
@@ -1238,6 +1300,9 @@ pub fn run<T: SessionTransport>(
             &mut gesture_detector,
             touch_settings,
             &simple_channels,
+            &mut microphone_channel,
+            &mut media_pipelines,
+            &mut screen_power,
             transport,
             &mut tls,
             limits,
@@ -1321,6 +1386,7 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
     media_pipelines: &mut MediaPipelines,
     video_render_target: &VideoRenderTarget,
     sensors_channel: &mut Option<SensorsChannel>,
+    microphone_channel: &mut Option<MicrophoneChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     ping_state: &mut Option<PingState>,
     channel_setup_complete: &mut bool,
@@ -1353,6 +1419,7 @@ fn drain_and_dispatch_frames<T: SessionTransport>(
             media_pipelines,
             video_render_target,
             sensors_channel,
+            microphone_channel,
             simple_channels,
             ping_state,
             tls,
@@ -1375,6 +1442,7 @@ fn arm_channels_after_service_discovery(
     system_audio_channel: &mut Option<SystemAudioChannel>,
     speech_audio_channel: &mut Option<SpeechAudioChannel>,
     sensors_channel: &mut Option<SensorsChannel>,
+    microphone_channel: &mut Option<MicrophoneChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
 ) {
     *video_channel = Some(VideoChannel::AwaitingOpen(ChannelOpenStateMachine::new(
@@ -1392,12 +1460,10 @@ fn arm_channels_after_service_discovery(
     *sensors_channel = Some(SensorsChannel::AwaitingOpen(ChannelOpenStateMachine::new(
         SENSORS_CHANNEL_ID,
     )));
-    for channel_id in [
-        INPUT_CHANNEL_ID,
-        BLUETOOTH_CHANNEL_ID,
-        MICROPHONE_CHANNEL_ID,
-        RADIO_CHANNEL_ID,
-    ] {
+    *microphone_channel = Some(MicrophoneChannel::AwaitingOpen(
+        ChannelOpenStateMachine::new(MICROPHONE_CHANNEL_ID),
+    ));
+    for channel_id in [INPUT_CHANNEL_ID, BLUETOOTH_CHANNEL_ID, RADIO_CHANNEL_ID] {
         simple_channels.insert(channel_id, ChannelOpenStateMachine::new(channel_id));
     }
 }
@@ -1422,6 +1488,7 @@ fn handle_message<T: SessionTransport>(
     media_pipelines: &mut MediaPipelines,
     video_render_target: &VideoRenderTarget,
     sensors_channel: &mut Option<SensorsChannel>,
+    microphone_channel: &mut Option<MicrophoneChannel>,
     simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
     ping_state: &mut Option<PingState>,
     tls: &mut OpenSslTlsClient,
@@ -1458,12 +1525,60 @@ fn handle_message<T: SessionTransport>(
                 system_audio_channel,
                 speech_audio_channel,
                 sensors_channel,
+                microphone_channel,
                 simple_channels,
             );
         }
         return Ok(ProbeOutcome::Continue);
     }
 
+    dispatch_channel_message(
+        message,
+        video_channel,
+        media_audio_channel,
+        system_audio_channel,
+        speech_audio_channel,
+        media_pipelines,
+        video_render_target,
+        sensors_channel,
+        microphone_channel,
+        simple_channels,
+        tls,
+        transport,
+        limits,
+    )?;
+
+    let input_open = simple_channel_is_open(simple_channels, INPUT_CHANNEL_ID);
+    let video_ready = matches!(
+        video_channel,
+        Some(VideoChannel::Open(machine)) if machine.state() == VideoSetupState::Ready
+    );
+    Ok(if video_ready && input_open {
+        ProbeOutcome::ChannelSetupComplete
+    } else {
+        ProbeOutcome::Continue
+    })
+}
+
+/// The per-channel-id routing chain, split out of `handle_message` purely
+/// to keep it under `clippy::too_many_lines` — no behavior change from
+/// when this was inline.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_channel_message<T: SessionTransport>(
+    message: &Message,
+    video_channel: &mut Option<VideoChannel>,
+    media_audio_channel: &mut Option<MediaAudioChannel>,
+    system_audio_channel: &mut Option<SystemAudioChannel>,
+    speech_audio_channel: &mut Option<SpeechAudioChannel>,
+    media_pipelines: &mut MediaPipelines,
+    video_render_target: &VideoRenderTarget,
+    sensors_channel: &mut Option<SensorsChannel>,
+    microphone_channel: &mut Option<MicrophoneChannel>,
+    simple_channels: &mut HashMap<u8, ChannelOpenStateMachine>,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
     if message.channel_id == VIDEO_CHANNEL_ID {
         handle_video_channel_message(
             message,
@@ -1503,6 +1618,15 @@ fn handle_message<T: SessionTransport>(
         )?;
     } else if message.channel_id == SENSORS_CHANNEL_ID {
         handle_sensors_channel_message(message, sensors_channel, tls, transport, limits)?;
+    } else if message.channel_id == MICROPHONE_CHANNEL_ID {
+        handle_microphone_channel_message(
+            message,
+            microphone_channel,
+            &mut media_pipelines.microphone_capture,
+            tls,
+            transport,
+            limits,
+        )?;
     } else if message.channel_id == INPUT_CHANNEL_ID
         && simple_channel_is_open(simple_channels, INPUT_CHANNEL_ID)
     {
@@ -1521,17 +1645,7 @@ fn handle_message<T: SessionTransport>(
             limits,
         )?;
     }
-
-    let input_open = simple_channel_is_open(simple_channels, INPUT_CHANNEL_ID);
-    let video_ready = matches!(
-        video_channel,
-        Some(VideoChannel::Open(machine)) if machine.state() == VideoSetupState::Ready
-    );
-    Ok(if video_ready && input_open {
-        ProbeOutcome::ChannelSetupComplete
-    } else {
-        ProbeOutcome::Continue
-    })
+    Ok(())
 }
 
 /// Handles control-channel traffic that arrives after `HandshakeStateMachine`
@@ -1742,10 +1856,16 @@ fn service_proactive_sends<T: SessionTransport>(
     gesture_detector: &mut ArmedGestureDetector,
     touch_settings: Option<&TouchSettingsHandoff>,
     simple_channels: &HashMap<u8, ChannelOpenStateMachine>,
+    microphone_channel: &mut Option<MicrophoneChannel>,
+    media_pipelines: &mut MediaPipelines,
+    screen_power: &mut ScreenPowerState,
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
     limits: ProtocolLimits,
 ) -> Result<(), CliError> {
+    service_audio_keepalive(&mut media_pipelines.media_audio_playback, "media_audio");
+    service_audio_keepalive(&mut media_pipelines.system_audio_playback, "system_audio");
+    service_audio_keepalive(&mut media_pipelines.speech_audio_playback, "speech_audio");
     service_ping(
         ping_state,
         flags,
@@ -1762,6 +1882,14 @@ fn service_proactive_sends<T: SessionTransport>(
         gesture_detector,
         touch_settings,
         input_open,
+        screen_power,
+        transport,
+        tls,
+        limits,
+    )?;
+    service_microphone_capture(
+        microphone_channel,
+        &media_pipelines.microphone_capture,
         transport,
         tls,
         limits,
@@ -1886,26 +2014,160 @@ fn report_settings_gesture_event(event: GestureEvent, touch_settings: &TouchSett
     let _ = touch_settings.gesture_sender.send(event);
 }
 
-/// If `gesture`'s currently-assigned action is one of the four
-/// `SwitchTo*` category switches, sends the matching real-key-press pair
-/// (`down=true` then `down=false`, per `encode_key_event`'s doc comment)
-/// on the already-open input channel. A no-op for every other action —
-/// those are dispatched locally by the GTK thread instead (see
-/// `gtk_dev_ui.rs::dispatch_action`'s doc comment for why the split), and
-/// this function has no window/rotation state to act on anyway. Runs on
-/// this background thread specifically because it's the one thread with
-/// transport/TLS access.
-fn dispatch_gesture_key_action<T: SessionTransport>(
+/// Turns the physical display dark or back on by writing directly to the
+/// panel's backlight `brightness` sysfs file — never touching the
+/// Wayland/DRM output object itself, unlike either mechanism tried
+/// before it (see below). Discovers whichever single entry exists under
+/// `/sys/class/backlight` at runtime rather than hardcoding a device id
+/// (`11-0045` on this project's reference Pi, an I2C bus/address-derived
+/// name not guaranteed stable across a reinstall or a different Pi).
+/// Never panics and never surfaces as a `CliError` — a failure here must
+/// not break the protocol session, matching `AudioPlaybackState`/
+/// `VideoRenderState`'s "hardware side effects never break the main flow"
+/// discipline elsewhere in this file.
+///
+/// **Two other mechanisms were tried and real-hardware-rejected first,
+/// 2026-08-17/18** — recorded here so this isn't re-litigated:
+/// 1. `vcgencmd display_power` doesn't exist on Pi 5 at all (a
+///    Pi3/4-era VideoCore-firmware-only command — "Command not
+///    registered").
+/// 2. `wlopm --off`/`--on <output>` (Wayland Output Power Management, the
+///    standard wlroots tool for exactly this) consistently printed
+///    `ERROR: Setting power mode for output 'DSI-2' failed.` and never
+///    actually changed the display's power state, while still exiting
+///    `0` — a known labwc bug on Raspberry Pi DSI/DPI panels
+///    (`labwc/labwc` issues #1869/#2279 report the identical failure on
+///    the same class of hardware).
+/// 3. `wlr-randr --output <name> --off`/`--on` (the documented working
+///    alternative in that same upstream issue) genuinely did toggle the
+///    output's real `Enabled: yes`/`no` state — but real-hardware trial
+///    found a real side effect: this project's `wayvnc` VNC server
+///    captures that same named output specifically, and disabling it
+///    doesn't just blank the panel, it removes the output object from
+///    the compositor's active set entirely — `wayvnc`'s own log:
+///    `"Selected output DSI-2 went away ... No fallback outputs left.
+///    Detaching."` — silently killing any active VNC session every time
+///    the screen turned off. Backlight-only control changes none of
+///    that: the output stays fully enabled and composited throughout,
+///    `wayvnc` (and anything else watching the output list) is
+///    completely unaffected — confirmed directly this session (no
+///    detach warning in `wayvnc`'s log after switching).
+fn set_screen_power(on: bool) {
+    let Some(backlight_dir) = std::fs::read_dir("/sys/class/backlight")
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .and_then(Result::ok)
+        .map(|entry| entry.path())
+    else {
+        println!("probe_state=screen_power_command_failed on={on} error=no_backlight_device_found");
+        return;
+    };
+    let value = if on {
+        std::fs::read_to_string(backlight_dir.join("max_brightness"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    match std::fs::write(backlight_dir.join("brightness"), value.to_string()) {
+        Ok(()) => println!("probe_state=screen_power_command_sent on={on}"),
+        Err(error) => println!("probe_state=screen_power_command_failed on={on} error={error}"),
+    }
+}
+
+/// Drives the screen-off/wake-on-touch gesture
+/// (`gesture_settings::Action::ScreenOff`). Tracked as a plain local in
+/// `run()`, owned only by this background thread, mirroring
+/// `ArmedGestureDetector` itself.
+///
+/// Four states, not two, because of a real bug a design-validation pass
+/// caught before any code was written: the triple-finger-double-tap
+/// gesture that triggers `ScreenOff` completes (per this project's own
+/// established "fire on the first finger departing" design —
+/// `platform_api::gesture`) while up to two more of that same completing
+/// tap's fingers may still be touching the glass. Marking the screen
+/// `Off` immediately would let the very next frame — one of those same
+/// straggling fingers still lifting — be misread as a brand-new wake
+/// touch, flickering the screen back on one frame later. `TurningOff`
+/// lets the triggering gesture's own release finish normally (its
+/// completing frame still gets forwarded as an ordinary touch report,
+/// matching this module's existing accepted stance on not suppressing
+/// the completing frame of any gesture) before wake-detection arms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScreenPowerState {
+    On,
+    /// `set_screen_power(false)` already issued; waiting for the
+    /// triggering gesture's own remaining fingers to fully clear (a real
+    /// `TouchPhase::Up`, not just "count dropped") before arming
+    /// wake-detection.
+    TurningOff,
+    /// Screen genuinely dark, no finger down — the next touch begins a
+    /// wake.
+    Off,
+    /// A wake touch is in progress; every frame is swallowed (no gesture
+    /// push, no touch report sent) until it fully releases.
+    WakingUntilRelease,
+}
+
+/// The pure transition logic, factored out so it's unit-testable even
+/// though the real `wlr-randr` subprocess call isn't (matches this project's
+/// existing "pure state machines are unit tested, real hardware side
+/// effects are real-hardware-verified only" split). Does **not** call
+/// `set_screen_power` itself — callers do that at the specific
+/// transitions that need it (`Off` entry: wake; `ScreenOff` dispatch:
+/// turn off), since this function only knows the touch-phase side of the
+/// picture.
+fn advance_screen_power(state: ScreenPowerState, phase: TouchPhase) -> ScreenPowerState {
+    match state {
+        ScreenPowerState::On => ScreenPowerState::On,
+        ScreenPowerState::TurningOff => {
+            if phase == TouchPhase::Up {
+                ScreenPowerState::Off
+            } else {
+                ScreenPowerState::TurningOff
+            }
+        }
+        ScreenPowerState::Off => ScreenPowerState::WakingUntilRelease,
+        ScreenPowerState::WakingUntilRelease => {
+            if phase == TouchPhase::Up {
+                ScreenPowerState::On
+            } else {
+                ScreenPowerState::WakingUntilRelease
+            }
+        }
+    }
+}
+
+/// Loads `gesture`'s currently-assigned action and dispatches it, for the
+/// two categories of action that can only run on this background thread:
+/// the four `SwitchTo*` category switches (send a real-key-press pair,
+/// `down=true` then `down=false`, per `encode_key_event`'s doc comment,
+/// since this thread owns `transport`/`tls`) and `ScreenOff` (flips
+/// `screen_power` and issues the real `wlr-randr` call, since this thread's
+/// `service_touch_input` is the only place that can swallow the wake
+/// touch). A genuine third dispatch category exists too —
+/// `OpenSettings`/`ToggleFullscreen`/`CycleRotation` — dispatched locally
+/// by the GTK thread instead (see `gtk_dev_ui.rs::dispatch_action`'s doc
+/// comment); this function is a no-op for those.
+fn dispatch_gesture_action<T: SessionTransport>(
     gesture: platform_api::GestureId,
     timestamp_micros: u64,
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
     limits: ProtocolLimits,
+    screen_power: &mut ScreenPowerState,
 ) -> Result<(), CliError> {
     let action = crate::gesture_settings::GestureSettings::load(std::path::Path::new(
         crate::gesture_settings::DEFAULT_SETTINGS_PATH,
     ))
     .action_for(gesture);
+    if action == crate::gesture_settings::Action::ScreenOff {
+        set_screen_power(false);
+        *screen_power = ScreenPowerState::TurningOff;
+        println!("probe_state=screen_off_gesture_triggered");
+        return Ok(());
+    }
     let Some(keycode) = action.key_code() else {
         return Ok(());
     };
@@ -1932,11 +2194,24 @@ fn dispatch_gesture_key_action<T: SessionTransport>(
 /// this only runs once the input channel has actually reached `Open`
 /// (sending on an unopened channel would be a protocol violation the phone
 /// has no reason to expect).
+///
+/// The very top of the per-frame loop handles `screen_power` first,
+/// unconditionally (not itself gated on `touch_settings.is_some()` — it's
+/// a provable no-op on the plain `Wayland` target, since `screen_power`
+/// can only ever leave `On` via `dispatch_gesture_action`, itself only
+/// ever called from inside the `touch_settings.is_some()` branch below).
+/// While `screen_power` isn't `On`, every frame is `continue`d past —
+/// swallowed entirely, no gesture push, no touch report sent — see
+/// `ScreenPowerState`'s doc comment for why. A consequence, confirmed
+/// intentional: no gesture, including the four-finger arm swipe itself,
+/// is recognizable while the screen is off — only a plain touch wakes it.
+#[allow(clippy::too_many_arguments)]
 fn service_touch_input<T: SessionTransport>(
     touch_source: Option<&EvdevTouchSource>,
     gesture_detector: &mut ArmedGestureDetector,
     touch_settings: Option<&TouchSettingsHandoff>,
     input_open: bool,
+    screen_power: &mut ScreenPowerState,
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
     limits: ProtocolLimits,
@@ -1964,15 +2239,33 @@ fn service_touch_input<T: SessionTransport>(
         }
     }
     while let Some(frame) = touch_source.try_recv() {
+        // `TurningOff` deliberately falls through to normal processing
+        // below (only `Off`/`WakingUntilRelease` swallow) — the
+        // triggering gesture's own remaining frames, including its own
+        // touch report, are still forwarded exactly as before; only the
+        // phase-based state transition happens here. See
+        // `ScreenPowerState`'s doc comment.
+        let previous_screen_power = *screen_power;
+        *screen_power = advance_screen_power(previous_screen_power, frame.phase);
+        match previous_screen_power {
+            ScreenPowerState::On | ScreenPowerState::TurningOff => {}
+            ScreenPowerState::Off => {
+                set_screen_power(true);
+                println!("probe_state=screen_off_woken_by_touch");
+                continue;
+            }
+            ScreenPowerState::WakingUntilRelease => continue,
+        }
         if let Some(touch_settings) = touch_settings {
             if let Some(event) = gesture_detector.push(&frame) {
                 if let GestureEvent::Completed(gesture) = event {
-                    dispatch_gesture_key_action(
+                    dispatch_gesture_action(
                         gesture,
                         frame.timestamp_micros,
                         transport,
                         tls,
                         limits,
+                        screen_power,
                     )?;
                 }
                 report_settings_gesture_event(event, touch_settings);
@@ -2011,6 +2304,66 @@ fn service_touch_input<T: SessionTransport>(
             frame.phase,
             frame.points.len()
         );
+    }
+    Ok(())
+}
+
+/// Drains every captured PCM buffer queued since the last call and sends
+/// each as a `Data` message — proactive, not a reply to anything the
+/// phone sent, mirroring `service_touch_input`'s exact shape. Only does
+/// anything once the microphone channel has actually reached `Streaming`
+/// and a real capture pipeline is `Running`. Credit-exhausted drops
+/// (`protocol_aap::microphone_setup::MicrophoneSendOutcome::CreditExhausted`)
+/// are counted and logged once per call as an aggregate, never per frame
+/// — matching this project's no-log-spam-on-high-frequency-traffic
+/// discipline elsewhere in this file.
+fn service_microphone_capture<T: SessionTransport>(
+    microphone_channel: &mut Option<MicrophoneChannel>,
+    microphone_capture: &MicrophoneCaptureState,
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let Some(MicrophoneChannel::Open(machine)) = microphone_channel else {
+        return Ok(());
+    };
+    if machine.state() != MicrophoneSetupState::Streaming {
+        return Ok(());
+    }
+    let MicrophoneCaptureState::Running(pipeline) = microphone_capture else {
+        return Ok(());
+    };
+    if let Some(error) = pipeline.poll_bus_error() {
+        println!("probe_state=microphone_capture_pipeline_error");
+        println!("microphone_capture_error={error}");
+    }
+    let mut exhausted_count = 0_u32;
+    while let Some(frame) = pipeline.try_recv() {
+        match machine.send_data(frame.timestamp_micros, &frame.payload) {
+            MicrophoneSendOutcome::Sent(message) => {
+                let payload = message
+                    .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+                send_encrypted(
+                    transport,
+                    tls,
+                    MICROPHONE_CHANNEL_ID,
+                    MessageType::Specific,
+                    &payload,
+                    limits,
+                )?;
+            }
+            MicrophoneSendOutcome::CreditExhausted => exhausted_count += 1,
+            // Channel closed between `try_recv()` and this call (e.g. the
+            // phone just sent `Stop`) — stop draining, the remaining
+            // frames in the channel are simply discarded on the next
+            // `MicrophoneCapturePipeline` rebuild.
+            MicrophoneSendOutcome::NotStreaming => break,
+        }
+    }
+    if exhausted_count > 0 {
+        println!("probe_state=microphone_data_dropped_credit_exhausted");
+        println!("microphone_data_dropped_count={exhausted_count}");
     }
     Ok(())
 }
@@ -2643,13 +2996,16 @@ fn log_audio_stop_received(label: &str) {
     println!("probe_state={label}_channel_stop_received");
 }
 
-/// Lazily builds and starts one audio channel's real PCM playback pipeline
-/// on that channel's own `Start`. Mirrors `start_video_render_pipeline`;
-/// construction/start failure (most commonly: no reachable
-/// PipeWire/PulseAudio session, e.g. an unprivileged `sudo` session without
-/// `-E`) demotes `audio_playback` to `Failed` and is logged — never returns
-/// an error or aborts the probe, since playback is independent of protocol
-/// correctness (see `AudioPlaybackState`'s doc comment).
+/// Builds and starts one audio channel's real PCM playback pipeline.
+/// Called as soon as the channel reaches `ChannelOpenState::Open` (see
+/// `AudioPlaybackState`'s doc comment for why this moved earlier than
+/// `Start`); a no-op if already `Running`, so calling it again is always
+/// safe. Mirrors `start_video_render_pipeline`; construction/start failure
+/// (most commonly: no reachable PipeWire/PulseAudio session, e.g. an
+/// unprivileged `sudo` session without `-E`) demotes `audio_playback` to
+/// `Failed` and is logged — never returns an error or aborts the probe,
+/// since playback is independent of protocol correctness (see
+/// `AudioPlaybackState`'s doc comment).
 fn start_audio_playback_pipeline(
     audio_playback: &mut AudioPlaybackState,
     format: AudioFormat,
@@ -2667,10 +3023,13 @@ fn start_audio_playback_pipeline(
         Ok(pipeline) => match pipeline.start() {
             Ok(()) => {
                 println!("probe_state={label}_playback_pipeline_started");
+                let now = std::time::Instant::now();
                 *audio_playback = AudioPlaybackState::Running(RunningAudioPipeline {
                     pipeline,
-                    started_at: std::time::Instant::now(),
+                    format,
+                    started_at: now,
                     first_frame_latency_logged: false,
+                    last_push_at: now,
                 });
             }
             Err(error) => {
@@ -2688,19 +3047,24 @@ fn start_audio_playback_pipeline(
 }
 
 /// Pushes into an already-`Running` pipeline and, on the first successful
-/// push only, logs this channel's start latency (see
+/// real push only, logs this channel's start latency (see
 /// `RunningAudioPipeline`'s doc comment). Returns the same
 /// `Some((state, error))`/`None` shape `apply_to_running_audio_pipeline`
-/// reports upward.
+/// reports upward. `is_real_data` gates only the once-per-channel latency
+/// log — keep-alive silence pushes (`service_audio_keepalive`) always
+/// update `last_push_at` but must never be mistaken for the first real
+/// frame.
 fn push_and_check_running_audio_pipeline(
     running: &mut RunningAudioPipeline,
     label: &str,
+    is_real_data: bool,
     push: impl FnOnce(&AudioPlaybackPipeline) -> Result<(), media_gstreamer::GstreamerError>,
 ) -> Option<(&'static str, media_gstreamer::GstreamerError)> {
     if let Err(error) = push(&running.pipeline) {
         return Some(("playback_push_failed", error));
     }
-    if !running.first_frame_latency_logged {
+    running.last_push_at = std::time::Instant::now();
+    if is_real_data && !running.first_frame_latency_logged {
         running.first_frame_latency_logged = true;
         println!(
             "probe_metric={label}_audio_start_latency_ms={}",
@@ -2725,10 +3089,73 @@ fn apply_to_running_audio_pipeline(
 ) {
     let failure = match audio_playback {
         AudioPlaybackState::Running(running) => {
-            push_and_check_running_audio_pipeline(running, label, push)
+            push_and_check_running_audio_pipeline(running, label, true, push)
         }
         _ => None,
     };
+    if let Some((state, error)) = failure {
+        println!("probe_state={label}_{state}");
+        println!("{label}_playback_error={error}");
+        *audio_playback = AudioPlaybackState::Failed;
+    }
+}
+
+/// How long a `Running` audio-output pipeline may go without a real push
+/// before `service_audio_keepalive` fills the gap with silence. Chosen to
+/// sit comfortably under typical `PipeWire` ALSA-node idle-suspend
+/// timeouts (commonly a handful of seconds) while staying cheap: three
+/// channels each pushing a small buffer 4x/second is negligible local CPU
+/// cost (this never touches the USB-AOA link to the phone — purely a
+/// local `PipeWire` push).
+///
+/// **Real-hardware finding, 2026-08-17**: a live trial found the
+/// `MediaAudio` channel goes genuinely silent (zero `Data` messages, not
+/// just quiet) for the phone's entire spoken-assistant-response duration —
+/// 47.5 real seconds observed in one trial — then resumes with a fresh
+/// `Start`. The operator directly heard audible choppiness for ~5 seconds
+/// both when the assistant's own `SpeechAudio` response first started
+/// (that channel's pipeline's first-ever cold start, since `Start` on it
+/// doesn't arrive until the phone actually has something to say) and again
+/// when `MediaAudio` resumed after the gap. Both playback sinks already
+/// run `sync=false` (`audio.rs`), so buffer PTS does not drive playback
+/// timing here — the glitch is consistent with the underlying ALSA/USB
+/// audio device itself stalling on cold-start and being suspended during
+/// a multi-second real gap, not a GStreamer-level sync artifact. Silence
+/// keep-alive, combined with building/starting each pipeline as soon as
+/// its channel opens (`AudioPlaybackState`'s doc comment) rather than
+/// waiting for `Start`, keeps the device continuously active so neither
+/// condition should recur; not yet re-verified on real hardware.
+const AUDIO_KEEPALIVE_SILENCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Fills any gap since the last real push on a `Running` audio pipeline
+/// with a silence buffer sized for [`AUDIO_KEEPALIVE_SILENCE_INTERVAL`] —
+/// see that constant's doc comment for why. A no-op for `NotStarted`/
+/// `Unavailable`/`Failed` states, and a no-op if a real push already
+/// happened recently enough. Silence content is never derived from real
+/// audio and is never logged beyond its byte count, matching this
+/// project's no-raw-payload-logging rule.
+fn service_audio_keepalive(audio_playback: &mut AudioPlaybackState, label: &str) {
+    let AudioPlaybackState::Running(running) = audio_playback else {
+        return;
+    };
+    if running.last_push_at.elapsed() < AUDIO_KEEPALIVE_SILENCE_INTERVAL {
+        return;
+    }
+    let bytes_per_frame = running.format.channels as usize * 2; // S16LE
+    let sample_count = (AUDIO_KEEPALIVE_SILENCE_INTERVAL.as_millis() as usize
+        * running.format.sampling_rate as usize)
+        / 1000;
+    let silence = vec![0_u8; sample_count * bytes_per_frame];
+    let now_micros = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(u64::MAX);
+    let failure = push_and_check_running_audio_pipeline(running, label, false, |pipeline| {
+        pipeline.push_frame(&silence, now_micros)
+    });
     if let Some((state, error)) = failure {
         println!("probe_state={label}_{state}");
         println!("{label}_playback_error={error}");
@@ -2780,74 +3207,92 @@ fn handle_media_audio_channel_message<T: SessionTransport>(
             }
             println!("probe_state=media_audio_channel_open");
             *state = MediaAudioChannel::Open(AudioSetupStateMachine::new());
+            start_audio_playback_pipeline(
+                audio_playback,
+                MEDIA_AUDIO_PLAYBACK_FORMAT,
+                "media_audio",
+            );
             Ok(())
         }
-        MediaAudioChannel::Open(machine) => {
-            if message.message_type != MessageType::Specific {
-                return Err(CliError::Protocol(
-                    "expected a media-audio-channel media message".into(),
-                ));
-            }
-            let actions = machine
-                .advance(AudioSetupEvent::InboundMedia(&message.payload))
-                .map_err(|error| CliError::Protocol(error.to_string()))?;
-            for action in actions {
-                match action {
-                    AudioSetupAction::SendMedia(response) => {
-                        let payload = response
-                            .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
-                            .map_err(|error| CliError::Protocol(error.to_string()))?;
-                        let response_id = response.id;
-                        send_encrypted(
-                            transport,
-                            tls,
-                            MEDIA_AUDIO_CHANNEL_ID,
-                            MessageType::Specific,
-                            &payload,
-                            limits,
-                        )?;
-                        match response_id {
-                            MediaMessageId::Ack => {
-                                println!("probe_state=media_audio_channel_ack_sent");
-                            }
-                            _ => {
-                                println!("probe_state=media_audio_channel_setup_config_sent");
-                            }
-                        }
+        MediaAudioChannel::Open(machine) => handle_media_audio_channel_open_message(
+            message,
+            machine,
+            audio_playback,
+            tls,
+            transport,
+            limits,
+        ),
+    }
+}
+
+/// The `MediaAudioChannel::Open` arm of `handle_media_audio_channel_message`,
+/// split out purely to keep that function under `clippy::too_many_lines` —
+/// no behavior change from when this was inline.
+fn handle_media_audio_channel_open_message<T: SessionTransport>(
+    message: &Message,
+    machine: &mut AudioSetupStateMachine,
+    audio_playback: &mut AudioPlaybackState,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    if message.message_type != MessageType::Specific {
+        return Err(CliError::Protocol(
+            "expected a media-audio-channel media message".into(),
+        ));
+    }
+    let actions = machine
+        .advance(AudioSetupEvent::InboundMedia(&message.payload))
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    for action in actions {
+        match action {
+            AudioSetupAction::SendMedia(response) => {
+                let payload = response
+                    .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+                let response_id = response.id;
+                send_encrypted(
+                    transport,
+                    tls,
+                    MEDIA_AUDIO_CHANNEL_ID,
+                    MessageType::Specific,
+                    &payload,
+                    limits,
+                )?;
+                match response_id {
+                    MediaMessageId::Ack => {
+                        println!("probe_state=media_audio_channel_ack_sent");
                     }
-                    AudioSetupAction::Ready {
-                        session_id,
-                        configuration_index,
-                    } => {
-                        log_audio_channel_start_received(
-                            "media_audio",
-                            session_id,
-                            configuration_index,
-                        );
-                        start_audio_playback_pipeline(
-                            audio_playback,
-                            MEDIA_AUDIO_PLAYBACK_FORMAT,
-                            "media_audio",
-                        );
+                    _ => {
+                        println!("probe_state=media_audio_channel_setup_config_sent");
                     }
-                    AudioSetupAction::MediaDataReceived { timestamp, payload } => {
-                        log_audio_media_data_received("media_audio", timestamp, payload.len());
-                        apply_to_running_audio_pipeline(
-                            audio_playback,
-                            "media_audio",
-                            |pipeline| pipeline.push_frame(&payload, timestamp),
-                        );
-                    }
-                    AudioSetupAction::CodecConfigReceived { payload } => {
-                        println!("probe_state=media_audio_media_codec_config_received");
-                        println!("media_audio_media_codec_config_bytes={}", payload.len());
-                    }
-                    AudioSetupAction::StopReceived => log_audio_stop_received("media_audio"),
                 }
             }
-            Ok(())
+            AudioSetupAction::Ready {
+                session_id,
+                configuration_index,
+            } => {
+                log_audio_channel_start_received("media_audio", session_id, configuration_index);
+                start_audio_playback_pipeline(
+                    audio_playback,
+                    MEDIA_AUDIO_PLAYBACK_FORMAT,
+                    "media_audio",
+                );
+            }
+            AudioSetupAction::MediaDataReceived { timestamp, payload } => {
+                log_audio_media_data_received("media_audio", timestamp, payload.len());
+                apply_to_running_audio_pipeline(audio_playback, "media_audio", |pipeline| {
+                    pipeline.push_frame(&payload, timestamp)
+                });
+            }
+            AudioSetupAction::CodecConfigReceived { payload } => {
+                println!("probe_state=media_audio_media_codec_config_received");
+                println!("media_audio_media_codec_config_bytes={}", payload.len());
+            }
+            AudioSetupAction::StopReceived => log_audio_stop_received("media_audio"),
         }
     }
+    Ok(())
 }
 
 /// Drives the `SystemAudio` channel's `ChannelOpenStateMachine` then
@@ -2896,74 +3341,92 @@ fn handle_system_audio_channel_message<T: SessionTransport>(
             }
             println!("probe_state=system_audio_channel_open");
             *state = SystemAudioChannel::Open(AudioSetupStateMachine::new());
+            start_audio_playback_pipeline(
+                audio_playback,
+                VOICE_AUDIO_PLAYBACK_FORMAT,
+                "system_audio",
+            );
             Ok(())
         }
-        SystemAudioChannel::Open(machine) => {
-            if message.message_type != MessageType::Specific {
-                return Err(CliError::Protocol(
-                    "expected a system-audio-channel media message".into(),
-                ));
-            }
-            let actions = machine
-                .advance(AudioSetupEvent::InboundMedia(&message.payload))
-                .map_err(|error| CliError::Protocol(error.to_string()))?;
-            for action in actions {
-                match action {
-                    AudioSetupAction::SendMedia(response) => {
-                        let payload = response
-                            .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
-                            .map_err(|error| CliError::Protocol(error.to_string()))?;
-                        let response_id = response.id;
-                        send_encrypted(
-                            transport,
-                            tls,
-                            SYSTEM_AUDIO_CHANNEL_ID,
-                            MessageType::Specific,
-                            &payload,
-                            limits,
-                        )?;
-                        match response_id {
-                            MediaMessageId::Ack => {
-                                println!("probe_state=system_audio_channel_ack_sent");
-                            }
-                            _ => {
-                                println!("probe_state=system_audio_channel_setup_config_sent");
-                            }
-                        }
+        SystemAudioChannel::Open(machine) => handle_system_audio_channel_open_message(
+            message,
+            machine,
+            audio_playback,
+            tls,
+            transport,
+            limits,
+        ),
+    }
+}
+
+/// The `SystemAudioChannel::Open` arm of `handle_system_audio_channel_message`,
+/// split out purely to keep that function under `clippy::too_many_lines` —
+/// no behavior change from when this was inline.
+fn handle_system_audio_channel_open_message<T: SessionTransport>(
+    message: &Message,
+    machine: &mut AudioSetupStateMachine,
+    audio_playback: &mut AudioPlaybackState,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    if message.message_type != MessageType::Specific {
+        return Err(CliError::Protocol(
+            "expected a system-audio-channel media message".into(),
+        ));
+    }
+    let actions = machine
+        .advance(AudioSetupEvent::InboundMedia(&message.payload))
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    for action in actions {
+        match action {
+            AudioSetupAction::SendMedia(response) => {
+                let payload = response
+                    .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+                let response_id = response.id;
+                send_encrypted(
+                    transport,
+                    tls,
+                    SYSTEM_AUDIO_CHANNEL_ID,
+                    MessageType::Specific,
+                    &payload,
+                    limits,
+                )?;
+                match response_id {
+                    MediaMessageId::Ack => {
+                        println!("probe_state=system_audio_channel_ack_sent");
                     }
-                    AudioSetupAction::Ready {
-                        session_id,
-                        configuration_index,
-                    } => {
-                        log_audio_channel_start_received(
-                            "system_audio",
-                            session_id,
-                            configuration_index,
-                        );
-                        start_audio_playback_pipeline(
-                            audio_playback,
-                            VOICE_AUDIO_PLAYBACK_FORMAT,
-                            "system_audio",
-                        );
+                    _ => {
+                        println!("probe_state=system_audio_channel_setup_config_sent");
                     }
-                    AudioSetupAction::MediaDataReceived { timestamp, payload } => {
-                        log_audio_media_data_received("system_audio", timestamp, payload.len());
-                        apply_to_running_audio_pipeline(
-                            audio_playback,
-                            "system_audio",
-                            |pipeline| pipeline.push_frame(&payload, timestamp),
-                        );
-                    }
-                    AudioSetupAction::CodecConfigReceived { payload } => {
-                        println!("probe_state=system_audio_media_codec_config_received");
-                        println!("system_audio_media_codec_config_bytes={}", payload.len());
-                    }
-                    AudioSetupAction::StopReceived => log_audio_stop_received("system_audio"),
                 }
             }
-            Ok(())
+            AudioSetupAction::Ready {
+                session_id,
+                configuration_index,
+            } => {
+                log_audio_channel_start_received("system_audio", session_id, configuration_index);
+                start_audio_playback_pipeline(
+                    audio_playback,
+                    VOICE_AUDIO_PLAYBACK_FORMAT,
+                    "system_audio",
+                );
+            }
+            AudioSetupAction::MediaDataReceived { timestamp, payload } => {
+                log_audio_media_data_received("system_audio", timestamp, payload.len());
+                apply_to_running_audio_pipeline(audio_playback, "system_audio", |pipeline| {
+                    pipeline.push_frame(&payload, timestamp)
+                });
+            }
+            AudioSetupAction::CodecConfigReceived { payload } => {
+                println!("probe_state=system_audio_media_codec_config_received");
+                println!("system_audio_media_codec_config_bytes={}", payload.len());
+            }
+            AudioSetupAction::StopReceived => log_audio_stop_received("system_audio"),
         }
     }
+    Ok(())
 }
 
 /// Drives the `SpeechAudio` channel's `ChannelOpenStateMachine` then
@@ -3013,74 +3476,92 @@ fn handle_speech_audio_channel_message<T: SessionTransport>(
             }
             println!("probe_state=speech_audio_channel_open");
             *state = SpeechAudioChannel::Open(AudioSetupStateMachine::new());
+            start_audio_playback_pipeline(
+                audio_playback,
+                VOICE_AUDIO_PLAYBACK_FORMAT,
+                "speech_audio",
+            );
             Ok(())
         }
-        SpeechAudioChannel::Open(machine) => {
-            if message.message_type != MessageType::Specific {
-                return Err(CliError::Protocol(
-                    "expected a speech-audio-channel media message".into(),
-                ));
-            }
-            let actions = machine
-                .advance(AudioSetupEvent::InboundMedia(&message.payload))
-                .map_err(|error| CliError::Protocol(error.to_string()))?;
-            for action in actions {
-                match action {
-                    AudioSetupAction::SendMedia(response) => {
-                        let payload = response
-                            .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
-                            .map_err(|error| CliError::Protocol(error.to_string()))?;
-                        let response_id = response.id;
-                        send_encrypted(
-                            transport,
-                            tls,
-                            SPEECH_AUDIO_CHANNEL_ID,
-                            MessageType::Specific,
-                            &payload,
-                            limits,
-                        )?;
-                        match response_id {
-                            MediaMessageId::Ack => {
-                                println!("probe_state=speech_audio_channel_ack_sent");
-                            }
-                            _ => {
-                                println!("probe_state=speech_audio_channel_setup_config_sent");
-                            }
-                        }
+        SpeechAudioChannel::Open(machine) => handle_speech_audio_channel_open_message(
+            message,
+            machine,
+            audio_playback,
+            tls,
+            transport,
+            limits,
+        ),
+    }
+}
+
+/// The `SpeechAudioChannel::Open` arm of `handle_speech_audio_channel_message`,
+/// split out purely to keep that function under `clippy::too_many_lines` —
+/// no behavior change from when this was inline.
+fn handle_speech_audio_channel_open_message<T: SessionTransport>(
+    message: &Message,
+    machine: &mut AudioSetupStateMachine,
+    audio_playback: &mut AudioPlaybackState,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    if message.message_type != MessageType::Specific {
+        return Err(CliError::Protocol(
+            "expected a speech-audio-channel media message".into(),
+        ));
+    }
+    let actions = machine
+        .advance(AudioSetupEvent::InboundMedia(&message.payload))
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    for action in actions {
+        match action {
+            AudioSetupAction::SendMedia(response) => {
+                let payload = response
+                    .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+                let response_id = response.id;
+                send_encrypted(
+                    transport,
+                    tls,
+                    SPEECH_AUDIO_CHANNEL_ID,
+                    MessageType::Specific,
+                    &payload,
+                    limits,
+                )?;
+                match response_id {
+                    MediaMessageId::Ack => {
+                        println!("probe_state=speech_audio_channel_ack_sent");
                     }
-                    AudioSetupAction::Ready {
-                        session_id,
-                        configuration_index,
-                    } => {
-                        log_audio_channel_start_received(
-                            "speech_audio",
-                            session_id,
-                            configuration_index,
-                        );
-                        start_audio_playback_pipeline(
-                            audio_playback,
-                            VOICE_AUDIO_PLAYBACK_FORMAT,
-                            "speech_audio",
-                        );
+                    _ => {
+                        println!("probe_state=speech_audio_channel_setup_config_sent");
                     }
-                    AudioSetupAction::MediaDataReceived { timestamp, payload } => {
-                        log_audio_media_data_received("speech_audio", timestamp, payload.len());
-                        apply_to_running_audio_pipeline(
-                            audio_playback,
-                            "speech_audio",
-                            |pipeline| pipeline.push_frame(&payload, timestamp),
-                        );
-                    }
-                    AudioSetupAction::CodecConfigReceived { payload } => {
-                        println!("probe_state=speech_audio_media_codec_config_received");
-                        println!("speech_audio_media_codec_config_bytes={}", payload.len());
-                    }
-                    AudioSetupAction::StopReceived => log_audio_stop_received("speech_audio"),
                 }
             }
-            Ok(())
+            AudioSetupAction::Ready {
+                session_id,
+                configuration_index,
+            } => {
+                log_audio_channel_start_received("speech_audio", session_id, configuration_index);
+                start_audio_playback_pipeline(
+                    audio_playback,
+                    VOICE_AUDIO_PLAYBACK_FORMAT,
+                    "speech_audio",
+                );
+            }
+            AudioSetupAction::MediaDataReceived { timestamp, payload } => {
+                log_audio_media_data_received("speech_audio", timestamp, payload.len());
+                apply_to_running_audio_pipeline(audio_playback, "speech_audio", |pipeline| {
+                    pipeline.push_frame(&payload, timestamp)
+                });
+            }
+            AudioSetupAction::CodecConfigReceived { payload } => {
+                println!("probe_state=speech_audio_media_codec_config_received");
+                println!("speech_audio_media_codec_config_bytes={}", payload.len());
+            }
+            AudioSetupAction::StopReceived => log_audio_stop_received("speech_audio"),
         }
     }
+    Ok(())
 }
 
 /// Drives the `Sensors` channel's `ChannelOpenStateMachine`, then handles
@@ -3192,11 +3673,182 @@ fn handle_sensors_channel_message<T: SessionTransport>(
     }
 }
 
+/// Drives the `Microphone` channel's `ChannelOpenStateMachine` then
+/// `MicrophoneSetupStateMachine`, sending each state machine's response
+/// actions as TLS-encrypted application data. The `AwaitingOpen` arm
+/// mirrors `handle_media_audio_channel_message` exactly; the `Open` arm
+/// differs since this channel's `Data`/`Start` flow the opposite
+/// direction (head unit to phone, not phone to head unit — see
+/// `protocol_aap::microphone_setup`).
+fn handle_microphone_channel_message<T: SessionTransport>(
+    message: &Message,
+    microphone_channel: &mut Option<MicrophoneChannel>,
+    microphone_capture: &mut MicrophoneCaptureState,
+    tls: &mut OpenSslTlsClient,
+    transport: &mut T,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let state = microphone_channel.as_mut().ok_or_else(|| {
+        CliError::Protocol(
+            "microphone channel message before ServiceDiscoveryResponse was sent".into(),
+        )
+    })?;
+    match state {
+        MicrophoneChannel::AwaitingOpen(machine) => {
+            if message.message_type != MessageType::Control {
+                return Err(CliError::Protocol(
+                    "expected ChannelOpenRequest on microphone channel".into(),
+                ));
+            }
+            let actions = machine
+                .advance(ChannelOpenEvent::InboundControl(&message.payload))
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            for action in actions {
+                let ChannelOpenAction::SendControl(response) = action;
+                let payload = response
+                    .encode(DEFAULT_MAX_CONTROL_BODY_SIZE)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+                send_encrypted(
+                    transport,
+                    tls,
+                    MICROPHONE_CHANNEL_ID,
+                    MessageType::Control,
+                    &payload,
+                    limits,
+                )?;
+            }
+            println!("probe_state=microphone_channel_open");
+            *state = MicrophoneChannel::Open(MicrophoneSetupStateMachine::new());
+            Ok(())
+        }
+        MicrophoneChannel::Open(machine) => {
+            if message.message_type != MessageType::Specific {
+                return Err(CliError::Protocol(
+                    "expected a microphone-channel media message".into(),
+                ));
+            }
+            let actions = machine
+                .advance(MicrophoneSetupEvent::InboundMedia(&message.payload))
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            for action in actions {
+                match action {
+                    MicrophoneSetupAction::SendMedia(response) => {
+                        let payload = response
+                            .encode(DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE)
+                            .map_err(|error| CliError::Protocol(error.to_string()))?;
+                        let response_id = response.id;
+                        send_encrypted(
+                            transport,
+                            tls,
+                            MICROPHONE_CHANNEL_ID,
+                            MessageType::Specific,
+                            &payload,
+                            limits,
+                        )?;
+                        match response_id {
+                            MediaMessageId::Config => {
+                                println!("probe_state=microphone_channel_setup_config_sent");
+                            }
+                            MediaMessageId::MicrophoneResponse => {
+                                println!("probe_state=microphone_channel_response_sent");
+                            }
+                            MediaMessageId::Start => {
+                                println!("probe_state=microphone_channel_start_sent");
+                            }
+                            _ => {}
+                        }
+                    }
+                    MicrophoneSetupAction::Streaming { session_id } => {
+                        println!("probe_state=microphone_channel_streaming_started");
+                        println!("microphone_channel_session_id={session_id}");
+                        start_microphone_capture_pipeline(microphone_capture);
+                    }
+                    MicrophoneSetupAction::StreamingStopped => {
+                        println!("probe_state=microphone_channel_streaming_stopped");
+                        stop_microphone_capture_pipeline(microphone_capture);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Lazily builds and starts a fresh microphone capture pipeline on the
+/// channel's `Streaming` entry. Mirrors `start_audio_playback_pipeline`'s
+/// discipline (construction/start failure demotes to `Failed` and is
+/// logged, never aborts the probe) — but a no-op if already `Running`,
+/// since a repeated `Streaming` (reconfiguration while already streaming,
+/// see `MicrophoneSetupAction::Streaming`'s doc comment) doesn't need a
+/// pipeline rebuild, only a genuine close-then-reopen
+/// (`stop_microphone_capture_pipeline`) does.
+fn start_microphone_capture_pipeline(capture: &mut MicrophoneCaptureState) {
+    if !matches!(capture, MicrophoneCaptureState::NotStarted(_)) {
+        return;
+    }
+    let MicrophoneCaptureState::NotStarted(backend) =
+        std::mem::replace(capture, MicrophoneCaptureState::Failed)
+    else {
+        unreachable!("just matched NotStarted above");
+    };
+    match backend
+        .build_microphone_capture_pipeline(VOICE_AUDIO_PLAYBACK_FORMAT, AudioCaptureSource::Pulse)
+    {
+        Ok(pipeline) => match pipeline.start() {
+            Ok(()) => {
+                println!("probe_state=microphone_capture_pipeline_started");
+                *capture = MicrophoneCaptureState::Running(pipeline);
+            }
+            Err(error) => {
+                println!("probe_state=microphone_capture_pipeline_start_failed");
+                println!("microphone_capture_error={error}");
+                *capture = MicrophoneCaptureState::Failed;
+            }
+        },
+        Err(error) => {
+            println!("probe_state=microphone_capture_pipeline_build_failed");
+            println!("microphone_capture_error={error}");
+            *capture = MicrophoneCaptureState::Failed;
+        }
+    }
+}
+
+/// Tears the pipeline fully down (if running) and resets to a fresh,
+/// buildable `NotStarted` backend so the next `Streaming` entry starts
+/// clean — see `MicrophoneCaptureState`'s doc comment for why this
+/// channel, unlike the audio-output ones, rebuilds instead of just
+/// pausing. `GstreamerBackend::new()` is a zero-field unit struct and
+/// `gst::init()` is idempotent, so this is cheap.
+fn stop_microphone_capture_pipeline(capture: &mut MicrophoneCaptureState) {
+    let previous = std::mem::replace(capture, MicrophoneCaptureState::Failed);
+    if let MicrophoneCaptureState::Running(pipeline) = previous {
+        match pipeline.shutdown() {
+            Ok(()) => println!("probe_state=microphone_capture_pipeline_stopped"),
+            Err(error) => {
+                println!("probe_state=microphone_capture_pipeline_shutdown_failed");
+                println!("microphone_capture_error={error}");
+            }
+        }
+    }
+    *capture = new_microphone_capture_state();
+}
+
+fn new_microphone_capture_state() -> MicrophoneCaptureState {
+    match GstreamerBackend::new() {
+        Ok(backend) => MicrophoneCaptureState::NotStarted(backend),
+        Err(error) => {
+            println!("probe_state=microphone_capture_backend_unavailable");
+            println!("microphone_capture_error={error}");
+            MicrophoneCaptureState::Unavailable
+        }
+    }
+}
+
 /// Drives one "advertise → open → nothing further" channel's
-/// `ChannelOpenStateMachine` — now covers only `Input` (before it opens),
-/// `Bluetooth`, and `Microphone`; every other advertised channel
-/// (`Video`/`MediaAudio`/`SystemAudio`/`SpeechAudio`/`Sensors`) has
-/// graduated to its own dedicated state machine above as this project
+/// `ChannelOpenStateMachine` — now covers only `Input` (before it opens)
+/// and `Bluetooth`; every other advertised channel
+/// (`Video`/`MediaAudio`/`SystemAudio`/`SpeechAudio`/`Sensors`/`Microphone`)
+/// has graduated to its own dedicated state machine above as this project
 /// learned what each one needs beyond `ChannelOpenState::Open`.
 fn handle_simple_channel_message<T: SessionTransport>(
     channel_id: u8,
@@ -3570,4 +4222,74 @@ fn send_control<T: SessionTransport>(
     )
     .map_err(|error| CliError::Protocol(error.to_string()))?;
     transport.send_all(&frame).map_err(CliError::Transport)
+}
+
+#[cfg(test)]
+mod screen_power_tests {
+    use super::{ScreenPowerState, TouchPhase, advance_screen_power};
+
+    #[test]
+    fn on_stays_on_regardless_of_phase() {
+        assert_eq!(
+            advance_screen_power(ScreenPowerState::On, TouchPhase::Down),
+            ScreenPowerState::On
+        );
+        assert_eq!(
+            advance_screen_power(ScreenPowerState::On, TouchPhase::Up),
+            ScreenPowerState::On
+        );
+    }
+
+    /// The regression case a design-validation pass caught before any code
+    /// was written: a non-`Up` phase while `TurningOff` (the triggering
+    /// gesture's own straggling fingers still lifting) must stay
+    /// `TurningOff`, not fall straight into a wake — see
+    /// `ScreenPowerState`'s doc comment.
+    #[test]
+    fn turning_off_stays_turning_off_until_a_real_release() {
+        assert_eq!(
+            advance_screen_power(ScreenPowerState::TurningOff, TouchPhase::PointerUp),
+            ScreenPowerState::TurningOff
+        );
+        assert_eq!(
+            advance_screen_power(ScreenPowerState::TurningOff, TouchPhase::Moved),
+            ScreenPowerState::TurningOff
+        );
+    }
+
+    #[test]
+    fn turning_off_becomes_off_on_a_real_release() {
+        assert_eq!(
+            advance_screen_power(ScreenPowerState::TurningOff, TouchPhase::Up),
+            ScreenPowerState::Off
+        );
+    }
+
+    #[test]
+    fn off_always_begins_waking_regardless_of_phase() {
+        assert_eq!(
+            advance_screen_power(ScreenPowerState::Off, TouchPhase::Down),
+            ScreenPowerState::WakingUntilRelease
+        );
+    }
+
+    #[test]
+    fn waking_until_release_stays_waking_until_a_real_release() {
+        assert_eq!(
+            advance_screen_power(ScreenPowerState::WakingUntilRelease, TouchPhase::Moved),
+            ScreenPowerState::WakingUntilRelease
+        );
+        assert_eq!(
+            advance_screen_power(ScreenPowerState::WakingUntilRelease, TouchPhase::PointerUp),
+            ScreenPowerState::WakingUntilRelease
+        );
+    }
+
+    #[test]
+    fn waking_until_release_becomes_on_on_a_real_release() {
+        assert_eq!(
+            advance_screen_power(ScreenPowerState::WakingUntilRelease, TouchPhase::Up),
+            ScreenPowerState::On
+        );
+    }
 }

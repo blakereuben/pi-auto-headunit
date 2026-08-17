@@ -23,6 +23,7 @@ mod channel_open;
 mod control;
 mod input_message;
 mod media_message;
+mod microphone_setup;
 mod nav_focus;
 mod ping;
 mod protobuf;
@@ -71,6 +72,10 @@ pub use input_message::{
 };
 pub use media_message::{
     DEFAULT_MAX_MEDIA_MESSAGE_BODY_SIZE, MediaMessage, MediaMessageError, MediaMessageId,
+};
+pub use microphone_setup::{
+    MicrophoneSendOutcome, MicrophoneSetupAction, MicrophoneSetupError, MicrophoneSetupEvent,
+    MicrophoneSetupState, MicrophoneSetupStateMachine,
 };
 pub use nav_focus::{
     NavFocusError, NavFocusType, decode_nav_focus_request, encode_nav_focus_notification,

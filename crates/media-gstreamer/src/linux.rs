@@ -109,4 +109,12 @@ impl GstreamerBackend {
     ) -> Result<crate::AudioCapturePipeline, GstreamerError> {
         crate::AudioCapturePipeline::new(format, source, interval)
     }
+
+    pub fn build_microphone_capture_pipeline(
+        &self,
+        format: crate::AudioFormat,
+        source: crate::AudioCaptureSource,
+    ) -> Result<crate::MicrophoneCapturePipeline, GstreamerError> {
+        crate::MicrophoneCapturePipeline::new(format, source)
+    }
 }

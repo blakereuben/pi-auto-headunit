@@ -61,6 +61,15 @@ pub const MAX_ARM_WINDOW_SECONDS: u32 = 30;
 /// radio screen rather than any app (empty without a real tuner backend,
 /// which this project deliberately doesn't implement — see
 /// `protocol_aap::RadioCapability`'s doc comment).
+///
+/// `ScreenOff` (added 2026-08-17) is a **third** dispatch category,
+/// distinct from both the phone-facing `SwitchTo*` actions above and the
+/// GTK-thread-local `OpenSettings`/`ToggleFullscreen`/`CycleRotation`
+/// actions below: it needs neither `transport` (no phone message) nor GTK
+/// window state, but it must still run on the background protocol thread
+/// specifically, because that thread's `service_touch_input` is the only
+/// place that can swallow the touch used to wake the screen back up — see
+/// `auth_discovery_probe.rs`'s `ScreenPowerState`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     OpenSettings,
@@ -70,11 +79,12 @@ pub enum Action {
     SwitchToNavigation,
     SwitchToRadio,
     SwitchToPhone,
+    ScreenOff,
 }
 
 impl Action {
     #[must_use]
-    pub const fn all() -> [Action; 7] {
+    pub const fn all() -> [Action; 8] {
         [
             Action::OpenSettings,
             Action::ToggleFullscreen,
@@ -83,6 +93,7 @@ impl Action {
             Action::SwitchToNavigation,
             Action::SwitchToRadio,
             Action::SwitchToPhone,
+            Action::ScreenOff,
         ]
     }
 
@@ -96,6 +107,7 @@ impl Action {
             Action::SwitchToNavigation => "Switch to navigation",
             Action::SwitchToRadio => "Switch to radio",
             Action::SwitchToPhone => "Switch to phone",
+            Action::ScreenOff => "Screen off",
         }
     }
 
@@ -108,7 +120,10 @@ impl Action {
             Action::SwitchToNavigation => Some(protocol_aap::KeyCode::Navigation),
             Action::SwitchToRadio => Some(protocol_aap::KeyCode::Radio),
             Action::SwitchToPhone => Some(protocol_aap::KeyCode::Tel),
-            Action::OpenSettings | Action::ToggleFullscreen | Action::CycleRotation => None,
+            Action::OpenSettings
+            | Action::ToggleFullscreen
+            | Action::CycleRotation
+            | Action::ScreenOff => None,
         }
     }
 
@@ -121,6 +136,7 @@ impl Action {
             Action::SwitchToNavigation => "switch_to_navigation",
             Action::SwitchToRadio => "switch_to_radio",
             Action::SwitchToPhone => "switch_to_phone",
+            Action::ScreenOff => "screen_off",
         }
     }
 
@@ -133,6 +149,7 @@ impl Action {
             "switch_to_navigation" => Some(Action::SwitchToNavigation),
             "switch_to_radio" => Some(Action::SwitchToRadio),
             "switch_to_phone" => Some(Action::SwitchToPhone),
+            "screen_off" => Some(Action::ScreenOff),
             _ => None,
         }
     }
@@ -148,6 +165,7 @@ pub fn gesture_label(gesture: GestureId) -> &'static str {
         GestureId::SwipeDown => "Swipe down",
         GestureId::SwipeLeft => "Swipe left",
         GestureId::SwipeRight => "Swipe right",
+        GestureId::Circle => "Circle / spiral",
     }
 }
 
@@ -168,6 +186,8 @@ struct RawSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     swipe_right: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    circle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     arm_window_seconds: Option<u32>,
 }
 
@@ -181,6 +201,7 @@ impl RawSettings {
             GestureId::SwipeDown => self.swipe_down.as_deref(),
             GestureId::SwipeLeft => self.swipe_left.as_deref(),
             GestureId::SwipeRight => self.swipe_right.as_deref(),
+            GestureId::Circle => self.circle.as_deref(),
         }
     }
 
@@ -194,6 +215,7 @@ impl RawSettings {
             GestureId::SwipeDown => self.swipe_down = value,
             GestureId::SwipeLeft => self.swipe_left = value,
             GestureId::SwipeRight => self.swipe_right = value,
+            GestureId::Circle => self.circle = value,
         }
     }
 }
@@ -220,6 +242,11 @@ impl GestureSettings {
     /// empty without a real tuner backend this project deliberately
     /// doesn't implement — not a good default for a fresh install.
     /// `SwitchToRadio` is still a fully selectable, working action.
+    /// `Circle` defaults to `ScreenOff` — the gesture this action was
+    /// added for (2026-08-17), originally a triple-finger double-tap
+    /// replaced 2026-08-18 after real-hardware testing found three-finger
+    /// coordination unreliable (see `platform_api::gesture`'s doc
+    /// comment).
     #[must_use]
     pub fn defaults() -> Self {
         let mut mappings = HashMap::new();
@@ -230,6 +257,7 @@ impl GestureSettings {
         mappings.insert(GestureId::SwipeDown, Action::SwitchToMedia);
         mappings.insert(GestureId::SwipeLeft, Action::SwitchToPhone);
         mappings.insert(GestureId::SwipeRight, Action::ToggleFullscreen);
+        mappings.insert(GestureId::Circle, Action::ScreenOff);
         Self {
             mappings,
             arm_window_seconds: DEFAULT_ARM_WINDOW_SECONDS,
@@ -343,6 +371,7 @@ mod tests {
             settings.action_for(GestureId::SwipeRight),
             Action::ToggleFullscreen
         );
+        assert_eq!(settings.action_for(GestureId::Circle), Action::ScreenOff);
     }
 
     #[test]
@@ -366,6 +395,25 @@ mod tests {
         assert_eq!(Action::OpenSettings.key_code(), None);
         assert_eq!(Action::ToggleFullscreen.key_code(), None);
         assert_eq!(Action::CycleRotation.key_code(), None);
+        assert_eq!(Action::ScreenOff.key_code(), None);
+    }
+
+    #[test]
+    fn a_circle_gesture_reassignment_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-gesture-settings-circle-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = GestureSettings::defaults();
+        settings.set_action(GestureId::Circle, Action::OpenSettings);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = GestureSettings::load(&path);
+        assert_eq!(loaded.action_for(GestureId::Circle), Action::OpenSettings);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

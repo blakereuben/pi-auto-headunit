@@ -7,6 +7,8 @@ mod capture;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod microphone_capture;
+#[cfg(target_os = "linux")]
 mod render;
 
 #[cfg(target_os = "linux")]
@@ -15,6 +17,8 @@ pub use audio::{AudioFormat, AudioPlaybackPipeline, AudioSink};
 pub use capture::{AudioCapturePipeline, AudioCaptureSource, CaptureLevel};
 #[cfg(target_os = "linux")]
 pub use linux::{GstreamerBackend, GstreamerError};
+#[cfg(target_os = "linux")]
+pub use microphone_capture::{CapturedPcmFrame, MicrophoneCapturePipeline};
 #[cfg(target_os = "linux")]
 pub use render::{RenderSink, VideoRenderPipeline};
 
