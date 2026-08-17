@@ -18,6 +18,7 @@ pub enum ServiceKind {
     Video,
     Bluetooth,
     Input,
+    Radio,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

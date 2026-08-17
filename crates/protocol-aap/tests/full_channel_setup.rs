@@ -238,6 +238,7 @@ fn drives_service_discovery_response_and_both_channels_to_start() {
         bluetooth: None,
         microphone: None,
         sensors: None,
+        radio: None,
         head_unit_info: None,
         ping_configuration: None,
     };

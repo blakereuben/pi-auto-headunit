@@ -52,8 +52,8 @@ use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, DropDown, Label, Orientation, Overlay,
-    Picture, SpinButton, glib,
+    Application, ApplicationWindow, Box as GtkBox, Button, Grid, Label, Orientation, Overlay,
+    Picture, PolicyType, ScrolledWindow, SpinButton, glib,
 };
 use media_api::DecoderCapability;
 use media_gstreamer::{GstreamerBackend, GstreamerError, RenderSink, VideoRenderPipeline};
@@ -453,15 +453,56 @@ fn wire_session_polls(state: SessionPollState) {
     });
 }
 
+/// One gesture's action-assignment control: a plain `Button` labeled with
+/// the gesture's currently assigned action. Tapping it opens
+/// [`ActionPicker`] — see that type's doc comment for why this ended up
+/// as the reliable design after two more elaborate attempts each broke a
+/// different way on real touch hardware.
+#[derive(Clone)]
+struct GestureSelector {
+    change_button: Button,
+}
+
+/// Every gesture's action-assignment control, for every gesture.
+type GestureSelectors = Vec<(GestureId, GestureSelector)>;
+
+/// A full-panel action picker: tapping a gesture's [`GestureSelector`]
+/// hides [`SettingsPanel::main_page`] and shows this instead, with seven
+/// big, ordinary `Button`s — one per `Action` — plus a "Back" button.
+/// Tapping an action applies it to whichever gesture is currently being
+/// edited ([`Self::editing_gesture`], set the moment the picker opens)
+/// and returns to the main page; "Back" returns without changing
+/// anything. Both pages share the settings panel's single outer
+/// `ScrolledWindow` — real-hardware feedback, 2026-08-16: two earlier
+/// designs (a popup `DropDown`, then a `MenuButton`+`Popover` holding a
+/// `ListBox` in its own nested `ScrolledWindow` with a hand-rolled
+/// touch-drag-to-scroll gesture) each broke in a different, real way on
+/// this project's touchscreen — the `DropDown` clipped options off
+/// screen, and the popover version's nested scroll-vs-row-click gesture
+/// arbitration misfired, silently reassigning several gestures to the
+/// wrong action while the operator was trying to scroll. Plain, ordinary
+/// buttons in one already-reliable scrollable page have no such gesture
+/// to arbitrate — every tap unambiguously means "select this."
+#[derive(Clone)]
+struct ActionPicker {
+    root: GtkBox,
+    title: Label,
+    action_buttons: Rc<Vec<(Action, Button)>>,
+    back_button: Button,
+    editing_gesture: Rc<Cell<Option<GestureId>>>,
+}
+
 /// The settings panel's widgets, kept together so `run()`'s closures can
 /// show/hide it and read its controls without threading five separate
 /// widget handles around. `Clone` is cheap (GTK widgets are themselves
 /// reference-counted handles).
 #[derive(Clone)]
 struct SettingsPanel {
-    root: GtkBox,
+    root: ScrolledWindow,
+    main_page: GtkBox,
     rotation_label: Label,
-    gesture_dropdowns: Rc<Vec<(GestureId, DropDown)>>,
+    gesture_selectors: Rc<GestureSelectors>,
+    picker: ActionPicker,
     close_button: Button,
     toggle_fullscreen_button: Button,
     cycle_rotation_button: Button,
@@ -495,49 +536,129 @@ fn build_armed_mask() -> ArmedMask {
     ArmedMask { root }
 }
 
-/// The dropdown's selected index is just this array's index — kept as one
-/// shared source of truth (`Action::all()`) instead of a separately
-/// maintained label list plus a hand-written index<->`Action` mapping.
-fn action_dropdown_index(action: Action) -> u32 {
-    u32::try_from(
-        Action::all()
-            .iter()
-            .position(|candidate| *candidate == action)
-            .unwrap_or(0),
-    )
-    .unwrap_or(0)
+/// How far a press has to move before it's treated as a scroll drag
+/// rather than a tap — small enough that a genuine tap never triggers it,
+/// large enough that an ordinary drag reliably does.
+const SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS: f64 = 10.0;
+
+/// Manually drives `scroller`'s vertical scroll position from an ordinary
+/// press-drag-release sequence, instead of relying on `ScrolledWindow`'s
+/// own built-in kinetic touch scrolling. Real-hardware feedback,
+/// 2026-08-16: on this project's touchscreen/compositor combination,
+/// dragging content with a finger did not scroll it at all — only
+/// grabbing and dragging the scrollbar's own thumb did, which the
+/// operator explicitly rejected as unusable ("it MUST be a touch scroll
+/// inside"). That symptom pattern (ordinary clicks fine, kinetic
+/// drag-to-scroll never recognized) matches a known class of
+/// embedded-compositor issue where touch arrives to GTK as emulated
+/// pointer clicks rather than genuine touch-sequence events, which
+/// `GtkScrolledWindow`'s kinetic scrolling specifically requires. A plain
+/// [`gtk4::GestureDrag`] tracks any press-drag-release sequence regardless
+/// of whether it originated as real touch or emulated pointer input, so
+/// driving the adjustment from it directly works either way.
+///
+/// An earlier attempt at exactly this technique, applied to a small
+/// popover holding a `ListBox`, misfired and silently mis-selected rows
+/// while the operator tried to scroll (see [`ActionPicker`]'s doc
+/// comment) — that popover/`ListBox` design is gone now, replaced by
+/// this plain full-page-of-`Button`s layout, so the only competing
+/// gesture here is an ordinary `Button` click, not a list row's
+/// activate-and-close-popover behavior. Only claims the gesture (blocking
+/// the drag from also completing as a click) once movement exceeds
+/// [`SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS`] — below that, an ordinary tap
+/// still reaches its target normally.
+fn enable_touch_drag_scroll(scroller: &ScrolledWindow) {
+    let drag = gtk4::GestureDrag::new();
+    drag.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let vadjustment = scroller.vadjustment();
+    let start_value = Rc::new(Cell::new(0.0_f64));
+
+    let vadjustment_for_begin = vadjustment.clone();
+    let start_value_for_begin = Rc::clone(&start_value);
+    drag.connect_drag_begin(move |_, _, _| {
+        start_value_for_begin.set(vadjustment_for_begin.value());
+    });
+
+    let start_value_for_update = Rc::clone(&start_value);
+    drag.connect_drag_update(move |gesture, offset_x, offset_y| {
+        if offset_x.abs() > SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS
+            || offset_y.abs() > SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS
+        {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+        }
+        vadjustment.set_value(start_value_for_update.get() - offset_y);
+    });
+
+    scroller.add_controller(drag);
 }
 
-fn action_from_dropdown_index(index: u32) -> Action {
-    usize::try_from(index)
-        .ok()
-        .and_then(|index| Action::all().get(index).copied())
-        .unwrap_or(Action::OpenSettings)
+/// Builds the full-panel action picker — see [`ActionPicker`]'s doc
+/// comment for the design and the two real-hardware failures it
+/// replaced. Built once; which gesture it's editing is set fresh each
+/// time it's opened (`editing_gesture`).
+fn build_action_picker() -> ActionPicker {
+    let root = GtkBox::new(Orientation::Vertical, 8);
+    root.set_visible(false);
+
+    let back_button = Button::with_label("Back");
+    root.append(&back_button);
+
+    let title = Label::new(None);
+    root.append(&title);
+
+    // A two-column grid rather than one tall column — real-hardware
+    // feedback, 2026-08-16: once the panel filled the whole window, a
+    // single column of seven big buttons still didn't fit without
+    // scrolling, and the operator pointed out a full-screen page has
+    // enough width to lay them out instead of needing to scroll at all.
+    // A `FlowBox` (auto-wrapping based on its own per-child natural-width
+    // heuristics) was tried first and, on this same touchscreen/compositor
+    // combination, didn't actually wrap into two columns — real-hardware
+    // feedback, 2026-08-16: still rendered as one column. `Grid`'s
+    // explicit row/column placement (`row = index / 2, column = index %
+    // 2`, computed directly from `Action::all()`'s fixed order) has no
+    // such heuristic to misbehave.
+    let action_grid = Grid::new();
+    action_grid.set_row_spacing(8);
+    action_grid.set_column_spacing(8);
+    action_grid.set_column_homogeneous(true);
+    action_grid.set_hexpand(true);
+    root.append(&action_grid);
+
+    let mut action_buttons = Vec::new();
+    for (index, action) in Action::all().into_iter().enumerate() {
+        let button = Button::with_label(action.label());
+        button.set_hexpand(true);
+        let index = i32::try_from(index).unwrap_or(0);
+        action_grid.attach(&button, index % 2, index / 2, 1, 1);
+        action_buttons.push((action, button));
+    }
+
+    ActionPicker {
+        root,
+        title,
+        action_buttons: Rc::new(action_buttons),
+        back_button,
+        editing_gesture: Rc::new(Cell::new(None)),
+    }
 }
 
 /// Builds the settings panel once, hidden — shown only when the settings
 /// gesture's mapped action is [`Action::OpenSettings`]. A plain
-/// semi-opaque `GtkBox` centered over the video via `Overlay`, not a
-/// separate window: this is a dev diagnostic, not final product chrome.
+/// semi-opaque panel filling the whole window over the video via
+/// `Overlay`, not a separate window: this is a dev diagnostic, not final
+/// product chrome.
 fn build_settings_panel(initial_arm_window_seconds: u32) -> SettingsPanel {
-    let root = GtkBox::new(Orientation::Vertical, 8);
-    root.set_halign(gtk4::Align::Center);
-    root.set_valign(gtk4::Align::Center);
-    root.set_visible(false);
-    root.add_css_class("background");
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
+    let main_page = GtkBox::new(Orientation::Vertical, 8);
 
     let title = Label::new(Some("Head unit settings"));
-    root.append(&title);
+    main_page.append(&title);
 
     let rotation_label = Label::new(Some("Touch rotation: 0°"));
-    root.append(&rotation_label);
+    main_page.append(&rotation_label);
 
     let cycle_rotation_button = Button::with_label("Cycle rotation");
-    root.append(&cycle_rotation_button);
+    main_page.append(&cycle_rotation_button);
 
     let timeout_row = GtkBox::new(Orientation::Horizontal, 8);
     let timeout_label = Label::new(Some("Gesture timeout (seconds)"));
@@ -549,33 +670,77 @@ fn build_settings_panel(initial_arm_window_seconds: u32) -> SettingsPanel {
     arm_timeout_spin.set_value(f64::from(initial_arm_window_seconds));
     timeout_row.append(&timeout_label);
     timeout_row.append(&arm_timeout_spin);
-    root.append(&timeout_row);
+    main_page.append(&timeout_row);
 
     let mappings_title = Label::new(Some("Gesture assignments"));
-    root.append(&mappings_title);
+    main_page.append(&mappings_title);
 
-    let action_labels: Vec<&str> = Action::all().iter().map(|action| action.label()).collect();
-    let mut gesture_dropdowns = Vec::new();
-    for gesture in GestureId::all() {
+    // Two columns of gesture rows rather than one tall column — at the
+    // operator's explicit request, 2026-08-16, so the main list fits the
+    // full-screen panel without needing to scroll at all.
+    let gesture_grid = Grid::new();
+    gesture_grid.set_row_spacing(8);
+    gesture_grid.set_column_spacing(16);
+    gesture_grid.set_column_homogeneous(true);
+    gesture_grid.set_hexpand(true);
+    main_page.append(&gesture_grid);
+
+    let mut gesture_selectors = Vec::new();
+    for (index, gesture) in GestureId::all().into_iter().enumerate() {
         let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.set_hexpand(true);
         let label = Label::new(Some(crate::gesture_settings::gesture_label(gesture)));
-        let dropdown = DropDown::from_strings(&action_labels);
+        let change_button = Button::new();
+        change_button.set_hexpand(true);
         row.append(&label);
-        row.append(&dropdown);
-        root.append(&row);
-        gesture_dropdowns.push((gesture, dropdown));
+        row.append(&change_button);
+        let index = i32::try_from(index).unwrap_or(0);
+        gesture_grid.attach(&row, index % 2, index / 2, 1, 1);
+        gesture_selectors.push((gesture, GestureSelector { change_button }));
     }
 
     let close_button = Button::with_label("Close");
-    root.append(&close_button);
+    main_page.append(&close_button);
 
     let toggle_fullscreen_button = Button::with_label("Return to desktop");
-    root.append(&toggle_fullscreen_button);
+    main_page.append(&toggle_fullscreen_button);
+
+    let picker = build_action_picker();
+
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.append(&main_page);
+    content.append(&picker.root);
+
+    let root = ScrolledWindow::builder()
+        .child(&content)
+        .hscrollbar_policy(PolicyType::Never)
+        .build();
+    // Fills the whole window rather than floating as a small centered
+    // box — real-hardware feedback, 2026-08-16: a fixed-size centered
+    // panel left too little room for seven gesture rows on the 800x480
+    // panel, and even filling the whole window, the picker page (back
+    // button + title + seven action buttons) still doesn't fit without
+    // scrolling. `enable_touch_drag_scroll` below is what actually makes
+    // that scrolling usable — the plain scrollbar thumb was explicitly
+    // rejected as an unusable fallback.
+    enable_touch_drag_scroll(&root);
+    root.set_halign(gtk4::Align::Fill);
+    root.set_valign(gtk4::Align::Fill);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root.set_visible(false);
+    root.add_css_class("background");
+    root.set_margin_top(24);
+    root.set_margin_bottom(24);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
 
     SettingsPanel {
         root,
+        main_page,
         rotation_label,
-        gesture_dropdowns: Rc::new(gesture_dropdowns),
+        gesture_selectors: Rc::new(gesture_selectors),
+        picker,
         close_button,
         toggle_fullscreen_button,
         cycle_rotation_button,
@@ -624,6 +789,15 @@ fn toggle_fullscreen_button_label(is_fullscreen: bool) -> &'static str {
     }
 }
 
+/// Hides the whole settings panel and resets it back to
+/// [`SettingsPanel::main_page`] — so reopening it later never resumes
+/// showing a stale [`ActionPicker`] left open from a previous visit.
+fn close_settings_panel(settings_panel: &SettingsPanel) {
+    settings_panel.root.set_visible(false);
+    settings_panel.picker.root.set_visible(false);
+    settings_panel.main_page.set_visible(true);
+}
+
 /// Flips between fullscreen video and the plain desktop, always closing
 /// the settings panel too. Bidirectional deliberately — see [`Action`]'s
 /// doc comment for the real-hardware trial that found the one-directional
@@ -643,7 +817,7 @@ fn toggle_fullscreen(
     settings_panel
         .toggle_fullscreen_button
         .set_label(toggle_fullscreen_button_label(now_fullscreen));
-    settings_panel.root.set_visible(false);
+    close_settings_panel(settings_panel);
 }
 
 /// Connects every control's click/selection handler once, right after the
@@ -660,17 +834,51 @@ fn wire_settings_panel(
     is_fullscreen: &Rc<Cell<bool>>,
     gesture_settings: &Rc<RefCell<GestureSettings>>,
 ) {
-    for (gesture, dropdown) in settings_panel.gesture_dropdowns.iter() {
+    for (gesture, selector) in settings_panel.gesture_selectors.iter() {
         let initial = gesture_settings.borrow().action_for(*gesture);
-        dropdown.set_selected(action_dropdown_index(initial));
+        selector.change_button.set_label(initial.label());
         let gesture = *gesture;
+        let main_page = settings_panel.main_page.clone();
+        let picker = settings_panel.picker.clone();
+        selector.change_button.connect_clicked(move |_| {
+            picker.editing_gesture.set(Some(gesture));
+            picker.title.set_text(&format!(
+                "{}: choose an action",
+                crate::gesture_settings::gesture_label(gesture)
+            ));
+            main_page.set_visible(false);
+            picker.root.set_visible(true);
+        });
+    }
+
+    let main_page_for_back = settings_panel.main_page.clone();
+    let picker_for_back = settings_panel.picker.clone();
+    settings_panel.picker.back_button.connect_clicked(move |_| {
+        picker_for_back.root.set_visible(false);
+        main_page_for_back.set_visible(true);
+    });
+
+    for (action, action_button) in settings_panel.picker.action_buttons.iter() {
+        let action = *action;
+        let picker = settings_panel.picker.clone();
+        let main_page = settings_panel.main_page.clone();
         let gesture_settings = Rc::clone(gesture_settings);
-        dropdown.connect_selected_notify(move |dropdown| {
-            let action = action_from_dropdown_index(dropdown.selected());
+        let gesture_selectors = Rc::clone(&settings_panel.gesture_selectors);
+        action_button.connect_clicked(move |_| {
+            let Some(gesture) = picker.editing_gesture.get() else {
+                return;
+            };
             gesture_settings.borrow_mut().set_action(gesture, action);
             let _ = gesture_settings
                 .borrow()
                 .save(Path::new(DEFAULT_SETTINGS_PATH));
+            for (candidate_gesture, selector) in gesture_selectors.iter() {
+                if *candidate_gesture == gesture {
+                    selector.change_button.set_label(action.label());
+                }
+            }
+            picker.root.set_visible(false);
+            main_page.set_visible(true);
         });
     }
 
@@ -709,7 +917,7 @@ fn wire_settings_panel(
 
     let settings_panel_for_close = settings_panel.clone();
     settings_panel.close_button.connect_clicked(move |_| {
-        settings_panel_for_close.root.set_visible(false);
+        close_settings_panel(&settings_panel_for_close);
     });
 
     let window_for_toggle = window.clone();

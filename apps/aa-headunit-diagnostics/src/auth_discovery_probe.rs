@@ -474,10 +474,10 @@ use protocol_aap::{
     FrameError, FrameHeader, FrameType, HandshakeAction, HandshakeEvent, HandshakeState,
     HandshakeStateMachine, HeadUnitInfo, InputMessage, InputMessageId, KeyBindingStatus, KeyCode,
     MediaMessageId, Message, MessageAssembler, MessageType, MicrophoneCapability, NavFocusType,
-    PingConfiguration, PointerAction, ProtocolLimits, SensorCapability, SensorMessage,
-    SensorMessageId, SensorType, ServiceAvailability, ServiceCandidate, ServiceCapabilities,
-    ServiceCatalogue, ServiceDiscoveryRequestSummary, ServiceKind, TlsClient, TlsProgress,
-    TouchCapability, TouchPointer, TouchScreenType, UiConfig, VideoCapability,
+    PingConfiguration, PointerAction, ProtocolLimits, RadioCapability, RadioType, SensorCapability,
+    SensorMessage, SensorMessageId, SensorType, ServiceAvailability, ServiceCandidate,
+    ServiceCapabilities, ServiceCatalogue, ServiceDiscoveryRequestSummary, ServiceKind, TlsClient,
+    TlsProgress, TouchCapability, TouchPointer, TouchScreenType, UiConfig, VideoCapability,
     VideoCodecResolution, VideoCodecType, VideoFocusMode, VideoFrameRate, VideoSetupAction,
     VideoSetupEvent, VideoSetupState, VideoSetupStateMachine, decode_audio_focus_request,
     decode_bluetooth_pairing_request, decode_byebye_request, decode_frame,
@@ -706,6 +706,21 @@ const SPEECH_AUDIO_CHANNEL_ID: u8 = 5;
 const SENSORS_CHANNEL_ID: u8 = 6;
 const BLUETOOTH_CHANNEL_ID: u8 = 7;
 const MICROPHONE_CHANNEL_ID: u8 = 8;
+/// Advertises `RadioService` (`docs/protocol/aasdk-adoption.md`) as a
+/// capability only — no runtime tuning/scanning/preset messages are
+/// implemented (deliberately out of scope, no real tuner hardware
+/// exists). Real-hardware-confirmed, 2026-08-16: before this existed, the
+/// phone rejected `KeyCode::Radio` with "AA was not available"; once
+/// advertised, swipe-right instead navigates to Android Auto's own
+/// native radio screen (empty, since no tuning backend exists behind it,
+/// but the routing itself is correct — radio is a first-class native AA
+/// UI category, not a third-party-app switch like media/navigation/
+/// phone). If the phone ever does send more than the open handshake on
+/// this channel, `simple_channels` drives the same generic,
+/// already-proven open-then-reject-further-messages path every other
+/// unimplemented-beyond-open channel does (`handle_simple_channel_message`),
+/// never a hang or panic.
+const RADIO_CHANNEL_ID: u8 = 9;
 /// The coordinate space touch reports must be sent in: the negotiated
 /// video resolution (`VideoCodecResolution::Video1280x720`,
 /// `build_service_capabilities` below), **not** the DSI touchscreen's own
@@ -1381,6 +1396,7 @@ fn arm_channels_after_service_discovery(
         INPUT_CHANNEL_ID,
         BLUETOOTH_CHANNEL_ID,
         MICROPHONE_CHANNEL_ID,
+        RADIO_CHANNEL_ID,
     ] {
         simple_channels.insert(channel_id, ChannelOpenStateMachine::new(channel_id));
     }
@@ -2101,8 +2117,10 @@ fn send_service_discovery_response<T: SessionTransport>(
     Ok(())
 }
 
-/// The full canonical eight-service set — see the module doc comment for
-/// why (`OpenAuto`'s `ServiceFactory` finding).
+/// The canonical eight-service set (`OpenAuto`'s `ServiceFactory`
+/// finding, see the module doc comment) plus `Radio`, added 2026-08-16
+/// and real-hardware-confirmed necessary for `KeyCode::Radio` to route
+/// anywhere at all (see `RADIO_CHANNEL_ID`'s doc comment).
 fn build_service_catalogue() -> Result<ServiceCatalogue, CliError> {
     ServiceCatalogue::build(
         &[
@@ -2144,6 +2162,11 @@ fn build_service_catalogue() -> Result<ServiceCatalogue, CliError> {
             ServiceCandidate {
                 channel_id: MICROPHONE_CHANNEL_ID,
                 kind: ServiceKind::Microphone,
+                availability: ServiceAvailability::Ready,
+            },
+            ServiceCandidate {
+                channel_id: RADIO_CHANNEL_ID,
+                kind: ServiceKind::Radio,
                 availability: ServiceAvailability::Ready,
             },
         ],
@@ -2257,6 +2280,15 @@ fn build_service_capabilities() -> ServiceCapabilities {
         }),
         sensors: Some(SensorCapability {
             sensor_types: vec![SensorType::DrivingStatusData, SensorType::NightMode],
+        }),
+        // See `RADIO_CHANNEL_ID`'s doc comment — real-hardware-confirmed
+        // to correctly route to Android Auto's native radio screen.
+        // `radio_id`/`channel_spacing` are placeholder values; no real
+        // tuner hardware exists for them to describe.
+        radio: Some(RadioCapability {
+            radio_id: 0,
+            radio_type: RadioType::FmRadio,
+            channel_spacing: 100,
         }),
         head_unit_info: Some(HeadUnitInfo {
             make: "pi-auto-headunit".into(),

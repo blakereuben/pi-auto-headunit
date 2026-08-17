@@ -248,6 +248,51 @@ pub struct BluetoothCapability {
     pub car_address: String,
 }
 
+/// `aap_protobuf.service.radio.message.RadioType`
+/// (`service/radio/message/RadioType.proto`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RadioType {
+    AmRadio,
+    FmRadio,
+    AmHdRadio,
+    FmHdRadio,
+    DabRadio,
+    XmRadio,
+}
+
+impl RadioType {
+    const fn wire_value(self) -> i32 {
+        match self {
+            Self::AmRadio => 0,
+            Self::FmRadio => 1,
+            Self::AmHdRadio => 2,
+            Self::FmHdRadio => 3,
+            Self::DabRadio => 4,
+            Self::XmRadio => 5,
+        }
+    }
+}
+
+/// `aap_protobuf.service.radio.RadioService`, advertising exactly one
+/// `RadioProperties` entry (`radio_id`/`type`/`channel_spacing` — the only
+/// three fields proto2 `required` marks, per
+/// `docs/protocol/aasdk-adoption.md`'s `RadioProperties` mapping). Every
+/// other `RadioProperties` field (channel range, RDS, traffic service,
+/// presets, ...) and all ~25 runtime tuning/scanning/preset messages are
+/// deliberately unmapped and unimplemented. Real-hardware-confirmed,
+/// 2026-08-16: without this capability advertised, the phone rejected
+/// `KeyCode::Radio` with "AA was not available"; with it, the phone
+/// correctly navigates to its own native (currently empty, since no
+/// tuning backend exists behind it) radio screen — this capability alone
+/// was the missing precondition, not a working tuner, which would need
+/// the unmapped runtime messages implemented against real hardware.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RadioCapability {
+    pub radio_id: i32,
+    pub radio_type: RadioType,
+    pub channel_spacing: i32,
+}
+
 /// `aap_protobuf.service.sensorsource.SensorSourceService`. Only the
 /// `sensors` list (field 1) is modeled — `location_characterization`,
 /// `supported_fuel_types`, and `supported_ev_connector_types` have no
@@ -283,6 +328,7 @@ pub struct ServiceCapabilities {
     pub bluetooth: Option<BluetoothCapability>,
     pub microphone: Option<MicrophoneCapability>,
     pub sensors: Option<SensorCapability>,
+    pub radio: Option<RadioCapability>,
     pub head_unit_info: Option<HeadUnitInfo>,
     pub ping_configuration: Option<PingConfiguration>,
 }
@@ -454,6 +500,14 @@ fn encode_service(
             // Service.media_source_service (field 5).
             protobuf::write_length_delimited_field(&mut out, 5, &media_source_service);
         }
+        ServiceKind::Radio => {
+            let capability = capabilities
+                .radio
+                .ok_or(ServiceDiscoveryResponseError::MissingCapability { channel_id, kind })?;
+            let radio_service = encode_radio_service(capability);
+            // Service.radio_service (field 7).
+            protobuf::write_length_delimited_field(&mut out, 7, &radio_service);
+        }
     }
     Ok(out)
 }
@@ -609,6 +663,23 @@ fn encode_bluetooth_service(capability: &BluetoothCapability) -> Vec<u8> {
     out
 }
 
+fn encode_radio_service(capability: RadioCapability) -> Vec<u8> {
+    let mut radio_properties = Vec::new();
+    // RadioProperties.radio_id (field 1, required int32).
+    protobuf::write_int32_field(&mut radio_properties, 1, capability.radio_id);
+    // RadioProperties.type (field 2, required enum).
+    protobuf::write_int32_field(&mut radio_properties, 2, capability.radio_type.wire_value());
+    // RadioProperties.channel_spacing (field 5, required int32) — fields
+    // 3/4 (channel_range/channel_spacings) are both `repeated` and left
+    // empty; every optional field (6-14) is omitted.
+    protobuf::write_int32_field(&mut radio_properties, 5, capability.channel_spacing);
+
+    let mut out = Vec::new();
+    // RadioService.radio_properties (field 1, repeated RadioProperties).
+    protobuf::write_length_delimited_field(&mut out, 1, &radio_properties);
+    out
+}
+
 fn encode_media_source_service(capability: MicrophoneCapability) -> Vec<u8> {
     let audio_config = encode_audio_configuration(
         capability.sampling_rate,
@@ -678,6 +749,7 @@ mod tests {
             bluetooth: None,
             microphone: None,
             sensors: None,
+            radio: None,
             head_unit_info: None,
             ping_configuration: None,
         };
@@ -721,6 +793,7 @@ mod tests {
             bluetooth: None,
             microphone: None,
             sensors: None,
+            radio: None,
             head_unit_info: None,
             ping_configuration: None,
         };
@@ -764,6 +837,7 @@ mod tests {
             bluetooth: None,
             microphone: None,
             sensors: None,
+            radio: None,
             head_unit_info: None,
             ping_configuration: None,
         };
@@ -839,6 +913,7 @@ mod tests {
             bluetooth: None,
             microphone: None,
             sensors: None,
+            radio: None,
             head_unit_info: None,
             ping_configuration: None,
         };
@@ -879,6 +954,7 @@ mod tests {
             bluetooth: None,
             microphone: None,
             sensors: None,
+            radio: None,
             head_unit_info: None,
             ping_configuration: None,
         };
@@ -938,6 +1014,7 @@ mod tests {
             bluetooth: None,
             microphone: None,
             sensors: None,
+            radio: None,
             head_unit_info: None,
             ping_configuration: None,
         };
@@ -1088,6 +1165,54 @@ mod tests {
     }
 
     #[test]
+    fn encodes_radio_service_with_exact_bytes() {
+        let catalogue = catalogue(&[ServiceCandidate {
+            channel_id: 9,
+            kind: ServiceKind::Radio,
+            availability: ServiceAvailability::Ready,
+        }]);
+        let capabilities = ServiceCapabilities {
+            radio: Some(RadioCapability {
+                radio_id: 5,
+                radio_type: RadioType::FmRadio,
+                channel_spacing: 100,
+            }),
+            ..ServiceCapabilities::default()
+        };
+        let message = encode_service_discovery_response(&catalogue, &capabilities).expect("encode");
+        assert_eq!(
+            message.body,
+            vec![
+                0x0a, 0x0c, // channels (field 1), length 12
+                0x08, 0x09, // Service.id = 9
+                0x3a, 0x08, // Service.radio_service (field 7), length 8
+                0x0a, 0x06, // RadioService.radio_properties (field 1), length 6
+                0x08, 0x05, // RadioProperties.radio_id = 5
+                0x10, 0x01, // RadioProperties.type = FM_RADIO (1)
+                0x28, 0x64, // RadioProperties.channel_spacing = 100
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_radio_capability_fails_closed() {
+        let catalogue = catalogue(&[ServiceCandidate {
+            channel_id: 9,
+            kind: ServiceKind::Radio,
+            availability: ServiceAvailability::Ready,
+        }]);
+        let capabilities = ServiceCapabilities::default();
+        let error = encode_service_discovery_response(&catalogue, &capabilities).unwrap_err();
+        assert_eq!(
+            error,
+            ServiceDiscoveryResponseError::MissingCapability {
+                channel_id: 9,
+                kind: ServiceKind::Radio,
+            }
+        );
+    }
+
+    #[test]
     fn encodes_microphone_service_with_exact_bytes() {
         let catalogue = catalogue(&[ServiceCandidate {
             channel_id: 8,
@@ -1189,6 +1314,7 @@ mod tests {
             sensors: Some(SensorCapability {
                 sensor_types: vec![SensorType::DrivingStatusData, SensorType::NightMode],
             }),
+            radio: None,
             head_unit_info: None,
             ping_configuration: None,
         };

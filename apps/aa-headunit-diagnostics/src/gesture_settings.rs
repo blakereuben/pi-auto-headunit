@@ -52,11 +52,15 @@ pub const MAX_ARM_WINDOW_SECONDS: u32 = 30;
 /// The four `SwitchTo*` actions send a car-specific `KeyCode` (`Media` /
 /// `Navigation` / `Radio` / `Tel`) to the phone via
 /// `protocol_aap::encode_key_event` — confirmed, sourced wire values
-/// (`docs/protocol/aasdk-adoption.md`'s `KeyCode` section), but the actual
-/// on-phone *effect* is an unverified assumption (switches to whichever
-/// app the phone has set as default for that category — no approved
-/// source describes launching a specific named app). Real-hardware-
-/// untested as of 2026-08-16; see `MILESTONE_CHECKLIST.md` M3.
+/// (`docs/protocol/aasdk-adoption.md`'s `KeyCode` section). Real-hardware-
+/// confirmed, 2026-08-16 (`MILESTONE_CHECKLIST.md` M3): `Media`/
+/// `Navigation`/`Tel` switch to whichever third-party app the phone has
+/// set as default for that category (no approved source describes
+/// launching a specific named app — this is category-switching only);
+/// `Radio` is different — it navigates to Android Auto's own native
+/// radio screen rather than any app (empty without a real tuner backend,
+/// which this project deliberately doesn't implement — see
+/// `protocol_aap::RadioCapability`'s doc comment).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     OpenSettings,
@@ -202,13 +206,20 @@ pub struct GestureSettings {
 
 impl GestureSettings {
     /// Double-tap opens settings (the discoverable, always-safe default);
-    /// two-finger tap toggles fullscreen; long press cycles rotation; the
-    /// four swipe directions default to the four category-switch actions
-    /// in a spatially obvious layout (up→navigation, down→media, matching
-    /// how a map sits above and music sits below on a typical AA home
-    /// screen; left→phone, right→radio) — chosen so every gesture does
-    /// something distinct out of the box, not because any one mapping is
-    /// more "correct" than another. Fully reassignable afterward.
+    /// two-finger tap toggles fullscreen; long press cycles rotation; three
+    /// of the four swipe directions default to category-switch actions in a
+    /// spatially obvious layout (up→navigation, down→media, matching how a
+    /// map sits above and music sits below on a typical AA home screen;
+    /// left→phone) — chosen so every gesture does something distinct out of
+    /// the box, not because any one mapping is more "correct" than another.
+    /// Swipe right defaults to `ToggleFullscreen` (redundant with
+    /// two-finger tap, but genuinely functional) rather than
+    /// `SwitchToRadio`: `SwitchToRadio` is real-hardware-confirmed to
+    /// correctly navigate to Android Auto's own native radio screen (see
+    /// `protocol_aap::RadioCapability`'s doc comment), but that screen is
+    /// empty without a real tuner backend this project deliberately
+    /// doesn't implement — not a good default for a fresh install.
+    /// `SwitchToRadio` is still a fully selectable, working action.
     #[must_use]
     pub fn defaults() -> Self {
         let mut mappings = HashMap::new();
@@ -218,7 +229,7 @@ impl GestureSettings {
         mappings.insert(GestureId::SwipeUp, Action::SwitchToNavigation);
         mappings.insert(GestureId::SwipeDown, Action::SwitchToMedia);
         mappings.insert(GestureId::SwipeLeft, Action::SwitchToPhone);
-        mappings.insert(GestureId::SwipeRight, Action::SwitchToRadio);
+        mappings.insert(GestureId::SwipeRight, Action::ToggleFullscreen);
         Self {
             mappings,
             arm_window_seconds: DEFAULT_ARM_WINDOW_SECONDS,
@@ -299,7 +310,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_assign_every_gesture_a_distinct_action() {
+    fn defaults_assign_every_gesture_a_functional_action() {
         let settings = GestureSettings::defaults();
         assert_eq!(
             settings.action_for(GestureId::DoubleTap),
@@ -325,9 +336,12 @@ mod tests {
             settings.action_for(GestureId::SwipeLeft),
             Action::SwitchToPhone
         );
+        // Not `SwitchToRadio` — it works, but navigates to an empty
+        // native radio screen without real tuner hardware, see
+        // `defaults`'s own doc comment.
         assert_eq!(
             settings.action_for(GestureId::SwipeRight),
-            Action::SwitchToRadio
+            Action::ToggleFullscreen
         );
     }
 
