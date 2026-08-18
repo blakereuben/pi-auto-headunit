@@ -108,6 +108,23 @@ case "$1" in
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true
         fi
+        # M5: bounded, persistent journald logging
+        # (`packaging/systemd/journald-40-rpi-volatile-storage.conf`) —
+        # without this, a crashed boot's logs are gone the moment the
+        # board reboots (real-hardware finding, same session: this
+        # exact gap made the M5 appliance kiosk service's real hangs
+        # undiagnosable until fixed — see
+        # `docs/development/appliance-recovery.md`). A plain
+        # `daemon-reload` above does not apply a journald.conf.d change
+        # to the *already-running* daemon — confirmed directly, a
+        # `restart` alone left it still writing to the volatile runtime
+        # location, and only an explicit `--flush` actually migrated it.
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl restart systemd-journald || true
+        fi
+        if command -v journalctl >/dev/null 2>&1; then
+            journalctl --flush || true
+        fi
         ;;
 esac
 

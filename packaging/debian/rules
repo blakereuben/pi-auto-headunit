@@ -22,3 +22,5 @@ override_dh_auto_install:
 		debian/aa-headunit-diagnostics/usr/lib/systemd/system/aa-headunit-kiosk@.service
 	install -D -m0644 packaging/pam.d/aa-headunit-kiosk \
 		debian/aa-headunit-diagnostics/etc/pam.d/aa-headunit-kiosk
+	install -D -m0644 packaging/systemd/journald-40-rpi-volatile-storage.conf \
+		debian/aa-headunit-diagnostics/etc/systemd/journald.conf.d/40-rpi-volatile-storage.conf

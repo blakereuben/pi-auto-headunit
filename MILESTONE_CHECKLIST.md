@@ -120,11 +120,11 @@ Architecture and automated tests must remain portable throughout development, bu
 - [ ] Run the application as a dedicated unprivileged system user.
 - [ ] Add the preflight and main systemd services.
 - [ ] Start directly into the full-screen head unit on boot.
-- [ ] Provide a documented recovery/development path when the graphical service fails.
+- [x] Provide a documented recovery/development path when the graphical service fails.
 - [ ] Meet the measured boot-to-ready target or record justified revisions.
 - [ ] Build a release-quality signed `arm64` `.deb` without requiring Rust on the target.
 - [ ] Pass clean install, upgrade, remove, purge, and rollback tests.
-- [ ] Produce privacy-safe diagnostics and bounded journald logging.
+- [x] Produce privacy-safe diagnostics and bounded journald logging.
 
 ## M6 — Pi 5 wired hardening
 
