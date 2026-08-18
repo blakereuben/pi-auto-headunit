@@ -842,6 +842,41 @@ pub(crate) struct Gtk4WindowHandoff {
     pub(crate) pipeline_receiver: mpsc::Receiver<Result<VideoRenderPipeline, GstreamerError>>,
 }
 
+/// A cross-thread flag: `true` while the GTK settings panel is visible.
+/// Unlike [`SharedRotation`]/[`platform_api::SharedArmWindow`], both
+/// sides can hold a clone from the moment `TouchSettingsHandoff` is
+/// constructed — no one-shot channel handoff is needed, since (unlike a
+/// touch source or gesture detector) there's no runtime dependency that
+/// has to exist first. The GTK thread sets it (`gtk_dev_ui.rs`,
+/// `connect_visible_notify` on `SettingsPanel::root`); the background
+/// protocol thread only ever reads it (`service_touch_input`). Real-
+/// hardware finding (2026-08-18): every touch frame was always forwarded
+/// to the phone as AA input regardless of what was on screen locally —
+/// contending for the same USB link a local drag (e.g. the brightness
+/// slider) needed, and visibly degrading its smoothness. Gesture
+/// detection (the four-finger arm/close swipe) still runs regardless of
+/// this flag — only the AA-bound touch report is skipped — so the panel
+/// can still be closed by swiping while it's open.
+#[derive(Clone)]
+pub(crate) struct SharedPanelVisibility(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl SharedPanelVisibility {
+    #[must_use]
+    pub(crate) fn new(initially_visible: bool) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            initially_visible,
+        )))
+    }
+
+    pub(crate) fn set(&self, visible: bool) {
+        self.0.store(visible, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Bridges the background protocol thread's touch handling to the GTK
 /// thread's settings panel (`gtk_dev_ui.rs`). `rotation_sender` fires at
 /// most once, as soon as the touchscreen (if any) is opened, carrying a
@@ -856,12 +891,15 @@ pub(crate) struct Gtk4WindowHandoff {
 /// what a completed gesture actually does, since that mapping is
 /// head-unit/UI policy, not something the protocol/touch layer should
 /// know about — it only needs the armed/disarmed events to show/hide its
-/// own "listening" indicator.
+/// own "listening" indicator. `panel_visibility` is not a one-shot
+/// channel like the other three — see [`SharedPanelVisibility`]'s own
+/// doc comment for why.
 #[allow(clippy::struct_field_names)]
 pub(crate) struct TouchSettingsHandoff {
     pub(crate) rotation_sender: mpsc::Sender<Option<SharedRotation>>,
     pub(crate) arm_window_sender: mpsc::Sender<platform_api::SharedArmWindow>,
     pub(crate) gesture_sender: mpsc::Sender<GestureEvent>,
+    pub(crate) panel_visibility: SharedPanelVisibility,
 }
 
 /// Well under `PING_WATCHDOG_TIMEOUT` (5s) — deliberately, not just
@@ -2361,21 +2399,37 @@ fn report_settings_gesture_event(event: GestureEvent, touch_settings: &TouchSett
 /// directly (`gtk_dev_ui.rs`'s brightness slider, for live preview while
 /// dragging) — safe since this is just an independent sysfs write with
 /// no shared mutable state between the two call sites.
+/// Neither the backlight device path nor its `max_brightness` ceiling
+/// change while this process runs — real hardware, not something that
+/// gets hot-plugged — so both are discovered at most once and cached
+/// here. Real-hardware finding (2026-08-18): the brightness slider's
+/// live-preview call site (see this function's own doc comment) fires
+/// on every value-changed tick during a drag, and re-running
+/// `read_dir`+`read_to_string` on every one of those made the slider
+/// visibly stutter; caching collapses each call to the one syscall that
+/// actually has to happen every time (`fs::write` of the new value).
+static BACKLIGHT_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+static BACKLIGHT_MAX_BRIGHTNESS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
 pub(crate) fn set_screen_power(on: bool, brightness_percent: u8) {
-    let Some(backlight_dir) = std::fs::read_dir("/sys/class/backlight")
-        .ok()
-        .and_then(|mut entries| entries.next())
-        .and_then(Result::ok)
-        .map(|entry| entry.path())
-    else {
+    let backlight_dir = BACKLIGHT_DIR.get_or_init(|| {
+        std::fs::read_dir("/sys/class/backlight")
+            .ok()
+            .and_then(|mut entries| entries.next())
+            .and_then(Result::ok)
+            .map(|entry| entry.path())
+    });
+    let Some(backlight_dir) = backlight_dir else {
         println!("probe_state=screen_power_command_failed on={on} error=no_backlight_device_found");
         return;
     };
     let value = if on {
-        std::fs::read_to_string(backlight_dir.join("max_brightness"))
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-            .map_or(u32::MAX, |max| (max * u32::from(brightness_percent)) / 100)
+        let max_brightness = *BACKLIGHT_MAX_BRIGHTNESS.get_or_init(|| {
+            std::fs::read_to_string(backlight_dir.join("max_brightness"))
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+        });
+        max_brightness.map_or(u32::MAX, |max| (max * u32::from(brightness_percent)) / 100)
     } else {
         0
     };
@@ -2583,39 +2637,52 @@ fn service_touch_input<T: SessionTransport>(
                 report_settings_gesture_event(event, touch_settings);
             }
         }
-        let pointers: Vec<TouchPointer> = frame
-            .points
-            .iter()
-            .map(|point| TouchPointer {
-                x: point.x,
-                y: point.y,
-                pointer_id: point.pointer_id,
-            })
-            .collect();
-        let message = encode_touch_report(
-            frame.timestamp_micros,
-            &pointers,
-            frame.action_index,
-            touch_wire_action(frame.phase),
-        );
-        let payload = message
-            .encode(DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE)
-            .map_err(|error| CliError::Protocol(error.to_string()))?;
-        send_encrypted(
-            transport,
-            tls,
-            INPUT_CHANNEL_ID,
-            MessageType::Specific,
-            &payload,
-            limits,
-        )?;
-        // Coordinates are never logged, matching the no-raw-payload-logging
-        // rule applied to media `Data`/`CodecConfig` elsewhere in this file.
-        println!(
-            "probe_state=touch_report_sent phase={:?} pointer_count={}",
-            frame.phase,
-            frame.points.len()
-        );
+        // While the settings panel is showing, this touch belongs to a
+        // local GTK widget (e.g. dragging the brightness slider), not the
+        // phone's own rendered AA screen underneath it — forwarding it to
+        // AA anyway contends for the same USB link the local drag needs
+        // and made on-screen dragging visibly non-smooth, a real-hardware
+        // finding (2026-08-18). Gesture detection above still runs
+        // unconditionally, so the panel can still be closed with a
+        // four-finger swipe while this skips.
+        let panel_visible =
+            touch_settings.is_some_and(|touch_settings| touch_settings.panel_visibility.get());
+        if !panel_visible {
+            let pointers: Vec<TouchPointer> = frame
+                .points
+                .iter()
+                .map(|point| TouchPointer {
+                    x: point.x,
+                    y: point.y,
+                    pointer_id: point.pointer_id,
+                })
+                .collect();
+            let message = encode_touch_report(
+                frame.timestamp_micros,
+                &pointers,
+                frame.action_index,
+                touch_wire_action(frame.phase),
+            );
+            let payload = message
+                .encode(DEFAULT_MAX_INPUT_MESSAGE_BODY_SIZE)
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+            send_encrypted(
+                transport,
+                tls,
+                INPUT_CHANNEL_ID,
+                MessageType::Specific,
+                &payload,
+                limits,
+            )?;
+            // Coordinates are never logged, matching the no-raw-payload-
+            // logging rule applied to media `Data`/`CodecConfig` elsewhere
+            // in this file.
+            println!(
+                "probe_state=touch_report_sent phase={:?} pointer_count={}",
+                frame.phase,
+                frame.points.len()
+            );
+        }
     }
     Ok(())
 }
@@ -3094,6 +3161,16 @@ fn handle_video_channel_open_message<T: SessionTransport>(
                 println!("probe_state=video_media_data_received");
                 println!("video_media_data_timestamp={timestamp}");
                 println!("video_media_data_bytes={}", payload.len());
+                // A same-day attempt to skip this push while the
+                // settings panel covers the video (on the theory that
+                // continued compositor work for hidden frames was
+                // contributing to the brightness slider's residual
+                // stutter) was tried and reverted — real-hardware
+                // testing found it made the stutter *worse*, and
+                // introduced a new, worse bug: skipping frames drops
+                // reference frames the decoder needs, so resuming after
+                // the panel closed showed visibly glitched video until
+                // the next keyframe. Always push, unconditionally.
                 apply_to_running_pipeline(video_render, |pipeline| {
                     pipeline.push_frame(&payload, timestamp)
                 });

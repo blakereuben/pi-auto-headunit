@@ -62,13 +62,23 @@ use platform_linux::touch::{Rotation, SharedRotation};
 use transport_api::{AoaIdentification, AoaMachine};
 
 use crate::CliError;
-use crate::auth_discovery_probe::{Gtk4WindowHandoff, TouchSettingsHandoff, VideoRenderTarget};
+use crate::auth_discovery_probe::{
+    Gtk4WindowHandoff, SharedPanelVisibility, TouchSettingsHandoff, VideoRenderTarget,
+};
 use crate::cancellation::{self, CancellationFlag};
 use crate::connection_state::{self, ConnectionState};
 use crate::settings::{Action, DEFAULT_SETTINGS_PATH, HeadUnitSettings};
 
 const AOA_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the brightness slider waits after the last drag tick before
+/// persisting to disk — see `wire_brightness_and_device_settings`'s doc
+/// comment for the real-hardware stutter this avoids. Comfortably longer
+/// than a single drag tick (so rapid ticks keep cancelling and
+/// rescheduling this instead of each one writing to disk) but short
+/// enough that letting go of the slider still feels like it saved
+/// immediately.
+const BRIGHTNESS_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 /// Safety net only — normal shutdown happens the moment the session-result
 /// poll receives the background thread's outcome. Generous enough to sit
 /// above `auth_discovery_probe::run`'s own internal `PROBE_TIMEOUT` (30s)
@@ -109,6 +119,7 @@ struct ActivationState {
     hang_safety_net_seconds: u32,
     handoff: Gtk4WindowHandoff,
     touch_settings: TouchSettingsHandoff,
+    panel_visibility: SharedPanelVisibility,
     cancel: CancellationFlag,
     session_result_sender: mpsc::Sender<Result<(), CliError>>,
     capability_receiver: mpsc::Receiver<DecoderCapability>,
@@ -128,6 +139,7 @@ pub(crate) fn run(selector: &str, tls12_compatibility: bool) -> Result<(), CliEr
     let (rotation_sender, rotation_receiver) = mpsc::channel::<Option<SharedRotation>>();
     let (arm_window_sender, arm_window_receiver) = mpsc::channel::<SharedArmWindow>();
     let (gesture_sender, gesture_receiver) = mpsc::channel::<GestureEvent>();
+    let panel_visibility = SharedPanelVisibility::new(false);
 
     let activation_state = RefCell::new(Some(ActivationState {
         selector: selector.to_string(),
@@ -141,7 +153,9 @@ pub(crate) fn run(selector: &str, tls12_compatibility: bool) -> Result<(), CliEr
             rotation_sender,
             arm_window_sender,
             gesture_sender,
+            panel_visibility: panel_visibility.clone(),
         },
+        panel_visibility,
         cancel,
         session_result_sender,
         capability_receiver,
@@ -259,6 +273,7 @@ fn activate_window(
         hang_safety_net_seconds,
         handoff,
         touch_settings,
+        panel_visibility,
         cancel,
         session_result_sender,
         capability_receiver,
@@ -286,6 +301,17 @@ fn activate_window(
         gesture_settings.borrow().night_mode_gpio_line(),
     );
     overlay.add_overlay(&settings_panel.root);
+    // `settings_panel.root`'s own visibility is the single source of
+    // truth for whether the panel is showing (see `SharedPanelVisibility`'s
+    // doc comment, `auth_discovery_probe.rs`, for why this is mirrored
+    // into a cross-thread flag rather than read directly — the panel
+    // lives on this thread, the touch forwarding it gates lives on the
+    // background protocol thread). `connect_visible_notify` fires for
+    // every `set_visible` call anywhere in this file (open, close,
+    // fullscreen-toggle), so this one connection covers all of them.
+    settings_panel
+        .root
+        .connect_visible_notify(move |root| panel_visibility.set(root.is_visible()));
     let armed_mask = build_armed_mask();
     overlay.add_overlay(&armed_mask.root);
     let window = ApplicationWindow::builder()
@@ -607,6 +633,17 @@ fn build_armed_mask() -> ArmedMask {
 /// rather than a tap — small enough that a genuine tap never triggers it,
 /// large enough that an ordinary drag reliably does.
 const SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS: f64 = 10.0;
+/// Total straight-line distance from the press point a drag has to cover
+/// before its direction (vertical vs. horizontal) is judged at all — see
+/// `enable_touch_drag_scroll`'s doc comment for the real-hardware finding
+/// this exists for: `GestureDrag`'s offsets are cumulative from the
+/// press point, so very early in *any* drag both axes are still small
+/// and noisy (an imprecise touch-down, a slightly diagonal first
+/// movement), and judging direction from that noise alone produced false
+/// claims on genuine horizontal slider drags. Comfortably larger than
+/// [`SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS`] so the direction check only
+/// ever runs once a drag has clearly committed to some direction.
+const SCROLL_DRAG_MIN_TOTAL_PIXELS: f64 = 24.0;
 
 /// Manually drives `scroller`'s vertical scroll position from an ordinary
 /// press-drag-release sequence, instead of relying on `ScrolledWindow`'s
@@ -634,6 +671,39 @@ const SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS: f64 = 10.0;
 /// the drag from also completing as a click) once movement exceeds
 /// [`SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS`] — below that, an ordinary tap
 /// still reaches its target normally.
+///
+/// Claims only when vertical movement clearly *dominates* horizontal,
+/// never on absolute vertical distance alone — real-hardware finding
+/// (2026-08-18), diagnosed with temporary per-gesture logging: this
+/// gesture runs in `Capture` phase, meaning it sees every drag on any
+/// descendant *before* that descendant's own gesture handling does, and
+/// claiming steals the rest of the touch sequence from whatever child
+/// gesture was already handling it. The brightness slider
+/// (`SettingsPanel::brightness_scale`, a horizontal `Scale`) has its own
+/// internal drag handling for exactly this purpose. A first fix dropped
+/// `offset_x` from the claim check entirely (this panel never scrolls
+/// horizontally — `hscrollbar_policy(PolicyType::Never)`,
+/// `build_settings_panel`) but that alone wasn't enough: the logging
+/// showed every real slider drag *still* got claimed, at only ~11-13px
+/// of accumulated vertical drift over 289-454px of horizontal travel —
+/// ordinary finger wobble on a long horizontal drag, not an intentional
+/// vertical scroll, but still enough to cross the flat
+/// [`SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS`] threshold on its own. A second
+/// fix added exactly that — require `offset_y` to also exceed
+/// `offset_x` — but the *same* logging showed it still wasn't enough:
+/// `GestureDrag`'s offsets are cumulative from the press point, so very
+/// early in *any* drag (an imprecise touch-down, a slightly diagonal
+/// first movement) both axes are still small, and the ratio between two
+/// small noisy numbers is itself noisy — real claims were logged at
+/// offsets like `(7, -11)` and `(2, -20)`, comfortably vertical-dominant
+/// in that instant despite the drag going on to travel hundreds of
+/// pixels horizontally. [`SCROLL_DRAG_MIN_TOTAL_PIXELS`] gates the whole
+/// direction check behind a minimum total straight-line distance, so it
+/// only ever runs once a drag has clearly committed to a direction —
+/// real-hardware-confirmed: repeated full-range brightness drags no
+/// longer stuck at all, while a genuine vertical scroll (logged during
+/// the same trial at offsets like `(-6, -48)`, clearly vertical from the
+/// start) still claimed correctly.
 fn enable_touch_drag_scroll(scroller: &ScrolledWindow) {
     let drag = gtk4::GestureDrag::new();
     drag.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -648,8 +718,10 @@ fn enable_touch_drag_scroll(scroller: &ScrolledWindow) {
 
     let start_value_for_update = Rc::clone(&start_value);
     drag.connect_drag_update(move |gesture, offset_x, offset_y| {
-        if offset_x.abs() > SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS
-            || offset_y.abs() > SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS
+        let total = offset_x.hypot(offset_y);
+        if offset_y.abs() > SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS
+            && total > SCROLL_DRAG_MIN_TOTAL_PIXELS
+            && offset_y.abs() > offset_x.abs()
         {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
         }
@@ -1152,11 +1224,35 @@ fn wire_mtp_suppression_toggle(
 /// `ScreenOff` gesture swallows all touch, including the arm-swipe that
 /// would open this panel, while the screen is off), so there is no
 /// "adjusting brightness while asleep" case to worry about.
+///
+/// The settings-file save is debounced ([`BRIGHTNESS_SAVE_DEBOUNCE`]),
+/// not run on every tick — a second real-hardware finding (2026-08-18,
+/// after fixing `set_screen_power`'s own backlight-lookup caching still
+/// left the slider not smooth): a full `HeadUnitSettings::save` does a
+/// TOML serialize plus an `fs::write` of the whole settings file, which
+/// on every single value-changed event during an active drag was enough
+/// disk I/O on this (GTK) thread to visibly stutter the drag.
+///
+/// A same-day attempt to also throttle the live backlight write itself
+/// (skip writes closer together than ~16ms) made real-hardware dragging
+/// *worse*, not better, and was reverted — the live write stays
+/// unconditional, on every tick. Not fully explained; recorded so a
+/// future session doesn't re-attempt the identical throttle without new
+/// evidence for what it actually cost.
+///
+/// The residual "sticks partway through" symptom neither of the above
+/// two fixes addressed turned out to have nothing to do with this
+/// function at all — see `enable_touch_drag_scroll`'s doc comment for
+/// the actual root cause (the settings panel's own scroll-to-scroll
+/// gesture claiming the touch sequence out from under this slider's
+/// drag), found via temporary per-gesture diagnostic logging rather than
+/// further guessing here.
 fn wire_brightness_and_device_settings(
     settings_panel: &SettingsPanel,
     gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
 ) {
     let gesture_settings_for_brightness = Rc::clone(gesture_settings);
+    let pending_brightness_save: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
     settings_panel
         .brightness_scale
         .connect_value_changed(move |scale| {
@@ -1165,10 +1261,21 @@ fn wire_brightness_and_device_settings(
             gesture_settings_for_brightness
                 .borrow_mut()
                 .set_display_brightness_percent(percent);
-            let _ = gesture_settings_for_brightness
-                .borrow()
-                .save(Path::new(DEFAULT_SETTINGS_PATH));
             crate::auth_discovery_probe::set_screen_power(true, percent);
+
+            if let Some(source_id) = pending_brightness_save.take() {
+                source_id.remove();
+            }
+            let gesture_settings_for_save = Rc::clone(&gesture_settings_for_brightness);
+            let pending_brightness_save_for_timeout = Rc::clone(&pending_brightness_save);
+            let source_id = glib::timeout_add_local(BRIGHTNESS_SAVE_DEBOUNCE, move || {
+                let _ = gesture_settings_for_save
+                    .borrow()
+                    .save(Path::new(DEFAULT_SETTINGS_PATH));
+                pending_brightness_save_for_timeout.set(None);
+                glib::ControlFlow::Break
+            });
+            pending_brightness_save.set(Some(source_id));
         });
 
     let gesture_settings_for_audio = Rc::clone(gesture_settings);
