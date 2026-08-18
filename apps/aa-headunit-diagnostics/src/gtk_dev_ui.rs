@@ -132,6 +132,21 @@ struct ActivationState {
 
 pub(crate) fn run(selector: &str, tls12_compatibility: bool) -> Result<(), CliError> {
     let cancel = cancellation::install_ctrlc_handler()?;
+    run_with_cancel(selector, tls12_compatibility, cancel)
+}
+
+/// Same as [`run`], but takes an already-installed [`CancellationFlag`]
+/// instead of installing its own — `ctrlc::set_handler` can only be
+/// called once per process (`cancellation::install_ctrlc_handler`'s own
+/// doc comment), so a caller that needs to run more than one session in
+/// the same process (`usb kiosk`'s boot-time reconnect loop,
+/// `main.rs`) has to install the handler itself, once, and reuse the
+/// same flag across every session.
+pub(crate) fn run_with_cancel(
+    selector: &str,
+    tls12_compatibility: bool,
+    cancel: CancellationFlag,
+) -> Result<(), CliError> {
     let hang_safety_net_seconds = hang_safety_net_seconds()?;
     let (capability_sender, capability_receiver) = mpsc::channel::<DecoderCapability>();
     let (pipeline_sender, pipeline_receiver) = mpsc::channel();

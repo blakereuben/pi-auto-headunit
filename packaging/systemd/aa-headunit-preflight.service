@@ -1,0 +1,31 @@
+# M5 appliance readiness gate (ARCHITECTURE.md §9): "The service remains
+# disabled until preflight confirms a display, input device, writable
+# state directory, USB access, and at least one audio output." This
+# oneshot unit runs `aa-headunit-diagnostics preflight` (the same command
+# an operator can run by hand) and, via `aa-headunit-kiosk@.service`'s own
+# `Requires=`/`After=` on this unit, gates whether the kiosk session is
+# even attempted each boot — a non-zero exit here (a real, distinct
+# `PreflightFailed` error, not just an unsupported board) stops the kiosk
+# unit from starting instead of letting it fail messily against
+# incomplete hardware.
+#
+# Runs as the dedicated `aa-headunit` user (not root) so the
+# `preflight_state_dir` check confirms the *actual* runtime user can
+# write to /var/lib/aa-headunit, not just that root can.
+#
+# NOT YET real-hardware-tested as a systemd unit (only the underlying
+# `aa-headunit-diagnostics preflight` command has been run directly and
+# confirmed passing) — this project's own operator has deliberately not
+# enabled/started it yet. See `aa-headunit-kiosk@.service`'s own doc
+# comment for the larger reason (a genuine reboot risk this session
+# chose to defer).
+
+[Unit]
+Description=Android Auto head unit appliance readiness check
+Documentation=https://github.com/blakereuben/pi-auto-headunit
+
+[Service]
+Type=oneshot
+User=aa-headunit
+Group=aa-headunit
+ExecStart=/usr/bin/aa-headunit-diagnostics preflight

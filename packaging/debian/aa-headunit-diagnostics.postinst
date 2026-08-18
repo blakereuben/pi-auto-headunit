@@ -51,12 +51,13 @@ case "$1" in
         # without an interactive login, matching how the *human*
         # operator's own already-working audio path depends on owning
         # their session's XDG_RUNTIME_DIR (see the note above this
-        # case statement). Not yet exercised end-to-end on real
-        # hardware — the actual systemd units that will run as this
-        # user are a separate, not-yet-built M5 item
-        # (`MILESTONE_CHECKLIST.md`, "preflight and main systemd
-        # services"). Credential access for this user is *not* set up
-        # here — `docs/development/credential-provisioning.md` has the
+        # case statement). This is independent of the `aa-headunit-kiosk@.service`
+        # template below, which gets its own real logind session/seat
+        # via `pam_systemd.so` (`/etc/pam.d/aa-headunit-kiosk`), not
+        # this lingering one — lingering exists for PipeWire's own
+        # session needs, not for DRM/seat access. Credential access for
+        # this user is *not* set up here —
+        # `docs/development/credential-provisioning.md` has the
         # ownership-migration steps for when that's needed, and this
         # script never touches real credential file ownership itself.
         if command -v loginctl >/dev/null 2>&1; then
@@ -90,6 +91,22 @@ case "$1" in
         # this reload ran.
         if command -v udevadm >/dev/null 2>&1; then
             udevadm control --reload-rules || true
+        fi
+        # M5: `aa-headunit-preflight.service` and the
+        # `aa-headunit-kiosk@.service` template (`packaging/systemd/`)
+        # are installed by `packaging/debian/rules`'s plain `install -D`
+        # (not `dh_installsystemd`), so nothing else makes systemd aware
+        # of them — a `daemon-reload` is needed for `systemctl` to even
+        # see them as installable/enableable. Deliberately does **not**
+        # enable or start anything: real-hardware testing of the kiosk
+        # unit takes over DRM master from whatever compositor already
+        # owns the display, and enabling it changes what a reboot does
+        # — both a real operator decision, not something a package
+        # install should make unilaterally. See
+        # `aa-headunit-kiosk@.service`'s own doc comment for what's
+        # still unverified before an operator should enable it.
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
         fi
         ;;
 esac

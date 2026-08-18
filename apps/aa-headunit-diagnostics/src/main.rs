@@ -286,6 +286,19 @@ fn run(args: &[String]) -> Result<(), CliError> {
             usb_gtk_dev_ui(selector, true)
         }
         [group, command, allow]
+            if group == "usb" && command == "kiosk" && allow == "--allow-live-aap" =>
+        {
+            usb_kiosk(false)
+        }
+        [group, command, allow, compatibility]
+            if group == "usb"
+                && command == "kiosk"
+                && allow == "--allow-live-aap"
+                && compatibility == "--tls12-compat" =>
+        {
+            usb_kiosk(true)
+        }
+        [group, command, allow]
             if group == "usb"
                 && command == "wireless-bootstrap-probe"
                 && allow == "--allow-live-aap" =>
@@ -337,6 +350,7 @@ fn print_help() {
            usb auth-discovery-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
            usb session-supervisor --device BUS:ADDRESS --allow-live-aap [--tls12-compat] [--max-cycles COUNT [--force-disconnect-each-cycle]]\n\
            usb gtk-dev-ui --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
+           usb kiosk --allow-live-aap [--tls12-compat]\n\
            usb wireless-bootstrap-probe --allow-live-aap [--tls12-compat]\n\
          \n\
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
@@ -465,11 +479,121 @@ fn preflight() -> Result<(), CliError> {
         println!("note={note}");
     }
     print_radios(&platform_linux::discover_radios().map_err(CliError::Io)?);
-    if inventory.supported_baseline {
-        Ok(())
-    } else {
-        Err(CliError::UnsupportedPlatform)
+
+    // M5 appliance-readiness checks (`ARCHITECTURE.md` §9: "The service
+    // remains disabled until preflight confirms a display, input
+    // device, writable state directory, USB access, and at least one
+    // audio output"). `aa-headunit-preflight.service` runs this exact
+    // command before the main service is allowed to start
+    // (`Requisite=`/`After=`), so a failure here — not just an
+    // unsupported board — must also stop the appliance from launching
+    // into a broken/incomplete session.
+    let mut appliance_failures = Vec::new();
+    let checks: [(&str, bool, &str); 5] = [
+        (
+            "display",
+            preflight_display_ready(),
+            "no connected display output found",
+        ),
+        (
+            "input",
+            platform_linux::touch::discover_touchscreen()
+                .ok()
+                .flatten()
+                .is_some(),
+            "no touchscreen input device found",
+        ),
+        (
+            "state_dir",
+            preflight_state_dir_writable(),
+            "state directory is missing or not writable",
+        ),
+        ("usb", preflight_usb_ready(), "USB access check failed"),
+        (
+            "audio",
+            preflight_audio_ready(),
+            "no audio output device found",
+        ),
+    ];
+    for (name, ready, failure_reason) in checks {
+        println!(
+            "preflight_{name}={}",
+            if ready { "ready" } else { "not_ready" }
+        );
+        if !ready {
+            appliance_failures.push(failure_reason);
+        }
     }
+
+    if !inventory.supported_baseline {
+        return Err(CliError::UnsupportedPlatform);
+    }
+    if !appliance_failures.is_empty() {
+        return Err(CliError::PreflightFailed(appliance_failures.join("; ")));
+    }
+    Ok(())
+}
+
+/// A connected DRM output means a display is actually plugged in and
+/// recognized — `/sys/class/drm/*/status` reports `connected` per
+/// connector, kernel-maintained and available before any compositor
+/// starts (unlike checking for a running Wayland session, which is what
+/// this check exists to gate in the first place).
+fn preflight_display_ready() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        std::fs::read_to_string(entry.path().join("status"))
+            .is_ok_and(|status| status.trim() == "connected")
+    })
+}
+
+/// `/var/lib/aa-headunit` (`settings::DEFAULT_SETTINGS_PATH`'s parent)
+/// must exist and accept writes from whatever user this runs as —
+/// checked with a real temp-file write/remove, not just a permission-bit
+/// read, since group/ACL interactions are exactly the kind of thing
+/// worth confirming directly rather than inferring.
+fn preflight_state_dir_writable() -> bool {
+    let dir = std::path::Path::new("/var/lib/aa-headunit");
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".preflight-write-check");
+    let writable = std::fs::write(&probe, b"ok").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    writable
+}
+
+/// Confirms USB access without requiring a phone to be plugged in — the
+/// same `LibUsbAoaBackend` every other USB command already uses. A
+/// permission or libusb-init failure here means udev rules/group
+/// membership (`packaging/udev/70-aa-headunit.rules`,
+/// `aa-headunit-diagnostics.postinst`) aren't in effect yet, not that no
+/// phone is connected.
+fn preflight_usb_ready() -> bool {
+    let Ok(backend) = transport_usb::LibUsbAoaBackend::new() else {
+        return false;
+    };
+    backend.list_devices().is_ok()
+}
+
+/// At least one kernel-level ALSA sound card — checked instead of
+/// querying `PipeWire`/`PulseAudio` directly (`pactl`/`wpctl`) because
+/// those depend on a user session already being fully up, which
+/// preflight deliberately runs ahead of. `/proc/asound/cards` starts
+/// each real card's entry with its numeric index; a system with none
+/// prints `--- no soundcards ---` instead, which this distinguishes by
+/// checking the first line starts with a digit rather than just
+/// checking the file is non-empty (it never is, even with no cards).
+fn preflight_audio_ready() -> bool {
+    std::fs::read_to_string("/proc/asound/cards").is_ok_and(|cards| {
+        cards.lines().next().is_some_and(|first_line| {
+            first_line
+                .trim_start()
+                .starts_with(|character: char| character.is_ascii_digit())
+        })
+    })
 }
 
 fn wireless(args: &[String]) -> Result<(), CliError> {
@@ -1200,6 +1324,114 @@ fn usb_gtk_dev_ui(_: &str, _: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
+/// The well-known vendor ID `libusb` reports for a kernel root hub (not a
+/// real downstream peripheral) — excluded from AOA discovery below rather
+/// than probed like an ordinary device.
+#[cfg(target_os = "linux")]
+const LINUX_FOUNDATION_ROOT_HUB_VENDOR_ID: u16 = 0x1d6b;
+
+/// Finds one plausible phone to attempt an Android Auto session against,
+/// with no operator-supplied `--device` selector — the boot-time
+/// entry point (`usb kiosk`) has no human available to run `lsusb`
+/// first. Two passes: prefer a device already in AOA accessory mode
+/// (`transport_usb::is_accessory_id`, the common case right after a
+/// reconnect where the phone never fully re-enumerated back to its
+/// pre-accessory identity); otherwise, probe every other non-root-hub
+/// device with the documented AOA `GetProtocol` vendor request
+/// (`AoaBackend::query_protocol`). This is safe against arbitrary
+/// unrelated USB peripherals (the audio adapter, a hub) by design of the
+/// AOA spec itself: a device that doesn't implement this vendor request
+/// simply `STALL`s the control transfer, a fast, harmless, well-defined
+/// USB response, not a hang — this is the documented AOA discovery
+/// mechanism, not a heuristic. Returns `Ok(None)` (not an error) when no
+/// candidate is found, since "no phone plugged in yet" is the expected,
+/// unremarkable steady state for a head unit at boot.
+#[cfg(target_os = "linux")]
+fn find_candidate_device() -> Result<Option<transport_api::UsbDeviceId>, transport_api::AoaError> {
+    use transport_api::AoaBackend;
+
+    let mut backend = transport_usb::LibUsbAoaBackend::new()?;
+    let devices = backend.list_devices()?;
+    if let Some(device) = devices
+        .iter()
+        .find(|device| transport_usb::is_accessory_id(device.vendor_id, device.product_id))
+    {
+        return Ok(Some(device.clone()));
+    }
+    for device in &devices {
+        if device.vendor_id == LINUX_FOUNDATION_ROOT_HUB_VENDOR_ID {
+            continue;
+        }
+        if backend.query_protocol(device).is_ok() {
+            return Ok(Some(device.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// Entry point for `usb kiosk --allow-live-aap [--tls12-compat]` — the
+/// unattended, boot-time equivalent of `usb gtk-dev-ui`, with no
+/// operator-supplied `--device` and no fixed number of sessions.
+/// Installs the process's cancellation handler exactly once (`ctrlc`
+/// only allows one install per process — see
+/// `gtk_dev_ui::run_with_cancel`'s doc comment) and then loops: discover
+/// a candidate device (polling if none is plugged in yet), run one full
+/// GTK4 session against it via [`gtk_dev_ui::run_with_cancel`], and on
+/// that session ending for any reason (phone disconnected, a protocol
+/// error, the operator closed the window) — start over. A real operator
+/// `Ctrl-C`/`systemctl stop` (`SIGTERM`, which `ctrlc` also catches)
+/// breaks the loop cleanly at the next check point rather than being
+/// silently swallowed by the reconnect logic.
+///
+/// Deliberately simpler than `session_supervisor::run`'s reconnect model
+/// (which tracks a specific device by USB port topology across soft-
+/// reset/physical-replug escalation): this re-discovers fresh each
+/// cycle instead, the same discovery pass used for the very first
+/// session. A head unit only ever expects one phone connected at a
+/// time, so the practical difference is small; adopting
+/// `session_supervisor`'s more sophisticated tracking here is a
+/// reasonable future improvement, not a known correctness gap.
+#[cfg(target_os = "linux")]
+fn usb_kiosk(tls12_compatibility: bool) -> Result<(), CliError> {
+    const DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+    println!("probe_authorization=operator_confirmed");
+    println!("probe_payload_logging=disabled");
+    println!("probe_state=kiosk_started");
+    let cancel = cancellation::install_ctrlc_handler()?;
+
+    while !cancel.is_set() {
+        let selector = loop {
+            if cancel.is_set() {
+                return Ok(());
+            }
+            match find_candidate_device() {
+                Ok(Some(device)) => break format!("{}:{}", device.bus, device.address),
+                Ok(None) => std::thread::sleep(DISCOVERY_POLL_INTERVAL),
+                Err(error) => {
+                    println!("probe_state=kiosk_discovery_failed error={error}");
+                    std::thread::sleep(DISCOVERY_POLL_INTERVAL);
+                }
+            }
+        };
+        println!("probe_state=kiosk_device_selected selector={selector}");
+        match gtk_dev_ui::run_with_cancel(&selector, tls12_compatibility, cancel.clone()) {
+            Ok(()) => println!("probe_state=kiosk_session_ended"),
+            Err(error) => println!("probe_state=kiosk_session_ended error={error}"),
+        }
+        if !cancel.is_set() {
+            std::thread::sleep(RECONNECT_DELAY);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn usb_kiosk(_: bool) -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
+}
+
 #[cfg(target_os = "linux")]
 fn usb_wireless_bootstrap_probe(tls12_compatibility: bool) -> Result<(), CliError> {
     wireless_bootstrap::run(tls12_compatibility)
@@ -1259,6 +1491,14 @@ enum CliError {
     /// apart from every other outcome.
     #[cfg(target_os = "linux")]
     Cancelled,
+    /// `preflight`'s M5 appliance-readiness checks (`ARCHITECTURE.md` §9:
+    /// display, input device, writable state directory, USB access, at
+    /// least one audio output) found something not ready. Distinct from
+    /// `UnsupportedPlatform` — that's about the board/OS itself, this is
+    /// about this specific machine's current hardware/state, which can
+    /// change (a display plugged back in, `/var/lib/aa-headunit`
+    /// recreated) without a different board or OS.
+    PreflightFailed(String),
 }
 
 impl CliError {
@@ -1280,6 +1520,7 @@ impl CliError {
             Self::Transport(_) => 20,
             #[cfg(target_os = "linux")]
             Self::Cancelled => 22,
+            Self::PreflightFailed(_) => 23,
         }
     }
 }
@@ -1302,6 +1543,7 @@ impl std::fmt::Display for CliError {
             Self::Transport(error) => error.fmt(f),
             #[cfg(target_os = "linux")]
             Self::Cancelled => write!(f, "cancelled by operator (Ctrl-C)"),
+            Self::PreflightFailed(reason) => write!(f, "preflight: {reason}"),
         }
     }
 }

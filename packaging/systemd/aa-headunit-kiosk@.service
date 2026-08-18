@@ -1,0 +1,72 @@
+# M5 appliance boot service: runs the head unit fullscreen, on its own
+# dedicated Wayland compositor (`cage`, a kiosk compositor purpose-built
+# for "run one fullscreen app" — packaged for Raspberry Pi OS Trixie),
+# not inside the operator's existing desktop session.
+#
+# A *template* unit (the `@` in the filename) — instantiate it against a
+# specific, currently-unused virtual terminal, e.g.
+# `aa-headunit-kiosk@tty2.service`. Deliberately not tty1: real-hardware
+# inspection this session (`loginctl list-sessions`) found the operator's
+# own interactive desktop (`labwc`) already running there, and losing
+# that would be a real regression, not just an inconvenience. Pick
+# whichever VT is actually free on the target machine.
+#
+# The `[Unit]`/`[Service]` shape below (`After=`/`Before=`/
+# `ConditionPathExists=`/`Wants=`, `PAMName=`/`TTYPath=`/`TTYReset=`/
+# `TTYVHangup=`/`TTYVTDisallocate=`/`StandardInput=tty-fail`) matches
+# cage's own documented systemd deployment recipe
+# (https://github.com/cage-kiosk/cage/wiki/Starting-Cage-on-boot-with-systemd),
+# verified against that source rather than guessed — `pam_systemd.so` in
+# the matching PAM stack (`/etc/pam.d/aa-headunit-kiosk`, installed
+# alongside this unit) is what actually registers a real logind
+# session/seat for the process, which is what grants DRM device access
+# (dynamically, via logind's seat ACLs) — not the `video`/`render` group
+# membership `aa-headunit` already has from `postinst`, which matters for
+# other things (backlight, GPU access outside a seat session) but isn't
+# what a kiosk compositor's own DRM master role depends on.
+#
+# **Not yet real-hardware-tested as a systemd unit at all.** Testing it
+# live would take DRM master away from whatever compositor already owns
+# the display (this session: the operator's own desktop on tty1), and
+# enabling it changes what a reboot does — both explicitly deferred by
+# the operator this session, in favor of writing this correctly against
+# the verified official recipe and testing later, deliberately, rather
+# than causing an unplanned loss of display/desktop access mid-session.
+# First real test should confirm: the unit actually starts on the chosen
+# VT without conflicting with any getty already spawned there (add
+# `Conflicts=getty@%i.service` if one is), the kiosk session reaches
+# fullscreen Android Auto video the same way `usb gtk-dev-ui`/`usb kiosk`
+# already do interactively, and VT-switching away and back (`-s` below)
+# doesn't leave the session broken.
+
+[Unit]
+Description=Android Auto head unit appliance kiosk session (%I)
+Documentation=https://github.com/blakereuben/pi-auto-headunit
+After=aa-headunit-preflight.service systemd-user-sessions.service plymouth-quit-wait.service
+Requires=aa-headunit-preflight.service
+Before=graphical.target
+ConditionPathExists=/dev/tty0
+Wants=dbus.socket systemd-logind.service
+
+[Service]
+Type=simple
+User=aa-headunit
+Group=aa-headunit
+PAMName=aa-headunit-kiosk
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty-fail
+ExecStart=/usr/bin/cage -d -s -- /usr/bin/aa-headunit-diagnostics usb kiosk --allow-live-aap
+Restart=on-failure
+RestartSec=5
+# Incremental hardening (ARCHITECTURE.md §8) — only the directive with
+# no plausible interaction with DRM/USB/audio/seat access is included
+# here; widen this once the unit above is real-hardware-confirmed
+# working at all, verifying each addition against real DRM/USB/audio
+# behavior rather than adding a standard hardening block wholesale.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical.target

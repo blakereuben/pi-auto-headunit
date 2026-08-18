@@ -1,6 +1,8 @@
 # Development Debian package
 
-This packaging preview builds only `aa-headunit-diagnostics`. It installs no always-on service and does not modify `/boot/firmware/config.txt`.
+This packaging preview builds only `aa-headunit-diagnostics`. It does not modify `/boot/firmware/config.txt`.
+
+M5 adds `aa-headunit-preflight.service` and the `aa-headunit-kiosk@.service` template (`packaging/systemd/`) to the package, but `postinst` only runs `systemctl daemon-reload` — it never enables or starts either. Enabling the kiosk unit (`systemctl enable --now aa-headunit-kiosk@<VT>.service`, instantiated against a currently-unused virtual terminal — not whichever one an interactive desktop session is already using) is a deliberate operator decision; see `aa-headunit-kiosk@.service`'s own doc comment for what is and isn't real-hardware-confirmed before doing that.
 
 The package installs no certificate or private key, and creates no `credentials` directory itself — the `credentials install` command creates it, once, the first time an authorised user runs it. `postinst` creates a dedicated `aa-headunit` system group and makes `/etc/aa-headunit` group-writable (`root:aa-headunit`, `0770`) so that first run, and every diagnostic command afterward, works entirely unprivileged for any operator added to that group — no `sudo` needed. The private key file itself keeps its own strict, no-group/no-other `0600` permission check (`crates/credential-store`) unchanged; only the parent directory's own access is widened. See [`docs/development/credential-provisioning.md`](../docs/development/credential-provisioning.md) for the one-time group-membership step and the full provisioning workflow.
 
