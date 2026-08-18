@@ -1926,8 +1926,11 @@ fn observation_window(experiment_flags: &ExperimentFlags) -> Duration {
 /// (its arm-window duration seeded from the persisted
 /// `gesture_settings::GestureSettings`, so a previous session's
 /// customized timeout survives a restart), and sends its live-adjustable
-/// arm-window handle too. Extracted purely to keep `run()` itself under
-/// `clippy::too_many_lines`.
+/// arm-window handle too. Also syncs `mtp_suppression`'s masked/unmasked
+/// `gvfs-mtp-volume-monitor.service` state to the persisted setting, so
+/// every entry point (not just `gtk-dev-ui`, which also syncs immediately
+/// on toggle) picks it up at session start.
+/// Extracted purely to keep `run()` itself under `clippy::too_many_lines`.
 fn setup_settings_gesture(
     touch_source: Option<&EvdevTouchSource>,
     touch_settings: Option<&TouchSettingsHandoff>,
@@ -1936,10 +1939,11 @@ fn setup_settings_gesture(
         let rotation_handle = touch_source.map(EvdevTouchSource::rotation_handle);
         let _ = touch_settings.rotation_sender.send(rotation_handle);
     }
-    let arm_window_seconds = crate::gesture_settings::GestureSettings::load(std::path::Path::new(
+    let settings = crate::gesture_settings::GestureSettings::load(std::path::Path::new(
         crate::gesture_settings::DEFAULT_SETTINGS_PATH,
-    ))
-    .arm_window_seconds();
+    ));
+    crate::mtp_suppression::sync(settings.mtp_popup_suppression_enabled());
+    let arm_window_seconds = settings.arm_window_seconds();
     let detector = ArmedGestureDetector::new(
         SETTINGS_GESTURE_SWIPE_THRESHOLD_PIXELS,
         u64::from(arm_window_seconds) * 1_000_000,

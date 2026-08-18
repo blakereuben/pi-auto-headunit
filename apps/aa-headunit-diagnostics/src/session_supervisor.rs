@@ -157,6 +157,19 @@ struct SupervisedSession {
     /// instruction, 2026-08-16), 2+ = ask for a physical replug via
     /// `replug_prompt`.
     consecutive_failures: u32,
+    /// When set, `attempt` deliberately forces the device to disconnect and
+    /// re-enumerate after every *successful* cycle (not just failures),
+    /// reusing the same `soft_reset`/reconnect machinery already proven for
+    /// failure recovery. Exists specifically for the M4 "100 consecutive
+    /// cable connect/disconnect cycles" soak (`--force-disconnect-each-cycle`,
+    /// `usb session-supervisor`): Blake's explicit direction (2026-08-17)
+    /// was that this doesn't need to be a genuine physical unplug 100
+    /// times — a real connector's mechanical wear isn't in scope here, only
+    /// whether the head unit recovers cleanly from the connection actually
+    /// breaking and coming back, which a software-triggered re-enumeration
+    /// exercises identically to a physical one from the USB stack's own
+    /// point of view.
+    force_disconnect_each_cycle: bool,
 }
 
 impl SupervisedSession {
@@ -192,13 +205,57 @@ impl SupervisedSession {
         let mut transport = backend
             .open_claimed_session_transport(&outcome.transport.device)
             .map_err(CliError::Aoa)?;
-        crate::auth_discovery_probe::run(
+        let result = crate::auth_discovery_probe::run(
             &mut transport,
             self.tls12_compatibility,
             credentials.material,
             crate::auth_discovery_probe::VideoRenderTarget::Wayland,
             &self.cancel,
-        )
+        );
+        if result.is_ok() && self.force_disconnect_each_cycle {
+            // Drop the claimed transport before forcing a reset, so the
+            // "no leaked device handles" part of the soak is genuinely
+            // exercised — this cycle's own handle must already be gone.
+            drop(transport);
+            self.force_disconnect(cycle, &outcome.transport.device)?;
+        }
+        result
+    }
+
+    /// Deliberately breaks and re-establishes the USB connection after a
+    /// successful cycle, for `force_disconnect_each_cycle`'s soak. Reuses
+    /// `resolve_device`'s already-proven `consecutive_failures == 1`
+    /// escalation path (soft `reset()`, then wait for the device to
+    /// genuinely reappear) rather than a new mechanism.
+    fn force_disconnect(&mut self, cycle: u32, device: &UsbDeviceId) -> Result<(), CliError> {
+        let backend = transport_usb::LibUsbAoaBackend::new().map_err(CliError::Aoa)?;
+        println!("probe_state=supervisor_forced_disconnect_attempt cycle={cycle}");
+        let fresh = match backend.soft_reset(device) {
+            Ok(SoftResetOutcome::Reenumerated) => {
+                println!(
+                    "probe_state=supervisor_forced_disconnect_result cycle={cycle} outcome=ok_reenumerated"
+                );
+                backend
+                    .wait_for_physical_replug(device, REDISCOVERY_TIMEOUT)
+                    .map_err(CliError::Aoa)?
+            }
+            Ok(SoftResetOutcome::Completed) => {
+                println!(
+                    "probe_state=supervisor_forced_disconnect_result cycle={cycle} outcome=ok"
+                );
+                backend
+                    .wait_for_reconnect(device, REDISCOVERY_TIMEOUT)
+                    .map_err(CliError::Aoa)?
+            }
+            Err(error) => {
+                println!(
+                    "probe_state=supervisor_forced_disconnect_result cycle={cycle} outcome=failed reason={error}"
+                );
+                return Err(CliError::Aoa(error));
+            }
+        };
+        self.last_known = Some(fresh);
+        Ok(())
     }
 
     /// Resolves this cycle's device, escalating recovery based on
@@ -281,14 +338,26 @@ impl SupervisedSession {
 }
 
 /// Entry point for `usb session-supervisor --device <bus:address>
-/// --allow-live-aap [--tls12-compat] [--max-cycles N]`. `selector` is
-/// parsed once, up front, and used only for the very first cycle's device
-/// lookup — every later cycle re-discovers the phone by USB port instead
-/// (see `SupervisedSession`'s doc comment).
+/// --allow-live-aap [--tls12-compat] [--max-cycles N
+/// [--force-disconnect-each-cycle]]`. `selector` is parsed once, up front,
+/// and used only for the very first cycle's device lookup — every later
+/// cycle re-discovers the phone by USB port instead (see
+/// `SupervisedSession`'s doc comment).
+///
+/// `force_disconnect_each_cycle` also brackets the whole run with open
+/// file-descriptor and resident-memory samples (`crate::open_fd_count`/
+/// `crate::resident_memory_kib`, the same helpers `usb soak` already uses
+/// for M1's interface-level soak), since the M4 "100 consecutive cable
+/// connect/disconnect cycles" requirement (`PRD.md` §7) is specifically
+/// about recovering "without service restart or leaked device handles" —
+/// samples matter far less on an ordinary supervised run, where cycles are
+/// driven by real, unpredictable phone connects rather than a bounded
+/// deliberate soak.
 pub(crate) fn run(
     selector: &str,
     tls12_compatibility: bool,
     max_cycles: Option<u32>,
+    force_disconnect_each_cycle: bool,
 ) -> Result<(), CliError> {
     let (bus, address) = transport_usb::parse_bus_address(selector).map_err(CliError::Aoa)?;
     println!("probe_authorization=operator_confirmed");
@@ -302,8 +371,11 @@ pub(crate) fn run(
         last_known: None,
         cancel,
         consecutive_failures: 0,
+        force_disconnect_each_cycle,
     };
-    supervise(
+    let start_fds = force_disconnect_each_cycle.then(crate::open_fd_count);
+    let start_rss = force_disconnect_each_cycle.then(crate::resident_memory_kib);
+    let result = supervise(
         |cycle| {
             let result = session.attempt(cycle);
             match &result {
@@ -315,7 +387,18 @@ pub(crate) fn run(
         },
         max_cycles,
         RETRY_BACKOFF,
-    )
+    );
+    if let (Some(start_fds), Some(start_rss)) = (start_fds, start_rss) {
+        println!(
+            "open_fds_start={start_fds} open_fds_end={}",
+            crate::open_fd_count()
+        );
+        println!(
+            "rss_kib_start={start_rss} rss_kib_end={}",
+            crate::resident_memory_kib()
+        );
+    }
+    result
 }
 
 #[cfg(test)]

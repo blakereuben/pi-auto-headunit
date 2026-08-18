@@ -28,6 +28,9 @@ mod connection_state;
 mod gesture_settings;
 
 #[cfg(target_os = "linux")]
+mod mtp_suppression;
+
+#[cfg(target_os = "linux")]
 mod gtk_dev_ui;
 
 #[cfg(target_os = "linux")]
@@ -182,7 +185,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                 && device_flag == "--device"
                 && allow == "--allow-live-aap" =>
         {
-            usb_session_supervisor(selector, false, None)
+            usb_session_supervisor(selector, false, None, false)
         }
         [group, command, device_flag, selector, allow, compatibility]
             if group == "usb"
@@ -191,7 +194,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                 && allow == "--allow-live-aap"
                 && compatibility == "--tls12-compat" =>
         {
-            usb_session_supervisor(selector, true, None)
+            usb_session_supervisor(selector, true, None, false)
         }
         [
             group,
@@ -207,7 +210,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
             && allow == "--allow-live-aap"
             && cycles_flag == "--max-cycles" =>
         {
-            usb_session_supervisor(selector, false, Some(parse_cycles(cycles)?))
+            usb_session_supervisor(selector, false, Some(parse_cycles(cycles)?), false)
         }
         [
             group,
@@ -225,7 +228,45 @@ fn run(args: &[String]) -> Result<(), CliError> {
             && compatibility == "--tls12-compat"
             && cycles_flag == "--max-cycles" =>
         {
-            usb_session_supervisor(selector, true, Some(parse_cycles(cycles)?))
+            usb_session_supervisor(selector, true, Some(parse_cycles(cycles)?), false)
+        }
+        [
+            group,
+            command,
+            device_flag,
+            selector,
+            allow,
+            cycles_flag,
+            cycles,
+            force_flag,
+        ] if group == "usb"
+            && command == "session-supervisor"
+            && device_flag == "--device"
+            && allow == "--allow-live-aap"
+            && cycles_flag == "--max-cycles"
+            && force_flag == "--force-disconnect-each-cycle" =>
+        {
+            usb_session_supervisor(selector, false, Some(parse_cycles(cycles)?), true)
+        }
+        [
+            group,
+            command,
+            device_flag,
+            selector,
+            allow,
+            compatibility,
+            cycles_flag,
+            cycles,
+            force_flag,
+        ] if group == "usb"
+            && command == "session-supervisor"
+            && device_flag == "--device"
+            && allow == "--allow-live-aap"
+            && compatibility == "--tls12-compat"
+            && cycles_flag == "--max-cycles"
+            && force_flag == "--force-disconnect-each-cycle" =>
+        {
+            usb_session_supervisor(selector, true, Some(parse_cycles(cycles)?), true)
         }
         [group, command, device_flag, selector, allow]
             if group == "usb"
@@ -294,7 +335,7 @@ fn print_help() {
            usb tls-probe --device BUS:ADDRESS --allow-live-aap --tls12-compat\n\
            usb credential-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
            usb auth-discovery-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
-           usb session-supervisor --device BUS:ADDRESS --allow-live-aap [--tls12-compat] [--max-cycles COUNT]\n\
+           usb session-supervisor --device BUS:ADDRESS --allow-live-aap [--tls12-compat] [--max-cycles COUNT [--force-disconnect-each-cycle]]\n\
            usb gtk-dev-ui --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
            usb wireless-bootstrap-probe --allow-live-aap [--tls12-compat]\n\
          \n\
@@ -1134,12 +1175,18 @@ fn usb_session_supervisor(
     selector: &str,
     tls12_compatibility: bool,
     max_cycles: Option<u32>,
+    force_disconnect_each_cycle: bool,
 ) -> Result<(), CliError> {
-    session_supervisor::run(selector, tls12_compatibility, max_cycles)
+    session_supervisor::run(
+        selector,
+        tls12_compatibility,
+        max_cycles,
+        force_disconnect_each_cycle,
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn usb_session_supervisor(_: &str, _: bool, _: Option<u32>) -> Result<(), CliError> {
+fn usb_session_supervisor(_: &str, _: bool, _: Option<u32>, _: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
@@ -1171,12 +1218,12 @@ fn reject_completed_generated_identity_probe() -> Result<(), CliError> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_fd_count() -> usize {
+pub(crate) fn open_fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
 }
 
 #[cfg(target_os = "linux")]
-fn resident_memory_kib() -> u64 {
+pub(crate) fn resident_memory_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {
@@ -1357,6 +1404,21 @@ mod tests {
             "--allow-live-aap".into(),
             "--max-cycles".into(),
             "0".into(),
+        ];
+        assert!(matches!(run(&args), Err(CliError::Usage(_))));
+    }
+
+    #[test]
+    fn session_supervisor_force_disconnect_still_rejects_invalid_max_cycles() {
+        let args = vec![
+            "usb".into(),
+            "session-supervisor".into(),
+            "--device".into(),
+            "1:2".into(),
+            "--allow-live-aap".into(),
+            "--max-cycles".into(),
+            "0".into(),
+            "--force-disconnect-each-cycle".into(),
         ];
         assert!(matches!(run(&args), Err(CliError::Usage(_))));
     }

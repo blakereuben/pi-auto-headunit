@@ -189,6 +189,8 @@ struct RawSettings {
     circle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     arm_window_seconds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suppress_phone_mtp_popups: Option<bool>,
 }
 
 impl RawSettings {
@@ -224,6 +226,7 @@ impl RawSettings {
 pub struct GestureSettings {
     mappings: HashMap<GestureId, Action>,
     arm_window_seconds: u32,
+    mtp_popup_suppression_enabled: bool,
 }
 
 impl GestureSettings {
@@ -261,6 +264,7 @@ impl GestureSettings {
         Self {
             mappings,
             arm_window_seconds: DEFAULT_ARM_WINDOW_SECONDS,
+            mtp_popup_suppression_enabled: false,
         }
     }
 
@@ -288,6 +292,33 @@ impl GestureSettings {
         self.arm_window_seconds = seconds.clamp(MIN_ARM_WINDOW_SECONDS, MAX_ARM_WINDOW_SECONDS);
     }
 
+    /// Off by default — a real-hardware finding (2026-08-17/18): every
+    /// AOA reconnect (a forced software disconnect, or an ordinary
+    /// physical unplug/replug) makes the phone briefly re-enumerate in
+    /// its normal MTP mode before this project's own code transitions it
+    /// to Android Auto accessory mode, and the desktop's
+    /// `gvfs-mtp-volume-monitor` sometimes tries to claim it during that
+    /// window, producing "couldn't find matching udev device"/"no MTP
+    /// devices found" popups. An initial udev-property-based attempt at
+    /// suppressing this was confirmed real-hardware-*ineffective*
+    /// (correct property override, popups still happened — see
+    /// `mtp_suppression.rs`'s doc comment for the full investigation);
+    /// the actual fix, confirmed by the operator watching the screen
+    /// across 8 real reconnect cycles with zero popups, is masking the
+    /// `gvfs-mtp-volume-monitor.service` `systemctl --user` service
+    /// entirely while this is enabled. Off by default because that also
+    /// disables ordinary MTP file-browsing of a phone plugged into this
+    /// machine outside of Android Auto use, which is a real trade-off the
+    /// operator should opt into, not a silent default.
+    #[must_use]
+    pub fn mtp_popup_suppression_enabled(&self) -> bool {
+        self.mtp_popup_suppression_enabled
+    }
+
+    pub fn set_mtp_popup_suppression_enabled(&mut self, enabled: bool) {
+        self.mtp_popup_suppression_enabled = enabled;
+    }
+
     /// Loads from `path`; falls back to [`Self::defaults`] on any error
     /// (missing file, unreadable, malformed, or an unrecognized
     /// gesture/action key — forward/backward compatible with a future
@@ -310,6 +341,9 @@ impl GestureSettings {
         if let Some(seconds) = raw.arm_window_seconds {
             settings.set_arm_window_seconds(seconds);
         }
+        if let Some(enabled) = raw.suppress_phone_mtp_popups {
+            settings.set_mtp_popup_suppression_enabled(enabled);
+        }
         Some(settings)
     }
 
@@ -324,6 +358,7 @@ impl GestureSettings {
             raw.set(gesture, self.action_for(gesture));
         }
         raw.arm_window_seconds = Some(self.arm_window_seconds);
+        raw.suppress_phone_mtp_popups = Some(self.mtp_popup_suppression_enabled);
         let text = toml::to_string_pretty(&raw)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         if let Some(parent) = path.parent() {
@@ -456,6 +491,27 @@ mod tests {
             loaded.action_for(GestureId::TwoFingerTap),
             Action::ToggleFullscreen
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mtp_popup_suppression_defaults_off_and_round_trips_on() {
+        let defaults = GestureSettings::defaults();
+        assert!(!defaults.mtp_popup_suppression_enabled());
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-gesture-settings-mtp-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = GestureSettings::defaults();
+        settings.set_mtp_popup_suppression_enabled(true);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = GestureSettings::load(&path);
+        assert!(loaded.mtp_popup_suppression_enabled());
 
         let _ = fs::remove_dir_all(&dir);
     }

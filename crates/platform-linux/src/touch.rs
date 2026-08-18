@@ -5,21 +5,50 @@
 //! blocks until the kernel has events, so a caller polling once per loop
 //! iteration (like `auth-headunit-diagnostics`'s probe loop) needs a
 //! non-blocking [`EvdevTouchSource::try_recv`] fed by that thread, not a
-//! direct blocking call. The thread is never explicitly joined: this is a
-//! short-lived diagnostic CLI, and the OS reclaims the thread when the
-//! process exits, matching how the rest of this crate's process-lifetime
-//! hardware handles (transport claims, TLS sessions) are already handled.
+//! direct blocking call.
+//!
+//! **The reader thread is explicitly stopped and joined on
+//! [`EvdevTouchSource`]'s `Drop`** — this used to be fire-and-forget
+//! ("the OS reclaims the thread when the process exits"), which was true
+//! for the original one-shot diagnostic CLI this was built for, but broke
+//! the moment `usb session-supervisor` (a long-running process that opens
+//! and drops a fresh `EvdevTouchSource` every reconnect cycle) started
+//! using it. Real-hardware finding, 2026-08-18: a 100-cycle
+//! connect/disconnect soak with nobody touching the screen leaked exactly
+//! one open file descriptor per cycle (`/dev/input/event6`, confirmed via
+//! `strace -e trace=open,openat,close`) — `run_reader`'s old loop only
+//! ever checked whether its channel receiver was gone at the point it
+//! tried to `send` a *completed* touch frame, so with zero touch input
+//! during a cycle it stayed blocked in `fetch_events()` forever, and the
+//! `Device` (and its fd) it owned never dropped. Fixed by polling the
+//! device's fd with a bounded timeout
+//! ([`READER_POLL_TIMEOUT_MILLIS`]) instead of calling the blocking
+//! `fetch_events()` directly, checking a shared stop flag on every
+//! timeout — [`EvdevTouchSource::drop`] sets that flag and joins the
+//! thread, so the fd is guaranteed closed by the time `drop` returns, not
+//! just eventually. Zero latency cost for real touch input: `poll`
+//! returns immediately the instant data is ready, the timeout only ever
+//! elapses while idle.
 
 use std::io;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::SystemTime;
 
 use evdev::{AbsoluteAxisCode, Device, EventSummary, SynchronizationCode};
+use nix::poll::{PollFd, PollFlags, poll};
 use platform_api::{MultiTouchTracker, RawTouchEvent, TouchFrame};
+
+/// How long [`run_reader`]'s poll loop waits for touch data before
+/// re-checking the shutdown flag. Bounds worst-case shutdown latency
+/// without adding any latency to real touch input (see this module's own
+/// doc comment) — short enough that a `Drop`/join never feels slow, long
+/// enough not to spin the CPU polling an idle touchscreen.
+const READER_POLL_TIMEOUT_MILLIS: u16 = 200;
 
 /// Finds the first connected evdev device that reports both multitouch
 /// position axes — sufficient to identify a touchscreen without depending
@@ -115,6 +144,8 @@ impl SharedRotation {
 pub struct EvdevTouchSource {
     receiver: mpsc::Receiver<TouchFrame>,
     rotation: SharedRotation,
+    stop: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<()>>,
 }
 
 impl EvdevTouchSource {
@@ -128,10 +159,14 @@ impl EvdevTouchSource {
         let scale = AxisScale::from_device(&device, target_width, target_height, rotation)?;
         let rotation_handle = scale.rotation.clone();
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || run_reader(device, &scale, &sender));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_reader = Arc::clone(&stop);
+        let reader = thread::spawn(move || run_reader(device, &scale, &sender, &stop_for_reader));
         Ok(Self {
             receiver,
             rotation: rotation_handle,
+            stop,
+            reader: Some(reader),
         })
     }
 
@@ -147,6 +182,18 @@ impl EvdevTouchSource {
     #[must_use]
     pub fn rotation_handle(&self) -> SharedRotation {
         self.rotation.clone()
+    }
+}
+
+impl Drop for EvdevTouchSource {
+    /// Stops and joins the reader thread so its `Device` (and the fd it
+    /// owns) is guaranteed closed before this returns — see this module's
+    /// own doc comment for the real-hardware leak this fixes.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -254,9 +301,23 @@ fn reverse(value: u32, target: u32) -> u32 {
     target.saturating_sub(1).saturating_sub(value)
 }
 
-fn run_reader(mut device: Device, scale: &AxisScale, sender: &mpsc::Sender<TouchFrame>) {
+fn run_reader(
+    mut device: Device,
+    scale: &AxisScale,
+    sender: &mpsc::Sender<TouchFrame>,
+    stop: &AtomicBool,
+) {
     let mut tracker = MultiTouchTracker::new();
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut poll_fds = [PollFd::new(device.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut poll_fds, READER_POLL_TIMEOUT_MILLIS) {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(_) => return,
+        }
         let Ok(events) = device.fetch_events() else {
             return;
         };

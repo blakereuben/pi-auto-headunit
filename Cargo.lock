@@ -1215,6 +1215,7 @@ name = "platform-linux"
 version = "0.1.0"
 dependencies = [
  "evdev",
+ "nix 0.29.0",
  "platform-api",
 ]
 

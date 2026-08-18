@@ -31,6 +31,23 @@ case "$1" in
         mkdir -p /var/lib/aa-headunit
         chown root:aa-headunit /var/lib/aa-headunit
         chmod 0770 /var/lib/aa-headunit
+        # Real-hardware finding (2026-08-18): installing/updating
+        # `70-aa-headunit.rules` here via a plain `install -D` in
+        # `packaging/debian/rules`, not `dh_installudev`, does not by
+        # itself make the *already-running* `systemd-udevd` daemon
+        # notice — it caches parsed rules and only reloads them on an
+        # explicit request. Found while investigating a since-abandoned
+        # udev-based fix for the MTP-popup issue documented in
+        # `mtp_suppression.rs` (that fix didn't pan out, but this reload
+        # gap is real and independent of it — worth keeping for
+        # `70-aa-headunit.rules` itself on future upgrades). Confirmed
+        # live: `udevadm test` (which always re-reads rule files itself,
+        # independent of the daemon) reported a rule applying correctly
+        # while a real triggered event on the live daemon did not, until
+        # this reload ran.
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules || true
+        fi
         ;;
 esac
 

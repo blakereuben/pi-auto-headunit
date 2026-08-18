@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 platform-api = { path = "../platform-api" }
 evdev = "=0.13.2"
+nix = { version = "=0.29.0", default-features = false, features = ["poll"] }
 
 [lints]
 workspace = true

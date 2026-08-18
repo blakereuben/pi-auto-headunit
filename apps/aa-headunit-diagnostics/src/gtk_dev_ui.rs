@@ -52,8 +52,8 @@ use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, Grid, Label, Orientation, Overlay,
-    Picture, PolicyType, ScrolledWindow, SpinButton, glib,
+    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Grid, Label, Orientation,
+    Overlay, Picture, PolicyType, ScrolledWindow, SpinButton, glib,
 };
 use media_api::DecoderCapability;
 use media_gstreamer::{GstreamerBackend, GstreamerError, RenderSink, VideoRenderPipeline};
@@ -250,7 +250,10 @@ fn activate_window(
     let picture = Picture::new();
     let overlay = Overlay::new();
     overlay.set_child(Some(&picture));
-    let settings_panel = build_settings_panel(gesture_settings.borrow().arm_window_seconds());
+    let settings_panel = build_settings_panel(
+        gesture_settings.borrow().arm_window_seconds(),
+        gesture_settings.borrow().mtp_popup_suppression_enabled(),
+    );
     overlay.add_overlay(&settings_panel.root);
     let armed_mask = build_armed_mask();
     overlay.add_overlay(&armed_mask.root);
@@ -507,6 +510,7 @@ struct SettingsPanel {
     toggle_fullscreen_button: Button,
     cycle_rotation_button: Button,
     arm_timeout_spin: SpinButton,
+    mtp_suppression_check: CheckButton,
 }
 
 /// A full-overlay opaque indicator shown for exactly as long as
@@ -648,7 +652,10 @@ fn build_action_picker() -> ActionPicker {
 /// semi-opaque panel filling the whole window over the video via
 /// `Overlay`, not a separate window: this is a dev diagnostic, not final
 /// product chrome.
-fn build_settings_panel(initial_arm_window_seconds: u32) -> SettingsPanel {
+fn build_settings_panel(
+    initial_arm_window_seconds: u32,
+    initial_mtp_popup_suppression_enabled: bool,
+) -> SettingsPanel {
     let main_page = GtkBox::new(Orientation::Vertical, 8);
 
     let title = Label::new(Some("Head unit settings"));
@@ -671,6 +678,13 @@ fn build_settings_panel(initial_arm_window_seconds: u32) -> SettingsPanel {
     timeout_row.append(&timeout_label);
     timeout_row.append(&arm_timeout_spin);
     main_page.append(&timeout_row);
+
+    // Off by default — see `mtp_popup_suppression_enabled`'s doc comment
+    // for the real-hardware finding and the file-browsing trade-off.
+    let mtp_suppression_check =
+        CheckButton::with_label("Suppress phone file-browser popups on reconnect");
+    mtp_suppression_check.set_active(initial_mtp_popup_suppression_enabled);
+    main_page.append(&mtp_suppression_check);
 
     let mappings_title = Label::new(Some("Gesture assignments"));
     main_page.append(&mappings_title);
@@ -745,6 +759,7 @@ fn build_settings_panel(initial_arm_window_seconds: u32) -> SettingsPanel {
         toggle_fullscreen_button,
         cycle_rotation_button,
         arm_timeout_spin,
+        mtp_suppression_check,
     }
 }
 
@@ -825,6 +840,27 @@ fn toggle_fullscreen(
 /// `GestureSettings` immediately — small, infrequent writes, not worth
 /// debouncing.
 #[allow(clippy::too_many_arguments)]
+/// Split out of `wire_settings_panel` purely to keep it under
+/// `clippy::too_many_lines`.
+fn wire_mtp_suppression_toggle(
+    settings_panel: &SettingsPanel,
+    gesture_settings: &Rc<RefCell<GestureSettings>>,
+) {
+    let gesture_settings = Rc::clone(gesture_settings);
+    settings_panel
+        .mtp_suppression_check
+        .connect_toggled(move |check| {
+            let enabled = check.is_active();
+            gesture_settings
+                .borrow_mut()
+                .set_mtp_popup_suppression_enabled(enabled);
+            let _ = gesture_settings
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+            crate::mtp_suppression::sync(enabled);
+        });
+}
+
 fn wire_settings_panel(
     settings_panel: &SettingsPanel,
     window: &ApplicationWindow,
@@ -899,6 +935,8 @@ fn wire_settings_panel(
                 handle.set_micros(u64::from(seconds) * 1_000_000);
             }
         });
+
+    wire_mtp_suppression_toggle(settings_panel, gesture_settings);
 
     let settings_panel_for_cycle = settings_panel.clone();
     let rotation_handle_for_cycle = Rc::clone(rotation_handle);
