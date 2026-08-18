@@ -2,12 +2,18 @@
 //! started as (`platform_api::GestureId` → the small, closed [`Action`]
 //! set), plus, since M5 (`MILESTONE_CHECKLIST.md`, "Add persistent
 //! settings for display, rotation, touch, audio, microphone, Wi-Fi, and
-//! Bluetooth"), touch rotation, display brightness, and audio
-//! output/microphone input device selection. Wi-Fi and Bluetooth are
-//! deliberately not included yet — `wireless_bootstrap.rs` has no
-//! "preferred network" concept to persist against today (it generates a
-//! fresh random `SoftAP` SSID/password on every bootstrap), so there is
-//! nothing real to save until that work defines one.
+//! Bluetooth"), touch rotation, display brightness, audio output/
+//! microphone input device selection, and — as of the same milestone —
+//! the preferred Wi-Fi/Bluetooth *radio provider*
+//! (`platform_api::ProviderPreference`: `Auto`/`Onboard`/a named USB
+//! adapter's stable ID, the same choice `usb wireless --wifi`/
+//! `--bluetooth` already accepted as a one-shot flag). This is a
+//! narrower thing than a "preferred network": it's which physical
+//! radio to use, not which SSID/paired device to connect to.
+//! `wireless_bootstrap.rs` (M7's wireless Android Auto `SoftAP`
+//! bootstrap) still has no "preferred network" concept to persist
+//! against — it generates a fresh random `SoftAP` SSID/password on
+//! every bootstrap — so that remains out of scope here.
 //!
 //! Lives in [`DEFAULT_SETTINGS_PATH`] (`/var/lib/aa-headunit/settings.toml`)
 //! — mutable operator state, per `ARCHITECTURE.md` §8's `/etc/aa-headunit/`
@@ -231,6 +237,27 @@ struct RawSettings {
     microphone_input_device: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     night_mode_gpio_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wifi_preference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bluetooth_preference: Option<String>,
+}
+
+/// `ProviderPreference` (`platform_api`) has no `Display`/serialization
+/// of its own — this module owns its own wire mapping instead, matching
+/// the same choice already made for `Rotation`/`GestureId`/`Action` (see
+/// this module's own doc comment). `ProviderPreference::parse` already
+/// defines the string→enum direction (`"auto"`/`"onboard"`/anything
+/// else as a stable adapter ID) exactly as `usb wireless --wifi`/
+/// `--bluetooth` already accept on the command line; this is just its
+/// inverse, so a saved preference round-trips through the same format
+/// an operator would type.
+fn provider_preference_to_key(preference: &platform_api::ProviderPreference) -> String {
+    match preference {
+        platform_api::ProviderPreference::Auto => "auto".to_string(),
+        platform_api::ProviderPreference::Onboard => "onboard".to_string(),
+        platform_api::ProviderPreference::StableId(id) => id.clone(),
+    }
 }
 
 /// `Rotation`'s own `encode`/`decode` (`platform_linux::touch`) are
@@ -297,6 +324,8 @@ pub struct HeadUnitSettings {
     audio_output_device: Option<String>,
     microphone_input_device: Option<String>,
     night_mode_gpio_line: Option<u32>,
+    wifi_preference: platform_api::ProviderPreference,
+    bluetooth_preference: platform_api::ProviderPreference,
 }
 
 impl HeadUnitSettings {
@@ -340,6 +369,8 @@ impl HeadUnitSettings {
             audio_output_device: None,
             microphone_input_device: None,
             night_mode_gpio_line: None,
+            wifi_preference: platform_api::ProviderPreference::Auto,
+            bluetooth_preference: platform_api::ProviderPreference::Auto,
         }
     }
 
@@ -473,6 +504,31 @@ impl HeadUnitSettings {
         self.night_mode_gpio_line = line;
     }
 
+    /// Defaults to `Auto`. `usb wireless --wifi <auto|onboard|STABLE_ID>`
+    /// uses this as its default whenever `--wifi` is omitted, and saves
+    /// back to it whenever `--wifi` *is* given — the same "an explicit
+    /// choice both applies and persists" pattern every other M5 setting
+    /// already follows, so an operator only has to specify a preferred
+    /// adapter once.
+    #[must_use]
+    pub fn wifi_preference(&self) -> &platform_api::ProviderPreference {
+        &self.wifi_preference
+    }
+
+    pub fn set_wifi_preference(&mut self, preference: platform_api::ProviderPreference) {
+        self.wifi_preference = preference;
+    }
+
+    /// Mirrors [`Self::wifi_preference`] for `--bluetooth`.
+    #[must_use]
+    pub fn bluetooth_preference(&self) -> &platform_api::ProviderPreference {
+        &self.bluetooth_preference
+    }
+
+    pub fn set_bluetooth_preference(&mut self, preference: platform_api::ProviderPreference) {
+        self.bluetooth_preference = preference;
+    }
+
     /// Loads from `path`; falls back to [`Self::defaults`] on any error
     /// (missing file, unreadable, malformed, or an unrecognized
     /// gesture/action key — forward/backward compatible with a future
@@ -513,6 +569,12 @@ impl HeadUnitSettings {
         if let Some(line) = raw.night_mode_gpio_line {
             settings.set_night_mode_gpio_line(Some(line));
         }
+        if let Some(preference) = raw.wifi_preference {
+            settings.set_wifi_preference(platform_api::ProviderPreference::parse(&preference));
+        }
+        if let Some(preference) = raw.bluetooth_preference {
+            settings.set_bluetooth_preference(platform_api::ProviderPreference::parse(&preference));
+        }
         Some(settings)
     }
 
@@ -535,6 +597,8 @@ impl HeadUnitSettings {
         raw.microphone_input_device
             .clone_from(&self.microphone_input_device);
         raw.night_mode_gpio_line = self.night_mode_gpio_line;
+        raw.wifi_preference = Some(provider_preference_to_key(&self.wifi_preference));
+        raw.bluetooth_preference = Some(provider_preference_to_key(&self.bluetooth_preference));
         let text = toml::to_string_pretty(&raw)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         if let Some(parent) = path.parent() {
@@ -843,6 +907,44 @@ mod tests {
 
         let loaded = HeadUnitSettings::load(&path);
         assert_eq!(loaded.night_mode_gpio_line(), Some(17));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn radio_preferences_default_to_auto_and_round_trip_all_variants() {
+        let defaults = HeadUnitSettings::defaults();
+        assert_eq!(
+            defaults.wifi_preference(),
+            &platform_api::ProviderPreference::Auto
+        );
+        assert_eq!(
+            defaults.bluetooth_preference(),
+            &platform_api::ProviderPreference::Auto
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-radio-preference-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_wifi_preference(platform_api::ProviderPreference::Onboard);
+        settings.set_bluetooth_preference(platform_api::ProviderPreference::StableId(
+            "usb:1234:5678:1-2".to_string(),
+        ));
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(
+            loaded.wifi_preference(),
+            &platform_api::ProviderPreference::Onboard
+        );
+        assert_eq!(
+            loaded.bluetooth_preference(),
+            &platform_api::ProviderPreference::StableId("usb:1234:5678:1-2".to_string())
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

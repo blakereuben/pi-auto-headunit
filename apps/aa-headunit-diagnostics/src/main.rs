@@ -597,7 +597,9 @@ fn preflight_audio_ready() -> bool {
 }
 
 fn wireless(args: &[String]) -> Result<(), CliError> {
-    let (wifi_preference, bluetooth_preference) = parse_preferences(args)?;
+    let (wifi_override, bluetooth_override) = parse_preferences(args)?;
+    let (wifi_preference, bluetooth_preference) =
+        resolve_and_persist_radio_preferences(wifi_override, bluetooth_override);
     let providers = platform_linux::discover_radios().map_err(CliError::Io)?;
     print_radios(&providers);
 
@@ -608,11 +610,55 @@ fn wireless(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Combines an explicit `--wifi`/`--bluetooth` override (if given, i.e.
+/// `Some`) with the persisted preference
+/// (`settings::HeadUnitSettings::wifi_preference`/
+/// `bluetooth_preference`), and saves back whenever an override is
+/// given — the same "an explicit choice both applies and persists"
+/// pattern every other M5 setting already follows, so an operator only
+/// has to specify a preferred adapter once. Returns the resolved value
+/// either way, `Auto` if nothing was ever set.
+#[cfg(target_os = "linux")]
+fn resolve_and_persist_radio_preferences(
+    wifi_override: Option<ProviderPreference>,
+    bluetooth_override: Option<ProviderPreference>,
+) -> (ProviderPreference, ProviderPreference) {
+    let path = std::path::Path::new(settings::DEFAULT_SETTINGS_PATH);
+    let mut settings = settings::HeadUnitSettings::load(path);
+    let mut changed = false;
+    if let Some(preference) = wifi_override {
+        settings.set_wifi_preference(preference);
+        changed = true;
+    }
+    if let Some(preference) = bluetooth_override {
+        settings.set_bluetooth_preference(preference);
+        changed = true;
+    }
+    if changed {
+        let _ = settings.save(path);
+    }
+    (
+        settings.wifi_preference().clone(),
+        settings.bluetooth_preference().clone(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_and_persist_radio_preferences(
+    wifi_override: Option<ProviderPreference>,
+    bluetooth_override: Option<ProviderPreference>,
+) -> (ProviderPreference, ProviderPreference) {
+    (
+        wifi_override.unwrap_or(ProviderPreference::Auto),
+        bluetooth_override.unwrap_or(ProviderPreference::Auto),
+    )
+}
+
 fn parse_preferences(
     args: &[String],
-) -> Result<(ProviderPreference, ProviderPreference), CliError> {
-    let mut wifi = ProviderPreference::Auto;
-    let mut bluetooth = ProviderPreference::Auto;
+) -> Result<(Option<ProviderPreference>, Option<ProviderPreference>), CliError> {
+    let mut wifi = None;
+    let mut bluetooth = None;
     let mut index = 0;
     while index < args.len() {
         let flag = &args[index];
@@ -622,8 +668,8 @@ fn parse_preferences(
             ))
         })?;
         match flag.as_str() {
-            "--wifi" => wifi = ProviderPreference::parse(value),
-            "--bluetooth" => bluetooth = ProviderPreference::parse(value),
+            "--wifi" => wifi = Some(ProviderPreference::parse(value)),
+            "--bluetooth" => bluetooth = Some(ProviderPreference::parse(value)),
             _ => return Err(CliError::Usage(format!("unknown wireless option: {flag}"))),
         }
         index += 2;
@@ -1561,11 +1607,18 @@ mod tests {
             "usb:1234:5678:1-2".into(),
         ];
         let (wifi, bluetooth) = parse_preferences(&args).expect("valid preferences");
-        assert_eq!(wifi, ProviderPreference::Onboard);
+        assert_eq!(wifi, Some(ProviderPreference::Onboard));
         assert_eq!(
             bluetooth,
-            ProviderPreference::StableId("usb:1234:5678:1-2".into())
+            Some(ProviderPreference::StableId("usb:1234:5678:1-2".into()))
         );
+    }
+
+    #[test]
+    fn no_flags_leaves_both_preferences_unset() {
+        let (wifi, bluetooth) = parse_preferences(&[]).expect("empty args are valid");
+        assert_eq!(wifi, None);
+        assert_eq!(bluetooth, None);
     }
 
     #[test]

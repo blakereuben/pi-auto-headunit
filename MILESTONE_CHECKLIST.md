@@ -116,7 +116,7 @@ Architecture and automated tests must remain portable throughout development, bu
 
 ## M5 — Pi 5 appliance and package
 
-- [ ] Add persistent settings for display, rotation, touch, audio, microphone, Wi-Fi, and Bluetooth.
+- [x] Add persistent settings for display, rotation, touch, audio, microphone, Wi-Fi, and Bluetooth.
 - [ ] Run the application as a dedicated unprivileged system user.
 - [ ] Add the preflight and main systemd services.
 - [ ] Start directly into the full-screen head unit on boot.
