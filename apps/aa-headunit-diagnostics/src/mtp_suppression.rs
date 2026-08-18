@@ -1,6 +1,6 @@
 //! Runtime toggle that masks/unmasks the desktop's
 //! `gvfs-mtp-volume-monitor` `systemctl --user` service, matching
-//! `gesture_settings::GestureSettings::mtp_popup_suppression_enabled` —
+//! `settings::HeadUnitSettings::mtp_popup_suppression_enabled` —
 //! see that method's doc comment for the real-hardware finding this
 //! exists to fix (the desktop popping up "couldn't find matching udev
 //! device"/"no MTP devices found" on every Android Auto reconnect).
@@ -52,7 +52,7 @@ use std::process::Command;
 
 const SERVICE: &str = "gvfs-mtp-volume-monitor.service";
 
-/// Best-effort, matching `GestureSettings`'s own "a setting is a
+/// Best-effort, matching `HeadUnitSettings`'s own "a setting is a
 /// convenience, never allowed to fail a live session" discipline — a
 /// failure here (e.g. no user D-Bus session, `systemctl` missing) is
 /// logged, not propagated.

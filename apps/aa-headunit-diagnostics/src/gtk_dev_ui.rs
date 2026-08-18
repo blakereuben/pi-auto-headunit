@@ -24,7 +24,7 @@
 //! background protocol thread from real touch frames) signals this thread
 //! over `TouchSettingsHandoff::gesture_sender`; this thread looks up what
 //! that gesture is currently mapped to
-//! (`gesture_settings::GestureSettings`, persisted to
+//! (`settings::HeadUnitSettings`, persisted to
 //! `/var/lib/aa-headunit/settings.toml`) and either shows the settings
 //! panel, toggles fullscreen (bidirectionally — see `Action`'s doc
 //! comment for why; the session keeps running underneath either way, per
@@ -52,8 +52,8 @@ use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Grid, Label, Orientation,
-    Overlay, Picture, PolicyType, ScrolledWindow, SpinButton, glib,
+    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DropDown, Grid, Label,
+    Orientation, Overlay, Picture, PolicyType, Scale, ScrolledWindow, SpinButton, glib,
 };
 use media_api::DecoderCapability;
 use media_gstreamer::{GstreamerBackend, GstreamerError, RenderSink, VideoRenderPipeline};
@@ -65,7 +65,7 @@ use crate::CliError;
 use crate::auth_discovery_probe::{Gtk4WindowHandoff, TouchSettingsHandoff, VideoRenderTarget};
 use crate::cancellation::{self, CancellationFlag};
 use crate::connection_state::{self, ConnectionState};
-use crate::gesture_settings::{Action, DEFAULT_SETTINGS_PATH, GestureSettings};
+use crate::settings::{Action, DEFAULT_SETTINGS_PATH, HeadUnitSettings};
 
 const AOA_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -201,7 +201,7 @@ struct SessionPollState {
     current_rotation: Rc<Cell<Rotation>>,
     arm_window_handle: Rc<RefCell<Option<SharedArmWindow>>>,
     is_fullscreen: Rc<Cell<bool>>,
-    gesture_settings: Rc<RefCell<GestureSettings>>,
+    gesture_settings: Rc<RefCell<HeadUnitSettings>>,
     selector: String,
     tls12_compatibility: bool,
     hang_safety_net_seconds: u32,
@@ -222,6 +222,32 @@ struct SessionPollState {
 /// piece of state `wire_session_polls` needs, from one just-activated
 /// `ActivationState`. Extracted from `connect_activate`'s closure purely
 /// to keep `run()` itself under `clippy::too_many_lines`.
+/// Loads a small stylesheet defining `.flipped-panel { transform:
+/// rotate(180deg); }`, applied to the whole `GtkDisplay`. Real-hardware
+/// finding (2026-08-18): flipping the *video* 180° (`set_rotation_degrees`)
+/// left the settings panel — a separate GTK overlay drawn directly, never
+/// touched by that `GStreamer`-side change — still right-side-up, which
+/// the operator correctly flagged as making the flip look like it "made
+/// no difference" while the panel filled most of the screen during
+/// testing. `apply_rotation` toggles this class on `SettingsPanel::root`
+/// to match. Idempotent (safe to call once per window, which is all this
+/// needs) — `gtk4::style_context_add_provider_for_display` adds to the
+/// display's provider list, not a single widget, so this only needs
+/// calling once regardless of how many rotatable widgets end up using the
+/// class.
+fn install_flipped_panel_css() {
+    let Some(display) = gtk4::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_data(".flipped-panel { transform: rotate(180deg); }");
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 fn activate_window(
     application: &Application,
     state: ActivationState,
@@ -243,16 +269,21 @@ fn activate_window(
         gesture_receiver,
     } = state;
 
-    let gesture_settings: Rc<RefCell<GestureSettings>> = Rc::new(RefCell::new(
-        GestureSettings::load(Path::new(DEFAULT_SETTINGS_PATH)),
+    let gesture_settings: Rc<RefCell<HeadUnitSettings>> = Rc::new(RefCell::new(
+        HeadUnitSettings::load(Path::new(DEFAULT_SETTINGS_PATH)),
     ));
 
+    install_flipped_panel_css();
     let picture = Picture::new();
     let overlay = Overlay::new();
     overlay.set_child(Some(&picture));
     let settings_panel = build_settings_panel(
         gesture_settings.borrow().arm_window_seconds(),
         gesture_settings.borrow().mtp_popup_suppression_enabled(),
+        gesture_settings.borrow().display_brightness_percent(),
+        gesture_settings.borrow().audio_output_device(),
+        gesture_settings.borrow().microphone_input_device(),
+        gesture_settings.borrow().night_mode_gpio_line(),
     );
     overlay.add_overlay(&settings_panel.root);
     let armed_mask = build_armed_mask();
@@ -266,13 +297,27 @@ fn activate_window(
     window.present();
 
     let rotation_handle: Rc<RefCell<Option<SharedRotation>>> = Rc::new(RefCell::new(None));
-    let current_rotation: Rc<Cell<Rotation>> = Rc::new(Cell::new(Rotation::Rotate0));
+    // Loaded from settings, not always `Normal` — M5's persisted
+    // rotation (`crate::settings`). `rotation_label`'s text is set to
+    // match right below, and the loaded value is applied to the real
+    // `SharedRotation` handle once it becomes available (see the
+    // `rotation_receiver` poll below).
+    let current_rotation: Rc<Cell<Rotation>> =
+        Rc::new(Cell::new(gesture_settings.borrow().rotation()));
+    settings_panel
+        .rotation_label
+        .set_text(rotation_label_text(current_rotation.get()));
+    if current_rotation.get() == Rotation::Flipped180 {
+        settings_panel.root.add_css_class("flipped-panel");
+        armed_mask.root.add_css_class("flipped-panel");
+    }
     let arm_window_handle: Rc<RefCell<Option<SharedArmWindow>>> = Rc::new(RefCell::new(None));
     // The window is created fullscreen above.
     let is_fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(true));
 
     wire_settings_panel(
         &settings_panel,
+        &armed_mask,
         &window,
         &rotation_handle,
         &current_rotation,
@@ -322,7 +367,7 @@ fn wire_gesture_poll(
     rotation_handle: Rc<RefCell<Option<SharedRotation>>>,
     current_rotation: Rc<Cell<Rotation>>,
     is_fullscreen: Rc<Cell<bool>>,
-    gesture_settings: Rc<RefCell<GestureSettings>>,
+    gesture_settings: Rc<RefCell<HeadUnitSettings>>,
 ) -> glib::SourceId {
     glib::timeout_add_local(POLL_INTERVAL, move || {
         while let Ok(event) = gesture_receiver.try_recv() {
@@ -335,10 +380,12 @@ fn wire_gesture_poll(
                     dispatch_action(
                         action,
                         &settings_panel,
+                        &armed_mask,
                         &window,
                         &rotation_handle,
                         &current_rotation,
                         &is_fullscreen,
+                        &gesture_settings,
                     );
                 }
             }
@@ -392,9 +439,18 @@ fn wire_session_polls(state: SessionPollState) {
     });
 
     let rotation_handle_for_poll = Rc::clone(&rotation_handle);
+    let current_rotation_for_poll = Rc::clone(&current_rotation);
     let _rotation_poll_id =
         glib::timeout_add_local(POLL_INTERVAL, move || match rotation_receiver.try_recv() {
             Ok(handle) => {
+                // Apply the settings-loaded rotation the instant a real
+                // `SharedRotation` becomes available — the touch reader
+                // thread only starts reporting frames through it from
+                // here on, so this is the earliest point a persisted
+                // non-zero rotation can actually take effect.
+                if let Some(handle) = &handle {
+                    handle.set(current_rotation_for_poll.get());
+                }
                 *rotation_handle_for_poll.borrow_mut() = handle;
                 glib::ControlFlow::Break
             }
@@ -508,9 +564,16 @@ struct SettingsPanel {
     picker: ActionPicker,
     close_button: Button,
     toggle_fullscreen_button: Button,
-    cycle_rotation_button: Button,
+    flip_screen_button: Button,
     arm_timeout_spin: SpinButton,
     mtp_suppression_check: CheckButton,
+    brightness_scale: Scale,
+    audio_output_dropdown: DropDown,
+    audio_output_devices: Rc<Vec<String>>,
+    microphone_input_dropdown: DropDown,
+    microphone_input_devices: Rc<Vec<String>>,
+    night_mode_gpio_enabled_check: CheckButton,
+    night_mode_gpio_spin: SpinButton,
 }
 
 /// A full-overlay opaque indicator shown for exactly as long as
@@ -652,26 +715,198 @@ fn build_action_picker() -> ActionPicker {
 /// semi-opaque panel filling the whole window over the video via
 /// `Overlay`, not a separate window: this is a dev diagnostic, not final
 /// product chrome.
+///
+/// Lists `PulseAudio`/`PipeWire`-`pulse` device names via `pactl list
+/// short <kind>` (`kind` is `"sinks"` or `"sources"`) — the second
+/// tab-separated column of each line is the device's stable name, the
+/// same string `pulsesink`/`pulsesrc`'s `device` property expects
+/// (`media_gstreamer::AudioPlaybackPipeline`/`MicrophoneCapturePipeline`).
+/// `pactl` itself comes from `pulseaudio-utils`, *not* the `pipewire`/
+/// `wireplumber` packages this project's actual audio path already
+/// depends on — real-hardware-required (2026-08-18): the reference Pi 5
+/// image has `wpctl`/`pw-cli` but not `pactl` installed by default, so
+/// this returned nothing at first despite working `GStreamer` `PulseAudio`
+/// playback (`libpulse0`, the client library `pulsesink`/`pulsesrc` use
+/// directly, doesn't need the separate CLI tool). Added as an explicit
+/// `Depends` (`packaging/debian/control`), matching this project's
+/// existing convention of declaring exactly the external tools it
+/// actually shells out to (`adduser` is already one). Chose adding the
+/// dependency over parsing `wpctl status`/`wpctl inspect` instead: `pactl`
+/// speaks the exact `PulseAudio` compatibility surface `pulsesink`'s
+/// `device` property does by definition, where `wpctl`'s device
+/// descriptions are a human-readable label, not the raw `node.name`
+/// `GStreamer` needs — correct, not just convenient.
+///
+/// Empty on any failure (missing `pactl`, no reachable `PipeWire`
+/// session) rather than erroring — populating the settings panel with an
+/// empty device list (just "System default") is a reasonable degraded
+/// state, not a reason to fail building the whole panel.
+fn list_pulse_devices(kind: &str) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("pactl")
+        .args(["list", "short", kind])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Builds a device-selection `DropDown`: "System default" (index 0, maps
+/// to the persisted setting's `None`) followed by every device
+/// `list_pulse_devices` found, pre-selecting whichever entry matches
+/// `initial_device` (falling back to "System default" if it names a
+/// device that's no longer present — e.g. unplugged since last saved).
+fn build_device_dropdown(devices: &[String], initial_device: Option<&str>) -> DropDown {
+    let mut labels: Vec<&str> = vec!["System default"];
+    labels.extend(devices.iter().map(String::as_str));
+    let dropdown = DropDown::from_strings(&labels);
+    let selected = initial_device
+        .and_then(|initial| devices.iter().position(|device| device == initial))
+        .map_or(0, |index| index + 1);
+    dropdown.set_selected(u32::try_from(selected).unwrap_or(0));
+    dropdown
+}
+
+/// Reads whichever device name `dropdown` currently has selected back out
+/// as a persistable setting value — `None` for "System default" (index
+/// `0`) or an out-of-range/`GTK_INVALID_LIST_POSITION` selection,
+/// `Some(name)` otherwise.
+fn selected_device(dropdown: &DropDown, devices: &[String]) -> Option<String> {
+    let selected = dropdown.selected();
+    if selected == 0 || selected == gtk4::INVALID_LIST_POSITION {
+        return None;
+    }
+    devices
+        .get(usize::try_from(selected).ok()?.checked_sub(1)?)
+        .cloned()
+}
+
+/// Builds the brightness slider and the two audio-device dropdowns and
+/// appends them to `main_page` — split out of `build_settings_panel`
+/// purely to keep it under `clippy::too_many_lines`. None of the three
+/// live-apply: brightness takes effect the next time the screen is
+/// turned off/on (no live-brightness-while-lit handle exists the way
+/// rotation/arm-timeout have `SharedRotation`/`SharedArmWindow` — building
+/// one would mean a new shared channel threaded through
+/// `Gtk4WindowHandoff` purely for this, not justified yet for a setting
+/// that already takes effect on the very next natural screen-power
+/// event), and a device change only takes effect the next time its
+/// pipeline (re)starts (a fresh session, or a channel `Start`
+/// reconfiguration), matching every other pipeline construction
+/// parameter in this project (format, codec, ...), none of which are
+/// hot-swappable mid-stream.
+#[allow(clippy::too_many_arguments)]
+fn build_media_settings_controls(
+    main_page: &GtkBox,
+    initial_display_brightness_percent: u8,
+    initial_audio_output_device: Option<&str>,
+    initial_microphone_input_device: Option<&str>,
+    initial_night_mode_gpio_line: Option<u32>,
+) -> (
+    Scale,
+    DropDown,
+    Vec<String>,
+    DropDown,
+    Vec<String>,
+    CheckButton,
+    SpinButton,
+) {
+    let brightness_row = GtkBox::new(Orientation::Horizontal, 8);
+    let brightness_label = Label::new(Some("Screen brightness (%)"));
+    let brightness_scale = Scale::with_range(
+        Orientation::Horizontal,
+        f64::from(crate::settings::MIN_DISPLAY_BRIGHTNESS_PERCENT),
+        f64::from(crate::settings::MAX_DISPLAY_BRIGHTNESS_PERCENT),
+        1.0,
+    );
+    brightness_scale.set_hexpand(true);
+    brightness_scale.set_value(f64::from(initial_display_brightness_percent));
+    brightness_row.append(&brightness_label);
+    brightness_row.append(&brightness_scale);
+    main_page.append(&brightness_row);
+
+    let audio_output_devices = list_pulse_devices("sinks");
+    let audio_output_row = GtkBox::new(Orientation::Horizontal, 8);
+    let audio_output_label = Label::new(Some("Audio output device"));
+    let audio_output_dropdown =
+        build_device_dropdown(&audio_output_devices, initial_audio_output_device);
+    audio_output_dropdown.set_hexpand(true);
+    audio_output_row.append(&audio_output_label);
+    audio_output_row.append(&audio_output_dropdown);
+    main_page.append(&audio_output_row);
+
+    let microphone_input_devices = list_pulse_devices("sources");
+    let microphone_input_row = GtkBox::new(Orientation::Horizontal, 8);
+    let microphone_input_label = Label::new(Some("Microphone input device"));
+    let microphone_input_dropdown =
+        build_device_dropdown(&microphone_input_devices, initial_microphone_input_device);
+    microphone_input_dropdown.set_hexpand(true);
+    microphone_input_row.append(&microphone_input_label);
+    microphone_input_row.append(&microphone_input_dropdown);
+    main_page.append(&microphone_input_row);
+
+    // Unchecked/0 (the default) means night mode is disabled — see
+    // `HeadUnitSettings::night_mode_gpio_line`'s doc comment. The spin
+    // button stays enabled regardless of the checkbox state so a value
+    // can be picked before enabling, rather than forcing enable-then-set.
+    let night_mode_row = GtkBox::new(Orientation::Horizontal, 8);
+    let night_mode_gpio_enabled_check = CheckButton::with_label("Night mode via GPIO line");
+    night_mode_gpio_enabled_check.set_active(initial_night_mode_gpio_line.is_some());
+    let night_mode_gpio_spin = SpinButton::with_range(
+        f64::from(crate::settings::MIN_NIGHT_MODE_GPIO_LINE),
+        f64::from(crate::settings::MAX_NIGHT_MODE_GPIO_LINE),
+        1.0,
+    );
+    night_mode_gpio_spin.set_value(f64::from(
+        initial_night_mode_gpio_line.unwrap_or(crate::settings::MIN_NIGHT_MODE_GPIO_LINE),
+    ));
+    night_mode_row.append(&night_mode_gpio_enabled_check);
+    night_mode_row.append(&night_mode_gpio_spin);
+    main_page.append(&night_mode_row);
+
+    (
+        brightness_scale,
+        audio_output_dropdown,
+        audio_output_devices,
+        microphone_input_dropdown,
+        microphone_input_devices,
+        night_mode_gpio_enabled_check,
+        night_mode_gpio_spin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_settings_panel(
     initial_arm_window_seconds: u32,
     initial_mtp_popup_suppression_enabled: bool,
+    initial_display_brightness_percent: u8,
+    initial_audio_output_device: Option<&str>,
+    initial_microphone_input_device: Option<&str>,
+    initial_night_mode_gpio_line: Option<u32>,
 ) -> SettingsPanel {
     let main_page = GtkBox::new(Orientation::Vertical, 8);
 
     let title = Label::new(Some("Head unit settings"));
     main_page.append(&title);
 
-    let rotation_label = Label::new(Some("Touch rotation: 0°"));
+    let rotation_label = Label::new(Some("Screen: normal"));
     main_page.append(&rotation_label);
 
-    let cycle_rotation_button = Button::with_label("Cycle rotation");
-    main_page.append(&cycle_rotation_button);
+    let flip_screen_button = Button::with_label("Flip screen");
+    main_page.append(&flip_screen_button);
 
     let timeout_row = GtkBox::new(Orientation::Horizontal, 8);
     let timeout_label = Label::new(Some("Gesture timeout (seconds)"));
     let arm_timeout_spin = SpinButton::with_range(
-        f64::from(crate::gesture_settings::MIN_ARM_WINDOW_SECONDS),
-        f64::from(crate::gesture_settings::MAX_ARM_WINDOW_SECONDS),
+        f64::from(crate::settings::MIN_ARM_WINDOW_SECONDS),
+        f64::from(crate::settings::MAX_ARM_WINDOW_SECONDS),
         1.0,
     );
     arm_timeout_spin.set_value(f64::from(initial_arm_window_seconds));
@@ -685,6 +920,22 @@ fn build_settings_panel(
         CheckButton::with_label("Suppress phone file-browser popups on reconnect");
     mtp_suppression_check.set_active(initial_mtp_popup_suppression_enabled);
     main_page.append(&mtp_suppression_check);
+
+    let (
+        brightness_scale,
+        audio_output_dropdown,
+        audio_output_devices,
+        microphone_input_dropdown,
+        microphone_input_devices,
+        night_mode_gpio_enabled_check,
+        night_mode_gpio_spin,
+    ) = build_media_settings_controls(
+        &main_page,
+        initial_display_brightness_percent,
+        initial_audio_output_device,
+        initial_microphone_input_device,
+        initial_night_mode_gpio_line,
+    );
 
     let mappings_title = Label::new(Some("Gesture assignments"));
     main_page.append(&mappings_title);
@@ -703,7 +954,7 @@ fn build_settings_panel(
     for (index, gesture) in GestureId::all().into_iter().enumerate() {
         let row = GtkBox::new(Orientation::Horizontal, 8);
         row.set_hexpand(true);
-        let label = Label::new(Some(crate::gesture_settings::gesture_label(gesture)));
+        let label = Label::new(Some(crate::settings::gesture_label(gesture)));
         let change_button = Button::new();
         change_button.set_hexpand(true);
         row.append(&label);
@@ -757,43 +1008,67 @@ fn build_settings_panel(
         picker,
         close_button,
         toggle_fullscreen_button,
-        cycle_rotation_button,
+        flip_screen_button,
         arm_timeout_spin,
         mtp_suppression_check,
+        brightness_scale,
+        audio_output_dropdown,
+        audio_output_devices: Rc::new(audio_output_devices),
+        microphone_input_dropdown,
+        microphone_input_devices: Rc::new(microphone_input_devices),
+        night_mode_gpio_enabled_check,
+        night_mode_gpio_spin,
     }
 }
 
 fn rotation_label_text(rotation: Rotation) -> &'static str {
     match rotation {
-        Rotation::Rotate0 => "Touch rotation: 0°",
-        Rotation::Rotate90 => "Touch rotation: 90°",
-        Rotation::Rotate180 => "Touch rotation: 180°",
-        Rotation::Rotate270 => "Touch rotation: 270°",
+        Rotation::Normal => "Screen: normal",
+        Rotation::Flipped180 => "Screen: flipped 180°",
     }
 }
 
 fn next_rotation(rotation: Rotation) -> Rotation {
     match rotation {
-        Rotation::Rotate0 => Rotation::Rotate90,
-        Rotation::Rotate90 => Rotation::Rotate180,
-        Rotation::Rotate180 => Rotation::Rotate270,
-        Rotation::Rotate270 => Rotation::Rotate0,
+        Rotation::Normal => Rotation::Flipped180,
+        Rotation::Flipped180 => Rotation::Normal,
     }
 }
 
 fn apply_rotation(
     rotation: Rotation,
     settings_panel: &SettingsPanel,
+    armed_mask: &ArmedMask,
     rotation_handle: &Rc<RefCell<Option<SharedRotation>>>,
     current_rotation: &Rc<Cell<Rotation>>,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
 ) {
+    println!("probe_state=rotation_requested rotation={rotation:?}");
     current_rotation.set(rotation);
     settings_panel
         .rotation_label
         .set_text(rotation_label_text(rotation));
+    // Both overlays are GTK widgets, never touched by the video
+    // pipeline's own `set_rotation_degrees` — see
+    // `install_flipped_panel_css`'s doc comment for the real-hardware
+    // finding this fixes. The armed-state mask ("Listening for
+    // gesture…") needs the same treatment as the settings panel — both
+    // are overlaid directly on top of the (separately, correctly)
+    // flipped video.
+    if rotation == Rotation::Flipped180 {
+        settings_panel.root.add_css_class("flipped-panel");
+        armed_mask.root.add_css_class("flipped-panel");
+    } else {
+        settings_panel.root.remove_css_class("flipped-panel");
+        armed_mask.root.remove_css_class("flipped-panel");
+    }
     if let Some(handle) = rotation_handle.borrow().as_ref() {
         handle.set(rotation);
     }
+    gesture_settings.borrow_mut().set_rotation(rotation);
+    let _ = gesture_settings
+        .borrow()
+        .save(Path::new(DEFAULT_SETTINGS_PATH));
 }
 
 fn toggle_fullscreen_button_label(is_fullscreen: bool) -> &'static str {
@@ -837,14 +1112,14 @@ fn toggle_fullscreen(
 
 /// Connects every control's click/selection handler once, right after the
 /// panel is built. Reassigning a gesture's action saves the whole
-/// `GestureSettings` immediately — small, infrequent writes, not worth
+/// `HeadUnitSettings` immediately — small, infrequent writes, not worth
 /// debouncing.
 #[allow(clippy::too_many_arguments)]
 /// Split out of `wire_settings_panel` purely to keep it under
 /// `clippy::too_many_lines`.
 fn wire_mtp_suppression_toggle(
     settings_panel: &SettingsPanel,
-    gesture_settings: &Rc<RefCell<GestureSettings>>,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
 ) {
     let gesture_settings = Rc::clone(gesture_settings);
     settings_panel
@@ -861,14 +1136,124 @@ fn wire_mtp_suppression_toggle(
         });
 }
 
+/// Persists the brightness slider and the two device dropdowns on every
+/// change. The two device dropdowns still don't live-apply (see
+/// `build_settings_panel`'s doc comment on why — a device change only
+/// takes effect at the next pipeline start). Brightness *does* live-apply
+/// now — real-hardware feedback (2026-08-18): "the slider does nothing"
+/// is a bad experience for a brightness control specifically, unlike the
+/// device dropdowns, which have no meaningful "preview" concept anyway.
+/// Calls `auth_discovery_probe::set_screen_power` directly from this (GTK)
+/// thread rather than round-tripping through the background protocol
+/// thread via a new shared-handle channel (the `SharedRotation`/
+/// `SharedArmWindow` pattern) — safe because the backlight sysfs write
+/// itself has no shared mutable state to race on, and because the
+/// settings panel can only be open while the screen is already on (the
+/// `ScreenOff` gesture swallows all touch, including the arm-swipe that
+/// would open this panel, while the screen is off), so there is no
+/// "adjusting brightness while asleep" case to worry about.
+fn wire_brightness_and_device_settings(
+    settings_panel: &SettingsPanel,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    let gesture_settings_for_brightness = Rc::clone(gesture_settings);
+    settings_panel
+        .brightness_scale
+        .connect_value_changed(move |scale| {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let percent = scale.value() as u8;
+            gesture_settings_for_brightness
+                .borrow_mut()
+                .set_display_brightness_percent(percent);
+            let _ = gesture_settings_for_brightness
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+            crate::auth_discovery_probe::set_screen_power(true, percent);
+        });
+
+    let gesture_settings_for_audio = Rc::clone(gesture_settings);
+    let audio_output_devices = Rc::clone(&settings_panel.audio_output_devices);
+    let audio_output_dropdown = settings_panel.audio_output_dropdown.clone();
+    settings_panel
+        .audio_output_dropdown
+        .connect_selected_notify(move |_| {
+            let device = selected_device(&audio_output_dropdown, &audio_output_devices);
+            gesture_settings_for_audio
+                .borrow_mut()
+                .set_audio_output_device(device);
+            let _ = gesture_settings_for_audio
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+        });
+
+    let gesture_settings_for_mic = Rc::clone(gesture_settings);
+    let microphone_input_devices = Rc::clone(&settings_panel.microphone_input_devices);
+    let microphone_input_dropdown = settings_panel.microphone_input_dropdown.clone();
+    settings_panel
+        .microphone_input_dropdown
+        .connect_selected_notify(move |_| {
+            let device = selected_device(&microphone_input_dropdown, &microphone_input_devices);
+            gesture_settings_for_mic
+                .borrow_mut()
+                .set_microphone_input_device(device);
+            let _ = gesture_settings_for_mic
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+        });
+
+    // Also persist-only, like the two device dropdowns above — the GPIO
+    // line is only ever opened once, at probe start
+    // (`open_night_mode_gpio_source`), so there is nothing to live-apply
+    // here either. The spin button stays readable/settable regardless of
+    // the checkbox, so both handlers below read the checkbox for whether
+    // to persist `Some`/`None` and the spin for which line.
+    let gesture_settings_for_night_mode_check = Rc::clone(gesture_settings);
+    let night_mode_gpio_spin_for_check = settings_panel.night_mode_gpio_spin.clone();
+    settings_panel
+        .night_mode_gpio_enabled_check
+        .connect_toggled(move |check| {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let line = check
+                .is_active()
+                .then(|| night_mode_gpio_spin_for_check.value() as u32);
+            gesture_settings_for_night_mode_check
+                .borrow_mut()
+                .set_night_mode_gpio_line(line);
+            let _ = gesture_settings_for_night_mode_check
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+        });
+
+    let gesture_settings_for_night_mode_spin = Rc::clone(gesture_settings);
+    let night_mode_gpio_enabled_check_for_spin =
+        settings_panel.night_mode_gpio_enabled_check.clone();
+    settings_panel
+        .night_mode_gpio_spin
+        .connect_value_changed(move |spin| {
+            if !night_mode_gpio_enabled_check_for_spin.is_active() {
+                return;
+            }
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let value = spin.value() as u32;
+            gesture_settings_for_night_mode_spin
+                .borrow_mut()
+                .set_night_mode_gpio_line(Some(value));
+            let _ = gesture_settings_for_night_mode_spin
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn wire_settings_panel(
     settings_panel: &SettingsPanel,
+    armed_mask: &ArmedMask,
     window: &ApplicationWindow,
     rotation_handle: &Rc<RefCell<Option<SharedRotation>>>,
     current_rotation: &Rc<Cell<Rotation>>,
     arm_window_handle: &Rc<RefCell<Option<SharedArmWindow>>>,
     is_fullscreen: &Rc<Cell<bool>>,
-    gesture_settings: &Rc<RefCell<GestureSettings>>,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
 ) {
     for (gesture, selector) in settings_panel.gesture_selectors.iter() {
         let initial = gesture_settings.borrow().action_for(*gesture);
@@ -880,7 +1265,7 @@ fn wire_settings_panel(
             picker.editing_gesture.set(Some(gesture));
             picker.title.set_text(&format!(
                 "{}: choose an action",
-                crate::gesture_settings::gesture_label(gesture)
+                crate::settings::gesture_label(gesture)
             ));
             main_page.set_visible(false);
             picker.root.set_visible(true);
@@ -937,21 +1322,24 @@ fn wire_settings_panel(
         });
 
     wire_mtp_suppression_toggle(settings_panel, gesture_settings);
+    wire_brightness_and_device_settings(settings_panel, gesture_settings);
 
     let settings_panel_for_cycle = settings_panel.clone();
+    let armed_mask_for_cycle = armed_mask.clone();
     let rotation_handle_for_cycle = Rc::clone(rotation_handle);
     let current_rotation_for_cycle = Rc::clone(current_rotation);
-    settings_panel
-        .cycle_rotation_button
-        .connect_clicked(move |_| {
-            let next = next_rotation(current_rotation_for_cycle.get());
-            apply_rotation(
-                next,
-                &settings_panel_for_cycle,
-                &rotation_handle_for_cycle,
-                &current_rotation_for_cycle,
-            );
-        });
+    let gesture_settings_for_cycle = Rc::clone(gesture_settings);
+    settings_panel.flip_screen_button.connect_clicked(move |_| {
+        let next = next_rotation(current_rotation_for_cycle.get());
+        apply_rotation(
+            next,
+            &settings_panel_for_cycle,
+            &armed_mask_for_cycle,
+            &rotation_handle_for_cycle,
+            &current_rotation_for_cycle,
+            &gesture_settings_for_cycle,
+        );
+    });
 
     let settings_panel_for_close = settings_panel.clone();
     settings_panel.close_button.connect_clicked(move |_| {
@@ -982,17 +1370,26 @@ fn wire_settings_panel(
 fn dispatch_action(
     action: Action,
     settings_panel: &SettingsPanel,
+    armed_mask: &ArmedMask,
     window: &ApplicationWindow,
     rotation_handle: &Rc<RefCell<Option<SharedRotation>>>,
     current_rotation: &Rc<Cell<Rotation>>,
     is_fullscreen: &Rc<Cell<bool>>,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
 ) {
     match action {
         Action::OpenSettings => settings_panel.root.set_visible(true),
         Action::ToggleFullscreen => toggle_fullscreen(window, settings_panel, is_fullscreen),
-        Action::CycleRotation => {
+        Action::FlipScreen => {
             let next = next_rotation(current_rotation.get());
-            apply_rotation(next, settings_panel, rotation_handle, current_rotation);
+            apply_rotation(
+                next,
+                settings_panel,
+                armed_mask,
+                rotation_handle,
+                current_rotation,
+                gesture_settings,
+            );
         }
         // All no-ops here, dispatched instead from the background protocol
         // thread (`auth_discovery_probe.rs::service_touch_input`), for two
@@ -1001,7 +1398,7 @@ fn dispatch_action(
         // touches neither the phone nor GTK window state, but must still
         // run there since that thread's `service_touch_input` is the only
         // place that can swallow the touch used to wake the screen back
-        // up — see `gesture_settings::Action::ScreenOff`'s doc comment and
+        // up — see `settings::Action::ScreenOff`'s doc comment and
         // `auth_discovery_probe.rs`'s `ScreenPowerState`.
         Action::SwitchToMedia
         | Action::SwitchToNavigation

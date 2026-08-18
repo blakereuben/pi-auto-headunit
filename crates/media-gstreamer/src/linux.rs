@@ -97,8 +97,9 @@ impl GstreamerBackend {
         &self,
         format: crate::AudioFormat,
         sink: crate::AudioSink,
+        device: Option<&str>,
     ) -> Result<crate::AudioPlaybackPipeline, GstreamerError> {
-        crate::AudioPlaybackPipeline::new(format, sink)
+        crate::AudioPlaybackPipeline::new(format, sink, device)
     }
 
     pub fn build_audio_capture_pipeline(
@@ -114,7 +115,8 @@ impl GstreamerBackend {
         &self,
         format: crate::AudioFormat,
         source: crate::AudioCaptureSource,
+        device: Option<&str>,
     ) -> Result<crate::MicrophoneCapturePipeline, GstreamerError> {
-        crate::MicrophoneCapturePipeline::new(format, source)
+        crate::MicrophoneCapturePipeline::new(format, source, device)
     }
 }

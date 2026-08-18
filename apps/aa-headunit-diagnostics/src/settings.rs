@@ -1,6 +1,13 @@
-//! Persisted, user-reassignable mapping from a completed follow-up gesture
-//! (`platform_api::GestureId`) to a head-unit action, plus the small,
-//! closed action set itself.
+//! Persisted operator settings: the gesture-to-action mapping this module
+//! started as (`platform_api::GestureId` → the small, closed [`Action`]
+//! set), plus, since M5 (`MILESTONE_CHECKLIST.md`, "Add persistent
+//! settings for display, rotation, touch, audio, microphone, Wi-Fi, and
+//! Bluetooth"), touch rotation, display brightness, and audio
+//! output/microphone input device selection. Wi-Fi and Bluetooth are
+//! deliberately not included yet — `wireless_bootstrap.rs` has no
+//! "preferred network" concept to persist against today (it generates a
+//! fresh random `SoftAP` SSID/password on every bootstrap), so there is
+//! nothing real to save until that work defines one.
 //!
 //! Lives in [`DEFAULT_SETTINGS_PATH`] (`/var/lib/aa-headunit/settings.toml`)
 //! — mutable operator state, per `ARCHITECTURE.md` §8's `/etc/aa-headunit/`
@@ -13,13 +20,16 @@
 //! unprivileged-group pattern already used for `/etc/aa-headunit`
 //! (`packaging/README.md`), so saving settings never needs `sudo`.
 //!
-//! `GestureId`/`Action` deliberately don't derive `serde` traits — that
-//! would pull a serialization dependency into `platform-api`, a pure
-//! capability/data crate with none today (`ARCHITECTURE.md`'s dependency
-//! rule). This module owns the string<->enum mapping itself instead.
+//! `GestureId`/`Action`/`platform_linux::touch::Rotation` deliberately
+//! don't derive `serde` traits — that would pull a serialization
+//! dependency into `platform-api`/`platform-linux`, pure capability/data
+//! crates with none today (`ARCHITECTURE.md`'s dependency rule). This
+//! module owns every string<->enum mapping itself instead, matching the
+//! existing pattern `auth_discovery_probe.rs`'s `TOUCH_ROTATION_ENV_VAR`
+//! parsing already established for rotation specifically.
 //!
 //! A missing, unreadable, or malformed settings file always falls back to
-//! [`GestureSettings::defaults`] — settings are a convenience, never
+//! [`HeadUnitSettings::defaults`] — settings are a convenience, never
 //! allowed to fail a live session.
 
 use std::collections::HashMap;
@@ -28,9 +38,23 @@ use std::io;
 use std::path::Path;
 
 use platform_api::GestureId;
+use platform_linux::touch::Rotation;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_SETTINGS_PATH: &str = "/var/lib/aa-headunit/settings.toml";
+/// Backlight level applied whenever the screen is on — `100` (full
+/// brightness) matches this project's pre-M5 behaviour exactly (the
+/// screen-off/on gesture previously only ever wrote `0` or
+/// `max_brightness`), so a fresh install's actual on-screen behaviour is
+/// unchanged until an operator deliberately lowers it.
+pub const DEFAULT_DISPLAY_BRIGHTNESS_PERCENT: u8 = 100;
+/// `0` is deliberately excluded from the adjustable range — indistinguishable
+/// from the screen being off via the separate `ScreenOff` gesture action,
+/// and a saved `0` would leave a fresh boot with an unrecoverable-looking
+/// dark screen until the operator finds the (also on-screen) settings
+/// control to fix it.
+pub const MIN_DISPLAY_BRIGHTNESS_PERCENT: u8 = 1;
+pub const MAX_DISPLAY_BRIGHTNESS_PERCENT: u8 = 100;
 /// How long, after the four-finger arming swipe completes, a follow-up
 /// gesture has to arrive before the head unit silently disarms. Real-
 /// hardware feedback (2026-08-16): the operator asked for this to be
@@ -39,6 +63,12 @@ pub const DEFAULT_SETTINGS_PATH: &str = "/var/lib/aa-headunit/settings.toml";
 pub const DEFAULT_ARM_WINDOW_SECONDS: u32 = 3;
 pub const MIN_ARM_WINDOW_SECONDS: u32 = 1;
 pub const MAX_ARM_WINDOW_SECONDS: u32 = 30;
+/// The Raspberry Pi 40-pin header's usable BCM GPIO line range (0/1 are
+/// technically wired too — the ID EEPROM pins — but are reserved and
+/// excluded here since selecting them for night mode would conflict with
+/// board identification hardware).
+pub const MIN_NIGHT_MODE_GPIO_LINE: u32 = 2;
+pub const MAX_NIGHT_MODE_GPIO_LINE: u32 = 27;
 
 /// The small, closed set of actions a follow-up gesture can trigger.
 /// Deliberately not an open plugin system — see `platform_api::gesture`'s
@@ -64,7 +94,7 @@ pub const MAX_ARM_WINDOW_SECONDS: u32 = 30;
 ///
 /// `ScreenOff` (added 2026-08-17) is a **third** dispatch category,
 /// distinct from both the phone-facing `SwitchTo*` actions above and the
-/// GTK-thread-local `OpenSettings`/`ToggleFullscreen`/`CycleRotation`
+/// GTK-thread-local `OpenSettings`/`ToggleFullscreen`/`FlipScreen`
 /// actions below: it needs neither `transport` (no phone message) nor GTK
 /// window state, but it must still run on the background protocol thread
 /// specifically, because that thread's `service_touch_input` is the only
@@ -74,7 +104,7 @@ pub const MAX_ARM_WINDOW_SECONDS: u32 = 30;
 pub enum Action {
     OpenSettings,
     ToggleFullscreen,
-    CycleRotation,
+    FlipScreen,
     SwitchToMedia,
     SwitchToNavigation,
     SwitchToRadio,
@@ -88,7 +118,7 @@ impl Action {
         [
             Action::OpenSettings,
             Action::ToggleFullscreen,
-            Action::CycleRotation,
+            Action::FlipScreen,
             Action::SwitchToMedia,
             Action::SwitchToNavigation,
             Action::SwitchToRadio,
@@ -102,7 +132,7 @@ impl Action {
         match self {
             Action::OpenSettings => "Open settings",
             Action::ToggleFullscreen => "Toggle fullscreen",
-            Action::CycleRotation => "Cycle rotation",
+            Action::FlipScreen => "Flip screen",
             Action::SwitchToMedia => "Switch to media",
             Action::SwitchToNavigation => "Switch to navigation",
             Action::SwitchToRadio => "Switch to radio",
@@ -122,7 +152,7 @@ impl Action {
             Action::SwitchToPhone => Some(protocol_aap::KeyCode::Tel),
             Action::OpenSettings
             | Action::ToggleFullscreen
-            | Action::CycleRotation
+            | Action::FlipScreen
             | Action::ScreenOff => None,
         }
     }
@@ -131,7 +161,7 @@ impl Action {
         match self {
             Action::OpenSettings => "open_settings",
             Action::ToggleFullscreen => "toggle_fullscreen",
-            Action::CycleRotation => "cycle_rotation",
+            Action::FlipScreen => "flip_screen",
             Action::SwitchToMedia => "switch_to_media",
             Action::SwitchToNavigation => "switch_to_navigation",
             Action::SwitchToRadio => "switch_to_radio",
@@ -144,7 +174,7 @@ impl Action {
         match key {
             "open_settings" => Some(Action::OpenSettings),
             "toggle_fullscreen" => Some(Action::ToggleFullscreen),
-            "cycle_rotation" => Some(Action::CycleRotation),
+            "flip_screen" => Some(Action::FlipScreen),
             "switch_to_media" => Some(Action::SwitchToMedia),
             "switch_to_navigation" => Some(Action::SwitchToNavigation),
             "switch_to_radio" => Some(Action::SwitchToRadio),
@@ -191,6 +221,41 @@ struct RawSettings {
     arm_window_seconds: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suppress_phone_mtp_popups: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotation_degrees: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_brightness_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_output_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    microphone_input_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    night_mode_gpio_line: Option<u32>,
+}
+
+/// `Rotation`'s own `encode`/`decode` (`platform_linux::touch`) are
+/// crate-private there — this module owns its own wire mapping instead,
+/// matching the same choice already made for `GestureId`/`Action` (see
+/// the module doc comment) and reusing the exact `0`/`180` values
+/// `auth_discovery_probe.rs`'s `TOUCH_ROTATION_ENV_VAR` parsing already
+/// established. Degrees, not a bare bool, for a self-describing on-disk
+/// TOML value — `Rotation` itself is a 2-variant enum now (2026-08-18;
+/// see its own doc comment for why 90°/270° were dropped), but
+/// `rotation_degrees = 180` reads clearly without opening this file,
+/// where `rotation_flipped = true` would not.
+pub(crate) fn rotation_to_degrees(rotation: Rotation) -> u16 {
+    match rotation {
+        Rotation::Normal => 0,
+        Rotation::Flipped180 => 180,
+    }
+}
+
+fn rotation_from_degrees(degrees: u16) -> Option<Rotation> {
+    match degrees {
+        0 => Some(Rotation::Normal),
+        180 => Some(Rotation::Flipped180),
+        _ => None,
+    }
 }
 
 impl RawSettings {
@@ -223,13 +288,18 @@ impl RawSettings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GestureSettings {
+pub struct HeadUnitSettings {
     mappings: HashMap<GestureId, Action>,
     arm_window_seconds: u32,
     mtp_popup_suppression_enabled: bool,
+    rotation: Rotation,
+    display_brightness_percent: u8,
+    audio_output_device: Option<String>,
+    microphone_input_device: Option<String>,
+    night_mode_gpio_line: Option<u32>,
 }
 
-impl GestureSettings {
+impl HeadUnitSettings {
     /// Double-tap opens settings (the discoverable, always-safe default);
     /// two-finger tap toggles fullscreen; long press cycles rotation; three
     /// of the four swipe directions default to category-switch actions in a
@@ -255,7 +325,7 @@ impl GestureSettings {
         let mut mappings = HashMap::new();
         mappings.insert(GestureId::DoubleTap, Action::OpenSettings);
         mappings.insert(GestureId::TwoFingerTap, Action::ToggleFullscreen);
-        mappings.insert(GestureId::LongPress, Action::CycleRotation);
+        mappings.insert(GestureId::LongPress, Action::FlipScreen);
         mappings.insert(GestureId::SwipeUp, Action::SwitchToNavigation);
         mappings.insert(GestureId::SwipeDown, Action::SwitchToMedia);
         mappings.insert(GestureId::SwipeLeft, Action::SwitchToPhone);
@@ -265,6 +335,11 @@ impl GestureSettings {
             mappings,
             arm_window_seconds: DEFAULT_ARM_WINDOW_SECONDS,
             mtp_popup_suppression_enabled: false,
+            rotation: Rotation::Normal,
+            display_brightness_percent: DEFAULT_DISPLAY_BRIGHTNESS_PERCENT,
+            audio_output_device: None,
+            microphone_input_device: None,
+            night_mode_gpio_line: None,
         }
     }
 
@@ -319,6 +394,85 @@ impl GestureSettings {
         self.mtp_popup_suppression_enabled = enabled;
     }
 
+    /// Defaults to `Normal` — real-hardware-adjustable since M3 (the
+    /// `FlipScreen` gesture action, `AA_HEADUNIT_TOUCH_ROTATION` env
+    /// override) but never persisted across a restart until M5. Live
+    /// changes still apply immediately via `SharedRotation` exactly as
+    /// before; this only adds "and it's remembered next time."
+    #[must_use]
+    pub fn rotation(&self) -> Rotation {
+        self.rotation
+    }
+
+    pub fn set_rotation(&mut self, rotation: Rotation) {
+        self.rotation = rotation;
+    }
+
+    /// Applied whenever the screen is turned back on (`set_screen_power`,
+    /// `auth_discovery_probe.rs`) — `100` (full brightness) by default,
+    /// matching this project's behaviour before M5 introduced a real
+    /// adjustable level at all.
+    #[must_use]
+    pub fn display_brightness_percent(&self) -> u8 {
+        self.display_brightness_percent
+    }
+
+    /// Clamped to [`MIN_DISPLAY_BRIGHTNESS_PERCENT`]..=[`MAX_DISPLAY_BRIGHTNESS_PERCENT`]
+    /// — see those constants' doc comments for why `0` is excluded.
+    pub fn set_display_brightness_percent(&mut self, percent: u8) {
+        self.display_brightness_percent = percent.clamp(
+            MIN_DISPLAY_BRIGHTNESS_PERCENT,
+            MAX_DISPLAY_BRIGHTNESS_PERCENT,
+        );
+    }
+
+    /// `None` (the default) means the system default `PulseAudio` sink —
+    /// this project has never had any other behaviour before M5, so a
+    /// fresh install's actual audio routing is unchanged. `Some(name)`
+    /// is passed straight to `pulsesink`'s `device` property
+    /// (`media_gstreamer::AudioPlaybackPipeline::new`) with no validation
+    /// that `name` actually exists; an invalid name simply fails at
+    /// pipeline start like any other unreachable sink.
+    #[must_use]
+    pub fn audio_output_device(&self) -> Option<&str> {
+        self.audio_output_device.as_deref()
+    }
+
+    pub fn set_audio_output_device(&mut self, device: Option<String>) {
+        self.audio_output_device = device;
+    }
+
+    /// Mirrors [`Self::audio_output_device`] for microphone capture
+    /// (`pulsesrc`'s `device` property,
+    /// `media_gstreamer::MicrophoneCapturePipeline::new`).
+    #[must_use]
+    pub fn microphone_input_device(&self) -> Option<&str> {
+        self.microphone_input_device.as_deref()
+    }
+
+    pub fn set_microphone_input_device(&mut self, device: Option<String>) {
+        self.microphone_input_device = device;
+    }
+
+    /// `None` (the default) means night-mode signaling is disabled — no
+    /// GPIO line is read, and the `NightMode` sensor always reports day
+    /// mode, exactly matching this project's behaviour before this
+    /// setting existed. `Some(line)` is a BCM GPIO line number on
+    /// `platform_linux::gpio::DEFAULT_GPIO_CHIP`, read once per probe
+    /// loop iteration (`sync_night_mode`, `auth_discovery_probe.rs`) to
+    /// detect the car's illumination-wire signal — see
+    /// `platform_linux::gpio`'s doc comment for the required external
+    /// level-shifting hardware (Pi GPIOs are 3.3V logic, not 5V
+    /// tolerant).
+    #[must_use]
+    pub fn night_mode_gpio_line(&self) -> Option<u32> {
+        self.night_mode_gpio_line
+    }
+
+    pub fn set_night_mode_gpio_line(&mut self, line: Option<u32>) {
+        self.night_mode_gpio_line = line;
+    }
+
     /// Loads from `path`; falls back to [`Self::defaults`] on any error
     /// (missing file, unreadable, malformed, or an unrecognized
     /// gesture/action key — forward/backward compatible with a future
@@ -344,6 +498,21 @@ impl GestureSettings {
         if let Some(enabled) = raw.suppress_phone_mtp_popups {
             settings.set_mtp_popup_suppression_enabled(enabled);
         }
+        if let Some(rotation) = raw.rotation_degrees.and_then(rotation_from_degrees) {
+            settings.set_rotation(rotation);
+        }
+        if let Some(percent) = raw.display_brightness_percent {
+            settings.set_display_brightness_percent(percent);
+        }
+        if let Some(device) = raw.audio_output_device {
+            settings.set_audio_output_device(Some(device));
+        }
+        if let Some(device) = raw.microphone_input_device {
+            settings.set_microphone_input_device(Some(device));
+        }
+        if let Some(line) = raw.night_mode_gpio_line {
+            settings.set_night_mode_gpio_line(Some(line));
+        }
         Some(settings)
     }
 
@@ -359,6 +528,13 @@ impl GestureSettings {
         }
         raw.arm_window_seconds = Some(self.arm_window_seconds);
         raw.suppress_phone_mtp_popups = Some(self.mtp_popup_suppression_enabled);
+        raw.rotation_degrees = Some(rotation_to_degrees(self.rotation));
+        raw.display_brightness_percent = Some(self.display_brightness_percent);
+        raw.audio_output_device
+            .clone_from(&self.audio_output_device);
+        raw.microphone_input_device
+            .clone_from(&self.microphone_input_device);
+        raw.night_mode_gpio_line = self.night_mode_gpio_line;
         let text = toml::to_string_pretty(&raw)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         if let Some(parent) = path.parent() {
@@ -374,7 +550,7 @@ mod tests {
 
     #[test]
     fn defaults_assign_every_gesture_a_functional_action() {
-        let settings = GestureSettings::defaults();
+        let settings = HeadUnitSettings::defaults();
         assert_eq!(
             settings.action_for(GestureId::DoubleTap),
             Action::OpenSettings
@@ -385,7 +561,7 @@ mod tests {
         );
         assert_eq!(
             settings.action_for(GestureId::LongPress),
-            Action::CycleRotation
+            Action::FlipScreen
         );
         assert_eq!(
             settings.action_for(GestureId::SwipeUp),
@@ -429,7 +605,7 @@ mod tests {
         );
         assert_eq!(Action::OpenSettings.key_code(), None);
         assert_eq!(Action::ToggleFullscreen.key_code(), None);
-        assert_eq!(Action::CycleRotation.key_code(), None);
+        assert_eq!(Action::FlipScreen.key_code(), None);
         assert_eq!(Action::ScreenOff.key_code(), None);
     }
 
@@ -441,11 +617,11 @@ mod tests {
         ));
         let path = dir.join("settings.toml");
 
-        let mut settings = GestureSettings::defaults();
+        let mut settings = HeadUnitSettings::defaults();
         settings.set_action(GestureId::Circle, Action::OpenSettings);
         settings.save(&path).expect("save succeeds");
 
-        let loaded = GestureSettings::load(&path);
+        let loaded = HeadUnitSettings::load(&path);
         assert_eq!(loaded.action_for(GestureId::Circle), Action::OpenSettings);
 
         let _ = fs::remove_dir_all(&dir);
@@ -459,11 +635,11 @@ mod tests {
         ));
         let path = dir.join("settings.toml");
 
-        let mut settings = GestureSettings::defaults();
+        let mut settings = HeadUnitSettings::defaults();
         settings.set_action(GestureId::SwipeUp, Action::SwitchToRadio);
         settings.save(&path).expect("save succeeds");
 
-        let loaded = GestureSettings::load(&path);
+        let loaded = HeadUnitSettings::load(&path);
         assert_eq!(loaded.action_for(GestureId::SwipeUp), Action::SwitchToRadio);
 
         let _ = fs::remove_dir_all(&dir);
@@ -477,15 +653,12 @@ mod tests {
         ));
         let path = dir.join("settings.toml");
 
-        let mut settings = GestureSettings::defaults();
-        settings.set_action(GestureId::DoubleTap, Action::CycleRotation);
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_action(GestureId::DoubleTap, Action::FlipScreen);
         settings.save(&path).expect("save succeeds");
 
-        let loaded = GestureSettings::load(&path);
-        assert_eq!(
-            loaded.action_for(GestureId::DoubleTap),
-            Action::CycleRotation
-        );
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.action_for(GestureId::DoubleTap), Action::FlipScreen);
         // Untouched mappings still round-trip correctly.
         assert_eq!(
             loaded.action_for(GestureId::TwoFingerTap),
@@ -497,7 +670,7 @@ mod tests {
 
     #[test]
     fn mtp_popup_suppression_defaults_off_and_round_trips_on() {
-        let defaults = GestureSettings::defaults();
+        let defaults = HeadUnitSettings::defaults();
         assert!(!defaults.mtp_popup_suppression_enabled());
 
         let dir = std::env::temp_dir().join(format!(
@@ -506,11 +679,11 @@ mod tests {
         ));
         let path = dir.join("settings.toml");
 
-        let mut settings = GestureSettings::defaults();
+        let mut settings = HeadUnitSettings::defaults();
         settings.set_mtp_popup_suppression_enabled(true);
         settings.save(&path).expect("save succeeds");
 
-        let loaded = GestureSettings::load(&path);
+        let loaded = HeadUnitSettings::load(&path);
         assert!(loaded.mtp_popup_suppression_enabled());
 
         let _ = fs::remove_dir_all(&dir);
@@ -519,8 +692,8 @@ mod tests {
     #[test]
     fn load_falls_back_to_defaults_when_the_file_is_missing() {
         let path = Path::new("/nonexistent/aa-headunit-settings-test.toml");
-        let settings = GestureSettings::load(path);
-        assert_eq!(settings, GestureSettings::defaults());
+        let settings = HeadUnitSettings::load(path);
+        assert_eq!(settings, HeadUnitSettings::defaults());
     }
 
     #[test]
@@ -533,8 +706,8 @@ mod tests {
         let path = dir.join("settings.toml");
         fs::write(&path, "not valid toml {{{").expect("write succeeds");
 
-        let settings = GestureSettings::load(&path);
-        assert_eq!(settings, GestureSettings::defaults());
+        let settings = HeadUnitSettings::load(&path);
+        assert_eq!(settings, HeadUnitSettings::defaults());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -547,12 +720,12 @@ mod tests {
         ));
         let path = dir.join("settings.toml");
 
-        let mut settings = GestureSettings::defaults();
+        let mut settings = HeadUnitSettings::defaults();
         assert_eq!(settings.arm_window_seconds(), DEFAULT_ARM_WINDOW_SECONDS);
         settings.set_arm_window_seconds(10);
         settings.save(&path).expect("save succeeds");
 
-        let loaded = GestureSettings::load(&path);
+        let loaded = HeadUnitSettings::load(&path);
         assert_eq!(loaded.arm_window_seconds(), 10);
 
         let _ = fs::remove_dir_all(&dir);
@@ -560,7 +733,7 @@ mod tests {
 
     #[test]
     fn arm_window_seconds_clamps_to_the_allowed_range() {
-        let mut settings = GestureSettings::defaults();
+        let mut settings = HeadUnitSettings::defaults();
         settings.set_arm_window_seconds(0);
         assert_eq!(settings.arm_window_seconds(), MIN_ARM_WINDOW_SECONDS);
         settings.set_arm_window_seconds(1000);
@@ -572,5 +745,105 @@ mod tests {
         assert_eq!(gesture_label(GestureId::DoubleTap), "Double-tap");
         assert_eq!(gesture_label(GestureId::TwoFingerTap), "Two-finger tap");
         assert_eq!(gesture_label(GestureId::LongPress), "Long press");
+    }
+
+    #[test]
+    fn rotation_defaults_to_zero_and_round_trips() {
+        let defaults = HeadUnitSettings::defaults();
+        assert_eq!(defaults.rotation(), Rotation::Normal);
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-rotation-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_rotation(Rotation::Flipped180);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.rotation(), Rotation::Flipped180);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_brightness_defaults_full_and_clamps_and_round_trips() {
+        let defaults = HeadUnitSettings::defaults();
+        assert_eq!(
+            defaults.display_brightness_percent(),
+            DEFAULT_DISPLAY_BRIGHTNESS_PERCENT
+        );
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_display_brightness_percent(0);
+        assert_eq!(
+            settings.display_brightness_percent(),
+            MIN_DISPLAY_BRIGHTNESS_PERCENT
+        );
+        settings.set_display_brightness_percent(255);
+        assert_eq!(
+            settings.display_brightness_percent(),
+            MAX_DISPLAY_BRIGHTNESS_PERCENT
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-brightness-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+        settings.set_display_brightness_percent(42);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.display_brightness_percent(), 42);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_and_microphone_devices_default_to_system_default_and_round_trip() {
+        let defaults = HeadUnitSettings::defaults();
+        assert_eq!(defaults.audio_output_device(), None);
+        assert_eq!(defaults.microphone_input_device(), None);
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-devices-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_audio_output_device(Some("alsa_output.example".to_string()));
+        settings.set_microphone_input_device(Some("alsa_input.example".to_string()));
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.audio_output_device(), Some("alsa_output.example"));
+        assert_eq!(loaded.microphone_input_device(), Some("alsa_input.example"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn night_mode_gpio_line_defaults_to_disabled_and_round_trips() {
+        let defaults = HeadUnitSettings::defaults();
+        assert_eq!(defaults.night_mode_gpio_line(), None);
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-night-mode-gpio-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_night_mode_gpio_line(Some(17));
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.night_mode_gpio_line(), Some(17));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

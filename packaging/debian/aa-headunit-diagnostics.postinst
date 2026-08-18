@@ -19,6 +19,49 @@ case "$1" in
         if ! getent group aa-headunit >/dev/null 2>&1; then
             addgroup --system aa-headunit
         fi
+        # M5: a dedicated, unprivileged system user for the appliance
+        # service itself (ARCHITECTURE.md §8), distinct from the
+        # interactive-operator group-membership model above (still used
+        # for the human-run diagnostics CLI). No login shell, no created
+        # home directory (state already lives in /var/lib/aa-headunit,
+        # which this account joins via its primary group like any other
+        # `aa-headunit` group member). Supplementary groups are narrow —
+        # exactly what this app has ever actually needed on real
+        # hardware: `video` (backlight brightness), `plugdev` (USB, the
+        # existing `70-aa-headunit.rules` grants this group access),
+        # `render` (GPU/Wayland), `input` (evdev touch), `gpio`
+        # (`/dev/gpiochip*`, the M5 night-mode GPIO input — Raspberry Pi
+        # OS's own default udev rules already grant this group access to
+        # the chardev, so no project-owned udev rule is needed here,
+        # unlike `plugdev`/USB). `adduser <user> <group>` is idempotent
+        # on Debian (a no-op with exit 0 if already a member), safe to
+        # re-run on every upgrade.
+        if ! getent passwd aa-headunit >/dev/null 2>&1; then
+            adduser --system --ingroup aa-headunit --no-create-home \
+                --home /var/lib/aa-headunit --shell /usr/sbin/nologin \
+                aa-headunit
+        fi
+        for supplementary_group in video plugdev render input gpio; do
+            if getent group "$supplementary_group" >/dev/null 2>&1; then
+                adduser aa-headunit "$supplementary_group"
+            fi
+        done
+        # PipeWire/Wayland need a real user session (XDG_RUNTIME_DIR,
+        # a systemd --user instance) — lingering starts one at boot
+        # without an interactive login, matching how the *human*
+        # operator's own already-working audio path depends on owning
+        # their session's XDG_RUNTIME_DIR (see the note above this
+        # case statement). Not yet exercised end-to-end on real
+        # hardware — the actual systemd units that will run as this
+        # user are a separate, not-yet-built M5 item
+        # (`MILESTONE_CHECKLIST.md`, "preflight and main systemd
+        # services"). Credential access for this user is *not* set up
+        # here — `docs/development/credential-provisioning.md` has the
+        # ownership-migration steps for when that's needed, and this
+        # script never touches real credential file ownership itself.
+        if command -v loginctl >/dev/null 2>&1; then
+            loginctl enable-linger aa-headunit || true
+        fi
         if [ -d /etc/aa-headunit ]; then
             chown root:aa-headunit /etc/aa-headunit
             chmod 0770 /etc/aa-headunit

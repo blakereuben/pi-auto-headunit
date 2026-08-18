@@ -64,16 +64,27 @@ pub struct MicrophoneCapturePipeline {
 }
 
 impl MicrophoneCapturePipeline {
+    /// `device`, when set, names a specific `PulseAudio` source to
+    /// capture from instead of the system default — ignored for
+    /// `AudioCaptureSource::Test`. M5's persisted `microphone_input_device`
+    /// setting (`crate::settings`) is this project's only source for it;
+    /// see `AudioPlaybackPipeline::new`'s matching doc comment for why no
+    /// validation happens here.
     pub(crate) fn new(
         format: AudioFormat,
         source: AudioCaptureSource,
+        device: Option<&str>,
     ) -> Result<Self, GstreamerError> {
         let source_element = match source {
             AudioCaptureSource::Pulse => "pulsesrc".to_string(),
             AudioCaptureSource::Test => "audiotestsrc is-live=true".to_string(),
         };
+        let device_property = match (source, device) {
+            (AudioCaptureSource::Pulse, Some(device)) => format!(" device=\"{device}\""),
+            _ => String::new(),
+        };
         let description = format!(
-            "{source_element} ! audioconvert ! audioresample \
+            "{source_element}{device_property} ! audioconvert ! audioresample \
              ! audio/x-raw,format=S16LE,rate={},channels={},layout=interleaved \
              ! appsink name=sink emit-signals=false sync=false",
             format.sampling_rate, format.channels,
@@ -221,7 +232,7 @@ mod tests {
     fn captures_real_pcm_buffers_from_a_synthetic_test_source() {
         let backend = GstreamerBackend::new().expect("gstreamer available on this host");
         let pipeline = backend
-            .build_microphone_capture_pipeline(capture_format(), AudioCaptureSource::Test)
+            .build_microphone_capture_pipeline(capture_format(), AudioCaptureSource::Test, None)
             .expect("pipeline builds");
         pipeline.start().expect("pipeline starts");
 
@@ -239,7 +250,7 @@ mod tests {
     fn try_recv_is_none_without_a_running_pipeline() {
         let backend = GstreamerBackend::new().expect("gstreamer available on this host");
         let pipeline = backend
-            .build_microphone_capture_pipeline(capture_format(), AudioCaptureSource::Test)
+            .build_microphone_capture_pipeline(capture_format(), AudioCaptureSource::Test, None)
             .expect("pipeline builds");
         // Never started (still Null): no samples will ever arrive.
         assert!(pipeline.try_recv().is_none());

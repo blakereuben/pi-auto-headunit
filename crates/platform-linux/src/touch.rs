@@ -68,42 +68,36 @@ pub fn discover_touchscreen() -> io::Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// How the touch panel is physically mounted relative to how video is
-/// rendered, matching Wayland's `wl_output.transform` convention (rotation
-/// is anti-clockwise) so a compositor-side `wlr-randr --transform` and this
-/// rotation can be set to the same value and stay visually consistent.
-/// `Rotate90`/`Rotate270` swap which raw axis feeds the target X vs Y
-/// coordinate; all four also reverse one or both axes as needed so the
-/// rotated mapping still lands on the correct rendered pixel. Real-hardware
-/// verification of anything but `Rotate0` needs the DSI panel actually
-/// mounted rotated (not available on this project's reference rig — see
-/// `MILESTONE_CHECKLIST.md` M3's touch item) or a software-only check:
-/// rotate the Wayland output digitally (`wlr-randr --transform`) to match,
-/// then confirm taps land correctly.
+/// Whether the touch panel is physically mounted upside down relative to
+/// how video is rendered. Originally four values (0/90/180/270, matching
+/// Wayland's `wl_output.transform` convention), reduced to two
+/// (2026-08-18, real-hardware finding): this project's reference DSI
+/// panel is a fixed-aspect-ratio landscape mount with no way to reorient
+/// into portrait, so 90°/270° never had a coherent use case — rotating
+/// only touch input, with no matching way to reflow the video into
+/// portrait too, was "pointless on its own" (the operator's own words,
+/// after seeing it real-hardware-confirmed working exactly as specified
+/// and still not being useful). A 180° upside-down mount is the one
+/// realistic scenario for hardware shaped like this, so that's the only
+/// non-identity case kept.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Rotation {
-    Rotate0,
-    Rotate90,
-    Rotate180,
-    Rotate270,
+    Normal,
+    Flipped180,
 }
 
 impl Rotation {
     fn encode(self) -> u8 {
         match self {
-            Self::Rotate0 => 0,
-            Self::Rotate90 => 1,
-            Self::Rotate180 => 2,
-            Self::Rotate270 => 3,
+            Self::Normal => 0,
+            Self::Flipped180 => 1,
         }
     }
 
     fn decode(value: u8) -> Self {
         match value {
-            1 => Self::Rotate90,
-            2 => Self::Rotate180,
-            3 => Self::Rotate270,
-            _ => Self::Rotate0,
+            1 => Self::Flipped180,
+            _ => Self::Normal,
         }
     }
 }
@@ -127,7 +121,15 @@ impl SharedRotation {
         self.0.store(rotation.encode(), Ordering::SeqCst);
     }
 
-    fn get(&self) -> Rotation {
+    /// Real-hardware-required (2026-08-18): touch-only rotation was
+    /// pointless on its own (the operator: "if the video cannot rotate
+    /// then there is no point in rotating touch") — the background
+    /// protocol thread now also applies the same value to the video
+    /// pipeline (`media_gstreamer::VideoRenderPipeline::set_rotation_degrees`),
+    /// which needs to read the current value back, not just push new
+    /// ones — hence `pub`.
+    #[must_use]
+    pub fn get(&self) -> Rotation {
         Rotation::decode(self.0.load(Ordering::SeqCst))
     }
 }
@@ -247,25 +249,19 @@ impl AxisScale {
     }
 
     /// Builds the correctly-tagged event for a raw `ABS_MT_POSITION_X`
-    /// sample. Under `Rotate0`/`Rotate180` this still feeds the target X
-    /// coordinate; under `Rotate90`/`Rotate270` the raw X axis actually
-    /// determines the target *Y* coordinate instead, since the panel's own
-    /// X/Y axes are swapped relative to the rendered video once rotated —
-    /// see [`Rotation`]'s doc comment. Reads the current rotation fresh on
-    /// every call, so a live change via [`SharedRotation::set`] takes
-    /// effect on the very next sample.
+    /// sample — identity under `Normal`, reversed under `Flipped180` (a
+    /// point reflection, matching a real 180° upside-down mount; no axis
+    /// swap, unlike the removed 90°/270° cases — see [`Rotation`]'s doc
+    /// comment). Reads the current rotation fresh on every call, so a live
+    /// change via [`SharedRotation::set`] takes effect on the very next
+    /// sample.
     fn event_for_position_x(&self, raw: i32) -> RawTouchEvent {
         let scaled_to_width = scale(raw, self.x_min, self.x_span, self.target_width);
-        let scaled_to_height = scale(raw, self.x_min, self.x_span, self.target_height);
         match self.rotation.get() {
-            Rotation::Rotate0 => RawTouchEvent::PositionX(scaled_to_width),
-            Rotation::Rotate180 => {
+            Rotation::Normal => RawTouchEvent::PositionX(scaled_to_width),
+            Rotation::Flipped180 => {
                 RawTouchEvent::PositionX(reverse(scaled_to_width, self.target_width))
             }
-            Rotation::Rotate90 => {
-                RawTouchEvent::PositionY(reverse(scaled_to_height, self.target_height))
-            }
-            Rotation::Rotate270 => RawTouchEvent::PositionY(scaled_to_height),
         }
     }
 
@@ -273,15 +269,10 @@ impl AxisScale {
     /// sample.
     fn event_for_position_y(&self, raw: i32) -> RawTouchEvent {
         let scaled_to_height = scale(raw, self.y_min, self.y_span, self.target_height);
-        let scaled_to_width = scale(raw, self.y_min, self.y_span, self.target_width);
         match self.rotation.get() {
-            Rotation::Rotate0 => RawTouchEvent::PositionY(scaled_to_height),
-            Rotation::Rotate180 => {
+            Rotation::Normal => RawTouchEvent::PositionY(scaled_to_height),
+            Rotation::Flipped180 => {
                 RawTouchEvent::PositionY(reverse(scaled_to_height, self.target_height))
-            }
-            Rotation::Rotate90 => RawTouchEvent::PositionX(scaled_to_width),
-            Rotation::Rotate270 => {
-                RawTouchEvent::PositionX(reverse(scaled_to_width, self.target_width))
             }
         }
     }
@@ -390,8 +381,8 @@ mod tests {
     }
 
     #[test]
-    fn rotate0_leaves_axes_unchanged() {
-        let scale = axis_scale(Rotation::Rotate0);
+    fn normal_leaves_axes_unchanged() {
+        let scale = axis_scale(Rotation::Normal);
         assert_eq!(scale.event_for_position_x(0), RawTouchEvent::PositionX(0));
         assert_eq!(
             scale.event_for_position_x(4095),
@@ -405,8 +396,8 @@ mod tests {
     }
 
     #[test]
-    fn rotate180_reverses_both_axes_without_swapping_them() {
-        let scale = axis_scale(Rotation::Rotate180);
+    fn flipped180_reverses_both_axes_without_swapping_them() {
+        let scale = axis_scale(Rotation::Flipped180);
         assert_eq!(scale.event_for_position_x(0), RawTouchEvent::PositionX(799));
         assert_eq!(
             scale.event_for_position_x(4095),
@@ -420,58 +411,21 @@ mod tests {
     }
 
     #[test]
-    fn rotate90_swaps_axes() {
-        let scale = axis_scale(Rotation::Rotate90);
-        // Raw X now determines target Y, raw Y now determines target X.
-        assert_eq!(scale.event_for_position_x(0), RawTouchEvent::PositionY(479));
-        assert_eq!(
-            scale.event_for_position_x(4095),
-            RawTouchEvent::PositionY(0)
-        );
-        assert_eq!(scale.event_for_position_y(0), RawTouchEvent::PositionX(0));
-        assert_eq!(
-            scale.event_for_position_y(4095),
-            RawTouchEvent::PositionX(799)
-        );
-    }
-
-    #[test]
-    fn rotate270_swaps_axes_the_other_way_from_rotate90() {
-        let scale = axis_scale(Rotation::Rotate270);
-        assert_eq!(scale.event_for_position_x(0), RawTouchEvent::PositionY(0));
-        assert_eq!(
-            scale.event_for_position_x(4095),
-            RawTouchEvent::PositionY(479)
-        );
-        assert_eq!(scale.event_for_position_y(0), RawTouchEvent::PositionX(799));
-        assert_eq!(
-            scale.event_for_position_y(4095),
-            RawTouchEvent::PositionX(0)
-        );
-    }
-
-    #[test]
-    fn all_four_rotations_are_pairwise_distinct_for_the_same_input() {
+    fn both_rotations_are_distinct_for_the_same_input() {
         // A real regression this guards against: accidentally implementing
-        // two rotation cases identically (e.g. copy-paste leaving Rotate270
-        // behaving like Rotate90) would silently pass every other test
-        // above, since each is checked in isolation.
+        // both cases identically would silently pass either test above in
+        // isolation.
         let corner = (4095, 0);
-        let outputs: Vec<(RawTouchEvent, RawTouchEvent)> = [
-            Rotation::Rotate0,
-            Rotation::Rotate90,
-            Rotation::Rotate180,
-            Rotation::Rotate270,
-        ]
-        .into_iter()
-        .map(|rotation| {
-            let scale = axis_scale(rotation);
-            (
-                scale.event_for_position_x(corner.0),
-                scale.event_for_position_y(corner.1),
-            )
-        })
-        .collect();
+        let outputs: Vec<(RawTouchEvent, RawTouchEvent)> = [Rotation::Normal, Rotation::Flipped180]
+            .into_iter()
+            .map(|rotation| {
+                let scale = axis_scale(rotation);
+                (
+                    scale.event_for_position_x(corner.0),
+                    scale.event_for_position_y(corner.1),
+                )
+            })
+            .collect();
         for (index, pair) in outputs.iter().enumerate() {
             for (other_index, other_pair) in outputs.iter().enumerate() {
                 if index != other_index {

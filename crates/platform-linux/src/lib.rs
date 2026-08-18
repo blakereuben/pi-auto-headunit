@@ -6,6 +6,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+pub mod gpio;
 pub mod touch;
 
 #[must_use]

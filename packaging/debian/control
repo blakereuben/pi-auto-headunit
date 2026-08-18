@@ -26,7 +26,8 @@ Depends:
  libusb-1.0-0,
  gstreamer1.0-libav,
  gstreamer1.0-plugins-bad,
- gstreamer1.0-plugins-base
+ gstreamer1.0-plugins-base,
+ pulseaudio-utils
 Description: Raspberry Pi head-unit milestone diagnostics
  Platform, wireless-provider, USB/AOA, and media capability diagnostics for the
  Raspberry Pi head-unit project. This package does not implement an Android

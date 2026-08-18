@@ -67,15 +67,31 @@ pub struct AudioPlaybackPipeline {
 }
 
 impl AudioPlaybackPipeline {
-    pub(crate) fn new(format: AudioFormat, sink: AudioSink) -> Result<Self, GstreamerError> {
+    /// `device`, when set, names a specific `PulseAudio` sink to play
+    /// through instead of the system default — ignored for
+    /// `AudioSink::Fake`. M5's persisted `audio_output_device` setting
+    /// (`crate::settings`) is this project's only source for it; no
+    /// validation happens here that the named device actually exists —
+    /// an invalid name simply fails at `start()` like any other
+    /// unreachable sink (`AudioPlaybackState`'s existing "never aborts
+    /// the probe" discipline already covers that).
+    pub(crate) fn new(
+        format: AudioFormat,
+        sink: AudioSink,
+        device: Option<&str>,
+    ) -> Result<Self, GstreamerError> {
         let sink_element = match sink {
             AudioSink::Pulse => "pulsesink",
             AudioSink::Fake => "fakesink",
         };
+        let device_property = match (sink, device) {
+            (AudioSink::Pulse, Some(device)) => format!(" device=\"{device}\""),
+            _ => String::new(),
+        };
         let description = format!(
             "appsrc name=src is-live=true format=time \
              caps=\"audio/x-raw,format=S16LE,rate={},channels={},layout=interleaved\" \
-             ! audioconvert ! audioresample ! {sink_element} sync=false",
+             ! audioconvert ! audioresample ! {sink_element}{device_property} sync=false",
             format.sampling_rate, format.channels,
         );
         let element = gst::parse::launch(&description)
@@ -226,7 +242,7 @@ mod tests {
         let backend = GstreamerBackend::new().expect("gstreamer available on this host");
         let format = media_audio_format();
         let pipeline = backend
-            .build_audio_playback_pipeline(format, AudioSink::Fake)
+            .build_audio_playback_pipeline(format, AudioSink::Fake, None)
             .expect("pipeline builds");
         pipeline.start().expect("pipeline starts");
 

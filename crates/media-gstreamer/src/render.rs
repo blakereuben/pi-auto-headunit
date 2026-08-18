@@ -49,6 +49,7 @@ pub enum RenderSink {
 pub struct VideoRenderPipeline {
     pipeline: gst::Pipeline,
     appsrc: gst_app::AppSrc,
+    flip: gst::Element,
 }
 
 impl VideoRenderPipeline {
@@ -75,10 +76,25 @@ impl VideoRenderPipeline {
             RenderSink::Fake => "fakesink".to_string(),
             RenderSink::Gtk4Paintable => "gtk4paintablesink name=gtk_paintable_sink".to_string(),
         };
+        // `videoflip name=flip` sits between the decoder's raw output and
+        // the sink — real-hardware-required (2026-08-18): the existing
+        // touch-rotation setting (`platform_linux::touch::Rotation`,
+        // `settings::HeadUnitSettings::rotation`) only ever remapped touch
+        // coordinates, never the video image itself, which the operator
+        // correctly identified as pointless on its own ("if the video
+        // cannot rotate then there is no point in rotating touch") — a
+        // physically-rotated screen mount needs both to move together.
+        // `video-direction` (not the deprecated `method` property) is
+        // `controllable, changeable in NULL, READY, PAUSED or PLAYING
+        // state` (`gst-inspect-1.0 videoflip`), so `set_rotation_degrees`
+        // can retune it on an already-`Playing` pipeline with no rebuild —
+        // matching `SharedRotation`'s existing live-adjustable touch
+        // rotation exactly.
         let description = format!(
             "appsrc name=src is-live=true format=time \
              caps=\"{}\" \
-             ! {} ! {} ! {} ! {sink_element} sync=false",
+             ! {} ! {} ! {} ! videoflip name=flip video-direction=identity \
+             ! {sink_element} sync=false",
             elements.caps, elements.parser, elements.decoder, elements.converter,
         );
         let element = gst::parse::launch(&description)
@@ -99,7 +115,33 @@ impl VideoRenderPipeline {
             .map_err(|_| {
                 GstreamerError::PipelineConstruction("\"src\" was not an AppSrc".into())
             })?;
-        Ok(Self { pipeline, appsrc })
+        let flip = pipeline.by_name("flip").ok_or_else(|| {
+            GstreamerError::PipelineConstruction(
+                "videoflip element \"flip\" missing after parse".into(),
+            )
+        })?;
+        Ok(Self {
+            pipeline,
+            appsrc,
+            flip,
+        })
+    }
+
+    /// Rotates the rendered video to match [`Rotation`]'s own two states
+    /// (`platform_linux::touch::Rotation` — this crate doesn't depend on
+    /// `platform-linux`, so the caller converts to plain degrees rather
+    /// than this crate taking that type on directly; only `0`/`180` are
+    /// ever passed — `Rotation` itself has no 90°/270° variants to send
+    /// since 2026-08-18, see its own doc comment). Safe to call at any
+    /// pipeline state, including `Playing` — see the constructor's doc
+    /// comment on `video-direction`. Any value other than `0`/`180` is a
+    /// caller bug, so this silently falls back to `"identity"` rather than
+    /// erroring — matching this crate's existing "hardware side effects
+    /// never abort a live session" discipline, not a case worth a
+    /// `Result`.
+    pub fn set_rotation_degrees(&self, degrees: u16) {
+        let value = if degrees == 180 { "180" } else { "identity" };
+        self.flip.set_property_from_str("video-direction", value);
     }
 
     /// Starts the pipeline (`Playing`). For `RenderSink::Wayland`, this is

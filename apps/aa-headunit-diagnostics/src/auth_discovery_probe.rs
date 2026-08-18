@@ -462,6 +462,7 @@ use media_gstreamer::{
     GstreamerError, MicrophoneCapturePipeline, RenderSink, VideoRenderPipeline,
 };
 use platform_api::{ArmedGestureDetector, GestureEvent, TouchPhase};
+use platform_linux::gpio::{DEFAULT_GPIO_CHIP, NightModeGpioSource};
 use platform_linux::touch::{EvdevTouchSource, Rotation, SharedRotation, discover_touchscreen};
 use protocol_aap::{
     AASDK_MAX_FRAME_PAYLOAD_SIZE, AudioCapability, AudioFocusRequestType, AudioFocusStateType,
@@ -674,14 +675,14 @@ const REACTIVE_TRIGGERED_PROACTIVE_SEND_ENV_VAR: &str =
 /// set this explicitly should learn immediately if it didn't take effect,
 /// rather than unknowingly running the default short window instead.
 const OBSERVATION_WINDOW_SECONDS_ENV_VAR: &str = "AA_HEADUNIT_OBSERVATION_WINDOW_SECONDS";
-/// Opt-in, off-by-default touch rotation override (`0`/`90`/`180`/`270`,
-/// `wl_output.transform` convention — see `platform_linux::touch::Rotation`).
-/// `MILESTONE_CHECKLIST.md` M3's "verify touch rotation ... in every
-/// supported screen orientation" needs a way to exercise rotations other
-/// than the reference rig's actual physical mounting (`Rotate0`); this env
-/// var is that way, matching `OBSERVATION_WINDOW_SECONDS_ENV_VAR`'s
+/// Opt-in, off-by-default touch/video rotation override (`0`/`180` only —
+/// see `platform_linux::touch::Rotation`'s doc comment for why 90°/270°
+/// were dropped 2026-08-18). `MILESTONE_CHECKLIST.md` M3's "verify touch
+/// rotation ... in every supported screen orientation" needs a way to
+/// exercise the flipped mounting without physically remounting the panel;
+/// this env var is that way, matching `OBSERVATION_WINDOW_SECONDS_ENV_VAR`'s
 /// established pattern for an opt-in real-hardware experiment knob. Unset
-/// defaults to `Rotate0` (current behavior, unchanged); an unparseable
+/// defaults to `Normal` (current behavior, unchanged); an unparseable
 /// value is a hard usage error, not a silent fallback, for the same reason
 /// `read_observation_window_override` treats one as an error.
 const TOUCH_ROTATION_ENV_VAR: &str = "AA_HEADUNIT_TOUCH_ROTATION";
@@ -851,7 +852,7 @@ pub(crate) struct Gtk4WindowHandoff {
 /// [`platform_api::SharedArmWindow`] handle so the settings panel's
 /// timeout control has something to change. `gesture_sender` fires every
 /// time `ArmedGestureDetector` reports an armed/disarmed/completed event;
-/// the GTK thread owns `gesture_settings::GestureSettings` and decides
+/// the GTK thread owns `settings::HeadUnitSettings` and decides
 /// what a completed gesture actually does, since that mapping is
 /// head-unit/UI policy, not something the protocol/touch layer should
 /// know about — it only needs the armed/disarmed events to show/hide its
@@ -1123,17 +1124,15 @@ fn read_experiment_flags() -> Result<ExperimentFlags, CliError> {
 /// Parses `TOUCH_ROTATION_ENV_VAR` — see that constant's doc comment.
 fn read_touch_rotation() -> Result<Rotation, CliError> {
     let Some(value) = std::env::var_os(TOUCH_ROTATION_ENV_VAR) else {
-        return Ok(Rotation::Rotate0);
+        return Ok(Rotation::Normal);
     };
     let text = value.to_str().unwrap_or("");
     let rotation = match text {
-        "0" => Rotation::Rotate0,
-        "90" => Rotation::Rotate90,
-        "180" => Rotation::Rotate180,
-        "270" => Rotation::Rotate270,
+        "0" => Rotation::Normal,
+        "180" => Rotation::Flipped180,
         _ => {
             return Err(CliError::Usage(format!(
-                "{TOUCH_ROTATION_ENV_VAR} must be one of 0, 90, 180, 270"
+                "{TOUCH_ROTATION_ENV_VAR} must be one of 0, 180"
             )));
         }
     };
@@ -1256,6 +1255,16 @@ pub fn run<T: SessionTransport>(
     let touch_settings = touch_settings_handoff(&video_render_target);
     let mut gesture_detector = setup_settings_gesture(touch_source.as_ref(), touch_settings);
     let mut screen_power = ScreenPowerState::On;
+    // Tracks the rotation last pushed to the video pipeline so
+    // `sync_video_rotation` only calls `set_rotation_degrees` on an
+    // actual change, not every loop iteration — see that function's doc
+    // comment.
+    let mut last_applied_video_rotation = Rotation::Normal;
+    let night_mode_gpio = open_night_mode_gpio_source();
+    // `None` until the sensors channel opens and the first real GPIO
+    // read happens — see `sync_night_mode`'s doc comment for why that
+    // first read always sends regardless of its value.
+    let mut last_applied_night_mode: Option<bool> = None;
 
     while Instant::now() < deadline && !cancel.is_set() {
         let size = match transport.receive(&mut read_buffer) {
@@ -1303,6 +1312,10 @@ pub fn run<T: SessionTransport>(
             &mut microphone_channel,
             &mut media_pipelines,
             &mut screen_power,
+            &mut last_applied_video_rotation,
+            night_mode_gpio.as_ref(),
+            sensors_channel.as_ref(),
+            &mut last_applied_night_mode,
             transport,
             &mut tls,
             limits,
@@ -1996,6 +2009,91 @@ fn service_ping<T: SessionTransport>(
     Ok(())
 }
 
+/// Keeps the video pipeline's own rotation in sync with the touch
+/// reader's `SharedRotation` — the single source of truth both the
+/// settings panel (`gtk_dev_ui.rs`, live touch remap) and this function
+/// (live video rotation) read from, so they can never drift apart.
+/// `last_applied` (a `run()`-scoped local, not re-derived each call)
+/// means `VideoRenderPipeline::set_rotation_degrees` only runs on an
+/// actual change, not every loop iteration — a plain `Ordering::SeqCst`
+/// atomic load either way, so the check itself is cheap, but there's no
+/// reason to call into `GStreamer` when nothing changed. A no-op on the
+/// plain `Wayland` target (no touchscreen/rotation there) and while the
+/// video pipeline hasn't started yet (`VideoRenderState::Running` is the
+/// only state holding a real `VideoRenderPipeline`).
+fn sync_video_rotation(
+    touch_source: Option<&EvdevTouchSource>,
+    video_render: &VideoRenderState,
+    last_applied: &mut Rotation,
+) {
+    let (Some(touch_source), VideoRenderState::Running(pipeline)) = (touch_source, video_render)
+    else {
+        return;
+    };
+    let current = touch_source.rotation_handle().get();
+    if current == *last_applied {
+        return;
+    }
+    let degrees = crate::settings::rotation_to_degrees(current);
+    pipeline.set_rotation_degrees(degrees);
+    println!("probe_state=video_rotation_applied degrees={degrees}");
+    *last_applied = current;
+}
+
+/// Keeps the phone's `NightMode` sensor state in sync with the
+/// configured GPIO line, read fresh once per loop iteration (a cheap
+/// ioctl on an already-open character-device fd — see
+/// `platform_linux::gpio`). Only sends an unsolicited `SensorBatch` when
+/// the reading actually changes from `last_applied` and the sensors
+/// channel is already `Open` — a no-op before the phone has opened it
+/// (in which case `handle_sensors_channel_message`'s own `SensorRequest`
+/// response, sent once the channel does open, is what first tells the
+/// phone the day/night state — see its doc comment for why that initial
+/// response stays a fixed default rather than also reading GPIO: this
+/// function corrects it within the same loop iteration if it was
+/// already stale at that instant). `last_applied` starts `None`
+/// (`run()`), which never equals a real `Some(bool)` reading, so the
+/// first GPIO read after the channel opens always sends — establishing
+/// the phone's initial state — even if that first real reading happens
+/// to be `false`/day.
+fn sync_night_mode<T: SessionTransport>(
+    gpio_source: Option<&NightModeGpioSource>,
+    sensors_channel: Option<&SensorsChannel>,
+    last_applied: &mut Option<bool>,
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
+) -> Result<(), CliError> {
+    let (Some(gpio_source), Some(SensorsChannel::Open)) = (gpio_source, sensors_channel) else {
+        return Ok(());
+    };
+    let is_night = match gpio_source.is_active() {
+        Ok(is_night) => is_night,
+        Err(error) => {
+            println!("probe_state=night_mode_gpio_read_failed error={error}");
+            return Ok(());
+        }
+    };
+    if *last_applied == Some(is_night) {
+        return Ok(());
+    }
+    let batch = encode_night_mode_batch(is_night);
+    let payload = batch
+        .encode(DEFAULT_MAX_SENSOR_MESSAGE_BODY_SIZE)
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    send_encrypted(
+        transport,
+        tls,
+        SENSORS_CHANNEL_ID,
+        MessageType::Specific,
+        &payload,
+        limits,
+    )?;
+    println!("probe_state=night_mode_applied is_night={is_night}");
+    *last_applied = Some(is_night);
+    Ok(())
+}
+
 /// Every proactive (not-a-reply) send `run()`'s loop attempts once per
 /// iteration, grouped into one call purely to keep `run()` itself under
 /// `clippy::too_many_lines`.
@@ -2011,10 +2109,27 @@ fn service_proactive_sends<T: SessionTransport>(
     microphone_channel: &mut Option<MicrophoneChannel>,
     media_pipelines: &mut MediaPipelines,
     screen_power: &mut ScreenPowerState,
+    last_applied_video_rotation: &mut Rotation,
+    night_mode_gpio: Option<&NightModeGpioSource>,
+    sensors_channel: Option<&SensorsChannel>,
+    last_applied_night_mode: &mut Option<bool>,
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
     limits: ProtocolLimits,
 ) -> Result<(), CliError> {
+    sync_video_rotation(
+        touch_source,
+        &media_pipelines.video_render,
+        last_applied_video_rotation,
+    );
+    sync_night_mode(
+        night_mode_gpio,
+        sensors_channel,
+        last_applied_night_mode,
+        transport,
+        tls,
+        limits,
+    )?;
     service_audio_keepalive(&mut media_pipelines.media_audio_playback, "media_audio");
     service_audio_keepalive(&mut media_pipelines.system_audio_playback, "system_audio");
     service_audio_keepalive(&mut media_pipelines.speech_audio_playback, "speech_audio");
@@ -2076,7 +2191,7 @@ fn observation_window(experiment_flags: &ExperimentFlags) -> Duration {
 /// touchscreen and any `TouchSettingsHandoff` exist) exactly once, builds
 /// the `ArmedGestureDetector` `run()`'s loop feeds every touch frame into
 /// (its arm-window duration seeded from the persisted
-/// `gesture_settings::GestureSettings`, so a previous session's
+/// `settings::HeadUnitSettings`, so a previous session's
 /// customized timeout survives a restart), and sends its live-adjustable
 /// arm-window handle too. Also syncs `mtp_suppression`'s masked/unmasked
 /// `gvfs-mtp-volume-monitor.service` state to the persisted setting, so
@@ -2091,8 +2206,8 @@ fn setup_settings_gesture(
         let rotation_handle = touch_source.map(EvdevTouchSource::rotation_handle);
         let _ = touch_settings.rotation_sender.send(rotation_handle);
     }
-    let settings = crate::gesture_settings::GestureSettings::load(std::path::Path::new(
-        crate::gesture_settings::DEFAULT_SETTINGS_PATH,
+    let settings = crate::settings::HeadUnitSettings::load(std::path::Path::new(
+        crate::settings::DEFAULT_SETTINGS_PATH,
     ));
     crate::mtp_suppression::sync(settings.mtp_popup_suppression_enabled());
     let arm_window_seconds = settings.arm_window_seconds();
@@ -2140,6 +2255,35 @@ fn open_touch_source(rotation: Rotation) -> Option<EvdevTouchSource> {
         }
         Err(error) => {
             println!("probe_state=touch_input_unavailable reason=open_failed error={error}");
+            None
+        }
+    }
+}
+
+/// Best-effort GPIO night-mode source discovery, run once before the
+/// receive loop starts — mirrors `open_touch_source`'s posture. Reads
+/// `night_mode_gpio_line` fresh from disk (the same "settings are cheap
+/// to reload on demand" pattern already used for audio device selection,
+/// `start_audio_playback_pipeline`) rather than threading it through
+/// `setup_settings_gesture`'s already-loaded settings, since this is the
+/// only thing in `run()` that needs it. `None` — the default — means the
+/// feature is disabled: no GPIO line is configured, or the configured
+/// line failed to open (missing `gpiod` kernel support, wrong chip,
+/// permission denied). Either way the probe continues exactly as if
+/// night mode didn't exist; a missing/misconfigured GPIO has no bearing
+/// on protocol correctness, same reasoning as a missing touchscreen.
+fn open_night_mode_gpio_source() -> Option<NightModeGpioSource> {
+    let settings = crate::settings::HeadUnitSettings::load(std::path::Path::new(
+        crate::settings::DEFAULT_SETTINGS_PATH,
+    ));
+    let line = settings.night_mode_gpio_line()?;
+    match NightModeGpioSource::open(std::path::Path::new(DEFAULT_GPIO_CHIP), line) {
+        Ok(source) => {
+            println!("probe_state=night_mode_gpio_source_opened line={line}");
+            Some(source)
+        }
+        Err(error) => {
+            println!("probe_state=night_mode_gpio_unavailable reason=open_failed error={error}");
             None
         }
     }
@@ -2208,7 +2352,16 @@ fn report_settings_gesture_event(event: GestureEvent, touch_settings: &TouchSett
 ///    `wayvnc` (and anything else watching the output list) is
 ///    completely unaffected — confirmed directly this session (no
 ///    detach warning in `wayvnc`'s log after switching).
-fn set_screen_power(on: bool) {
+///
+/// `brightness_percent` (M5's persisted `display_brightness_percent`
+/// setting — `crate::settings`) only matters when `on`; ignored while
+/// turning the screen off, which always writes `0` regardless. Called
+/// from two threads: this background protocol thread (on a real
+/// `ScreenOff` gesture or wake touch) and, since M5, the GTK thread
+/// directly (`gtk_dev_ui.rs`'s brightness slider, for live preview while
+/// dragging) — safe since this is just an independent sysfs write with
+/// no shared mutable state between the two call sites.
+pub(crate) fn set_screen_power(on: bool, brightness_percent: u8) {
     let Some(backlight_dir) = std::fs::read_dir("/sys/class/backlight")
         .ok()
         .and_then(|mut entries| entries.next())
@@ -2222,7 +2375,7 @@ fn set_screen_power(on: bool) {
         std::fs::read_to_string(backlight_dir.join("max_brightness"))
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok())
-            .unwrap_or(u32::MAX)
+            .map_or(u32::MAX, |max| (max * u32::from(brightness_percent)) / 100)
     } else {
         0
     };
@@ -2233,7 +2386,7 @@ fn set_screen_power(on: bool) {
 }
 
 /// Drives the screen-off/wake-on-touch gesture
-/// (`gesture_settings::Action::ScreenOff`). Tracked as a plain local in
+/// (`settings::Action::ScreenOff`). Tracked as a plain local in
 /// `run()`, owned only by this background thread, mirroring
 /// `ArmedGestureDetector` itself.
 ///
@@ -2303,7 +2456,7 @@ fn advance_screen_power(state: ScreenPowerState, phase: TouchPhase) -> ScreenPow
 /// `screen_power` and issues the real `wlr-randr` call, since this thread's
 /// `service_touch_input` is the only place that can swallow the wake
 /// touch). A genuine third dispatch category exists too —
-/// `OpenSettings`/`ToggleFullscreen`/`CycleRotation` — dispatched locally
+/// `OpenSettings`/`ToggleFullscreen`/`FlipScreen` — dispatched locally
 /// by the GTK thread instead (see `gtk_dev_ui.rs::dispatch_action`'s doc
 /// comment); this function is a no-op for those.
 fn dispatch_gesture_action<T: SessionTransport>(
@@ -2314,12 +2467,12 @@ fn dispatch_gesture_action<T: SessionTransport>(
     limits: ProtocolLimits,
     screen_power: &mut ScreenPowerState,
 ) -> Result<(), CliError> {
-    let action = crate::gesture_settings::GestureSettings::load(std::path::Path::new(
-        crate::gesture_settings::DEFAULT_SETTINGS_PATH,
-    ))
-    .action_for(gesture);
-    if action == crate::gesture_settings::Action::ScreenOff {
-        set_screen_power(false);
+    let settings = crate::settings::HeadUnitSettings::load(std::path::Path::new(
+        crate::settings::DEFAULT_SETTINGS_PATH,
+    ));
+    let action = settings.action_for(gesture);
+    if action == crate::settings::Action::ScreenOff {
+        set_screen_power(false, settings.display_brightness_percent());
         *screen_power = ScreenPowerState::TurningOff;
         println!("probe_state=screen_off_gesture_triggered");
         return Ok(());
@@ -2406,7 +2559,10 @@ fn service_touch_input<T: SessionTransport>(
         match previous_screen_power {
             ScreenPowerState::On | ScreenPowerState::TurningOff => {}
             ScreenPowerState::Off => {
-                set_screen_power(true);
+                let settings = crate::settings::HeadUnitSettings::load(std::path::Path::new(
+                    crate::settings::DEFAULT_SETTINGS_PATH,
+                ));
+                set_screen_power(true, settings.display_brightness_percent());
                 println!("probe_state=screen_off_woken_by_touch");
                 continue;
             }
@@ -3175,7 +3331,20 @@ fn start_audio_playback_pipeline(
     else {
         unreachable!("just matched NotStarted above");
     };
-    match backend.build_audio_playback_pipeline(format, AudioSink::Pulse) {
+    // Loaded fresh here rather than threaded down as a parameter, matching
+    // `dispatch_gesture_action`'s existing "settings are cheap to reload
+    // on demand" pattern (a small TOML read, on a pipeline-start event
+    // that only ever happens once per channel per session — not a hot
+    // path) rather than adding a parameter to the whole
+    // handle_message/drain_and_dispatch_frames call chain above this.
+    let settings = crate::settings::HeadUnitSettings::load(std::path::Path::new(
+        crate::settings::DEFAULT_SETTINGS_PATH,
+    ));
+    match backend.build_audio_playback_pipeline(
+        format,
+        AudioSink::Pulse,
+        settings.audio_output_device(),
+    ) {
         Ok(pipeline) => match pipeline.start() {
             Ok(()) => {
                 println!("probe_state={label}_playback_pipeline_started");
@@ -3802,6 +3971,19 @@ fn handle_sensors_channel_message<T: SessionTransport>(
                         SensorType::DrivingStatusData => {
                             Some(encode_driving_status_unrestricted_batch())
                         }
+                        // Fixed `false` (day) here regardless of the
+                        // configured GPIO — `sync_night_mode` reads the
+                        // real state proactively, once per loop
+                        // iteration, and immediately corrects this with
+                        // an unsolicited follow-up `SensorBatch` in the
+                        // same iteration if it was already night at
+                        // this instant. Not threading live GPIO through
+                        // this whole per-message dispatch chain
+                        // (`handle_message` → `dispatch_channel_message`
+                        // → here) avoids adding a GPIO parameter to
+                        // three already-`too_many_arguments`-flagged
+                        // functions for a gap no wider than one loop
+                        // iteration.
                         SensorType::NightMode => Some(encode_night_mode_batch(false)),
                         SensorType::Unknown(_) => None,
                     };
@@ -3947,9 +4129,16 @@ fn start_microphone_capture_pipeline(capture: &mut MicrophoneCaptureState) {
     else {
         unreachable!("just matched NotStarted above");
     };
-    match backend
-        .build_microphone_capture_pipeline(VOICE_AUDIO_PLAYBACK_FORMAT, AudioCaptureSource::Pulse)
-    {
+    // See `start_audio_playback_pipeline`'s matching comment for why this
+    // is loaded fresh here rather than threaded through as a parameter.
+    let settings = crate::settings::HeadUnitSettings::load(std::path::Path::new(
+        crate::settings::DEFAULT_SETTINGS_PATH,
+    ));
+    match backend.build_microphone_capture_pipeline(
+        VOICE_AUDIO_PLAYBACK_FORMAT,
+        AudioCaptureSource::Pulse,
+        settings.microphone_input_device(),
+    ) {
         Ok(pipeline) => match pipeline.start() {
             Ok(()) => {
                 println!("probe_state=microphone_capture_pipeline_started");

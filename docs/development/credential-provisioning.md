@@ -58,6 +58,14 @@ aa-headunit-diagnostics credentials status
 
 This changes ownership metadata only — it never reads, prints, or otherwise touches the certificate/private-key contents.
 
+**For the dedicated `aa-headunit` system user (M5)**: the same re-own step applies once the actual appliance systemd service runs as that account instead of the interactive operator — the private-key check keys off file ownership, not group membership, so the service can only read a key it directly owns:
+
+```sh
+sudo chown -R aa-headunit:aa-headunit /etc/aa-headunit/credentials
+```
+
+Not yet needed today (nothing runs as this user yet — see `packaging/debian/aa-headunit-diagnostics.postinst`'s user-creation comment); recorded here so whoever wires up the systemd service doesn't have to rediscover the same ownership requirement documented above for the operator's own account.
+
 ## Bounded interoperability probe
 
 After an authorised pair is installed, the diagnostics application can load it at runtime for an explicitly selected, bounded USB interoperability probe — unprivileged, once the group membership above is active:

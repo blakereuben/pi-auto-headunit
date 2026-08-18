@@ -10,6 +10,7 @@ repository.workspace = true
 platform-api = { path = "../platform-api" }
 evdev = "=0.13.2"
 nix = { version = "=0.29.0", default-features = false, features = ["poll"] }
+gpiod = "0.3.0"
 
 [lints]
 workspace = true
