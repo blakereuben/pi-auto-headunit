@@ -25,19 +25,40 @@
 # other things (backlight, GPU access outside a seat session) but isn't
 # what a kiosk compositor's own DRM master role depends on.
 #
-# **Not yet real-hardware-tested as a systemd unit at all.** Testing it
-# live would take DRM master away from whatever compositor already owns
-# the display (this session: the operator's own desktop on tty1), and
-# enabling it changes what a reboot does — both explicitly deferred by
-# the operator this session, in favor of writing this correctly against
-# the verified official recipe and testing later, deliberately, rather
-# than causing an unplanned loss of display/desktop access mid-session.
-# First real test should confirm: the unit actually starts on the chosen
-# VT without conflicting with any getty already spawned there (add
-# `Conflicts=getty@%i.service` if one is), the kiosk session reaches
-# fullscreen Android Auto video the same way `usb gtk-dev-ui`/`usb kiosk`
-# already do interactively, and VT-switching away and back (`-s` below)
-# doesn't leave the session broken.
+# **Real-hardware-tested, 2026-08-18, and found to hang the whole board.**
+# With `lightdm`/`labwc` (this session's interactive desktop, tty1)
+# stopped or disabled and this unit as the *only* compositor, `cage`
+# never spawned its child process at all — `/sys/class/drm/card1-HDMI-*`
+# (the `vc4` GPU node) was `disconnected`, while the physical panel was
+# actually `/sys/class/drm/card2-DSI-2` (`drm-rp1-dsi`, the RP1
+# southbridge's DSI driver) — `connected`. wlroots (cage's compositor
+# library) auto-selects a DRM device and appears to have picked the
+# disconnected `vc4` node, leaving cage waiting on a connector that would
+# never appear. `Environment=WLR_DRM_DEVICES=` below forces the correct
+# device explicitly, mirroring how this project's own GStreamer/GTK4
+# render path has always needed explicit output targeting rather than
+# relying on autodetection (see `crates/media-gstreamer/src/render.rs`'s
+# own history).
+#
+# Separately — and this is the part that actually caused the real-hardware
+# finding above to matter — after a `chvt` to this unit's VT (both with
+# and without a second live compositor present), the *board itself*
+# hung hard enough to need a physical power cycle: VNC went grey, a
+# directly-attached keyboard stopped responding, and no kernel
+# panic/oops/hung-task message appears anywhere in the journal for that
+# boot (checked directly, including `-k` kernel-only output) — consistent
+# with a firmware/GPU-level lockup this OS never got to log, not a
+# userspace crash. A hardware watchdog (`bcm2835-wdt`, 1-minute timeout)
+# is active on this board, which may or may not be what actually
+# recovers a future occurrence. **The `WLR_DRM_DEVICES` fix above has NOT
+# been verified to resolve this** — testing stopped after multiple real
+# hangs required physical intervention, and this unit was disabled again
+# (`lightdm` re-enabled) rather than risk another one. Before the next
+# real test: confirm `WLR_DRM_DEVICES=/dev/dri/card2` is still the right
+# card path (`for f in /sys/class/drm/card*-*/status; do echo "$f:
+# $(cat $f)"; done` — look for `connected`), and treat a repeat hang as
+# evidence this is a real firmware/DRM-driver bug independent of the
+# wrong-device theory, not something this project's own code can fix.
 
 [Unit]
 Description=Android Auto head unit appliance kiosk session (%I)
@@ -58,6 +79,7 @@ TTYReset=yes
 TTYVHangup=yes
 TTYVTDisallocate=yes
 StandardInput=tty-fail
+Environment=WLR_DRM_DEVICES=/dev/dri/card2
 ExecStart=/usr/bin/cage -d -s -- /usr/bin/aa-headunit-diagnostics usb kiosk --allow-live-aap
 Restart=on-failure
 RestartSec=5
