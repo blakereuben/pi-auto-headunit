@@ -122,7 +122,7 @@ Architecture and automated tests must remain portable throughout development, bu
 - [ ] Start directly into the full-screen head unit on boot.
 - [x] Provide a documented recovery/development path when the graphical service fails.
 - [ ] Meet the measured boot-to-ready target or record justified revisions.
-- [ ] Build a release-quality signed `arm64` `.deb` without requiring Rust on the target.
+- [x] Build a release-quality signed `arm64` `.deb` without requiring Rust on the target.
 - [x] Pass clean install, upgrade, remove, purge, and rollback tests.
 - [x] Produce privacy-safe diagnostics and bounded journald logging.
 
