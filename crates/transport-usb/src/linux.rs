@@ -73,11 +73,16 @@ pub enum HoldResult {
 pub enum SoftResetOutcome {
     /// The reset completed and the original device handle is still valid.
     Completed,
-    /// `LIBUSB_ERROR_NOT_FOUND` — the device re-enumerated as a result of
-    /// the reset (almost certainly with a new address) and must be
-    /// rediscovered; the original handle is no longer usable. Treated as
-    /// success, not failure, since re-enumeration is exactly what a
-    /// software-triggered "replug" is meant to cause.
+    /// The device re-enumerated (almost certainly with a new address) and
+    /// must be rediscovered; the original handle is no longer usable.
+    /// Treated as success, not failure, since re-enumeration is exactly
+    /// what a software-triggered "replug" is meant to cause. Reached two
+    /// ways: `LIBUSB_ERROR_NOT_FOUND` from `.reset()` itself (the reset
+    /// caused the re-enumeration), or the device already being absent
+    /// (`AoaError::Unplugged`) before `.reset()` is even reached — the
+    /// device was already mid-re-enumeration for some other reason (e.g.
+    /// the phone tearing down on its own right after acknowledging this
+    /// project's `ByeByeRequest`) by the time this ran.
     Reenumerated,
 }
 
@@ -270,7 +275,32 @@ impl LibUsbAoaBackend {
     /// as needing a real physical replug (`wait_for_physical_replug`), not
     /// retry this indefinitely.
     pub fn soft_reset(&self, device: &UsbDeviceId) -> Result<SoftResetOutcome, AoaError> {
-        let handle = self.open_device(device)?;
+        // Real-hardware-required (2026-08-18): `open_device` (via
+        // `find_device`) can itself fail with `AoaError::Unplugged` if the
+        // device has *already* disappeared from the USB enumeration by the
+        // time this runs — observed right after a clean, successful
+        // session ends, where the phone appears to voluntarily drop out of
+        // AOA accessory mode as part of its own teardown once it has
+        // acknowledged this project's `ByeByeRequest`
+        // (`auth_discovery_probe::send_byebye_request`), not as a result
+        // of anything this function does. Before this fix, that early
+        // failure was propagated as a hard error instead of being
+        // recognized as the same "device is mid-reenumeration" case
+        // `Err(RusbError::NotFound)` below already handles for a failure
+        // *during* `.reset()` — the caller (`session_supervisor`'s
+        // `resolve_device`) then used `wait_for_reconnect`'s "already
+        // present, no real wait" semantics instead of
+        // `wait_for_physical_replug`'s proper absence-then-presence
+        // wait, so the very next handshake could start before the
+        // phone's own teardown had actually finished. Same underlying
+        // bug class this project already fixed once for `RusbError::
+        // NotFound` (see that variant's doc comment above), just at a
+        // different failure point.
+        let handle = match self.open_device(device) {
+            Ok(handle) => handle,
+            Err(AoaError::Unplugged) => return Ok(SoftResetOutcome::Reenumerated),
+            Err(error) => return Err(error),
+        };
         match handle.reset() {
             Ok(()) => Ok(SoftResetOutcome::Completed),
             Err(RusbError::NotFound) => Ok(SoftResetOutcome::Reenumerated),

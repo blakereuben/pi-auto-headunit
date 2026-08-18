@@ -55,7 +55,9 @@ pub use bluetooth_service::{
     DEFAULT_MAX_BLUETOOTH_MESSAGE_BODY_SIZE, decode_bluetooth_pairing_request,
     encode_bluetooth_pairing_response,
 };
-pub use byebye::{ByeByeError, ByeByeReason, decode_byebye_request, encode_byebye_response};
+pub use byebye::{
+    ByeByeError, ByeByeReason, decode_byebye_request, encode_byebye_request, encode_byebye_response,
+};
 pub use channel_open::{
     ChannelOpenAction, ChannelOpenError, ChannelOpenEvent, ChannelOpenState,
     ChannelOpenStateMachine,

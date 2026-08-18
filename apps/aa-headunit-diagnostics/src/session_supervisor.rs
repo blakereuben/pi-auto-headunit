@@ -152,10 +152,30 @@ struct SupervisedSession {
     cancel: CancellationFlag,
     /// How many retryable failures have happened in a row, reset to 0 on
     /// any successful cycle (`run()`'s wrapper around `attempt`, based on
-    /// `is_retryable`). Drives `resolve_device`'s escalation: 0 = normal
-    /// reconnect, 1 = try a software `soft_reset` first (Blake's explicit
-    /// instruction, 2026-08-16), 2+ = ask for a physical replug via
-    /// `replug_prompt`.
+    /// `is_retryable`). Drives `resolve_device`'s escalation: 0 or 1 = try
+    /// a software `soft_reset` first (Blake's explicit instruction,
+    /// 2026-08-16), 2+ = ask for a physical replug via `replug_prompt`.
+    ///
+    /// 0 and 1 share the same soft-reset treatment as of 2026-08-18: a
+    /// real-hardware trial found that the reconnect immediately following
+    /// a *clean, successful* cycle (`consecutive_failures == 0`) reliably
+    /// raced the phone — `encrypted frame received before TLS handshake
+    /// completed`, on every single such reconnect, not intermittently —
+    /// even after adding a proper `ByeByeRequest`/`ByeByeResponse`
+    /// exchange (`auth_discovery_probe::send_byebye_request`) plus a
+    /// generous grace period afterward. The strict, deterministic
+    /// alternation (success, race, success, race, ...) across every
+    /// variant tried was the tell that this was never actually a fuzzy
+    /// timing race: the phone's session/TLS teardown apparently isn't
+    /// gated on any application-layer message at all, only on a genuine
+    /// USB bus-level reset — exactly what the *old* `1`-branch's
+    /// `soft_reset` already did, and exactly what the old `0`-branch
+    /// (direct `wait_for_reconnect`, no reset) never did. Reusing the
+    /// existing soft-reset path for `0` too closes this reliably, at the
+    /// cost of every ordinary reconnect now briefly forcing real USB
+    /// re-enumeration instead of being instant when possible — an
+    /// explicit, accepted tradeoff (Blake: "i want this as perfect as
+    /// possible").
     consecutive_failures: u32,
     /// When set, `attempt` deliberately forces the device to disconnect and
     /// re-enumerate after every *successful* cycle (not just failures),
@@ -277,10 +297,7 @@ impl SupervisedSession {
                 .ok_or(CliError::Aoa(AoaError::Unplugged));
         };
         match self.consecutive_failures {
-            0 => backend
-                .wait_for_reconnect(previous, REDISCOVERY_TIMEOUT)
-                .map_err(CliError::Aoa),
-            1 => {
+            0 | 1 => {
                 println!("probe_state=supervisor_soft_reset_attempt cycle={cycle}");
                 // `Reenumerated` means libusb told us the device is about
                 // to disappear and come back — real-hardware-observed
@@ -312,6 +329,19 @@ impl SupervisedSession {
                         false
                     }
                 };
+                // A fixed post-reconnect settle delay was tried and removed
+                // (2026-08-18): real-hardware trials from 0ms up to 8s
+                // showed zero effect on the residual `encrypted frame
+                // received before TLS handshake completed` collision that
+                // can occur on the reconnect immediately following a clean
+                // session end — the exact same cycles failed regardless of
+                // delay length, which rules out "not enough settle time" as
+                // the cause. Root cause undetermined; see
+                // `docs/protocol/session-supervisor-reconnect-race.md` for
+                // the full investigation record. Not fixed from the head
+                // unit's side, but the existing soft-reset escalation above
+                // already recovers it automatically within one retry cycle
+                // every time this has been observed.
                 if reenumerated {
                     backend
                         .wait_for_physical_replug(previous, REDISCOVERY_TIMEOUT)

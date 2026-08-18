@@ -35,6 +35,17 @@ impl ByeByeReason {
             value => Self::Unknown(value),
         }
     }
+
+    const fn to_wire(self) -> i32 {
+        match self {
+            Self::UserSelection => 1,
+            Self::DeviceSwitch => 2,
+            Self::NotSupported => 3,
+            Self::NotCurrentlySupported => 4,
+            Self::ProbeSupported => 5,
+            Self::Unknown(value) => value,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +144,28 @@ pub fn encode_byebye_response() -> ControlMessage {
     }
 }
 
+/// Encodes a `ByeByeRequest` (field 1, `reason`) for the head unit to
+/// *send*, not just receive. `ControlServiceChannel::sendShutdownRequest`
+/// in the pinned AASDK source confirms this message is symmetric — either
+/// side may initiate it — not phone-only as this module's original
+/// receive-only shape implied. Added 2026-08-18 after a real gap: ending a
+/// probe session by simply dropping the transport (no wire notice at all)
+/// left the phone believing the session was still live, so the next
+/// `session-supervisor` cycle's fresh TLS handshake collided with the
+/// phone still sending encrypted application data for the "old" session
+/// (`encrypted frame received before TLS handshake completed`, recovered
+/// only by a full soft-reset). Sending this first gives the phone a clean,
+/// explicit signal to tear its own session state down.
+#[must_use]
+pub fn encode_byebye_request(reason: ByeByeReason) -> ControlMessage {
+    let mut body = Vec::new();
+    protobuf::write_int32_field(&mut body, 1, reason.to_wire());
+    ControlMessage {
+        id: ControlMessageId::ByeByeRequest,
+        body,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +226,29 @@ mod tests {
         let message = encode_byebye_response();
         assert_eq!(message.id, ControlMessageId::ByeByeResponse);
         assert_eq!(message.body, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn encodes_and_decodes_every_known_reason_round_trip() {
+        for reason in [
+            ByeByeReason::UserSelection,
+            ByeByeReason::DeviceSwitch,
+            ByeByeReason::NotSupported,
+            ByeByeReason::NotCurrentlySupported,
+            ByeByeReason::ProbeSupported,
+        ] {
+            let message = encode_byebye_request(reason);
+            assert_eq!(message.id, ControlMessageId::ByeByeRequest);
+            assert_eq!(decode_byebye_request(&message.body), Ok(reason));
+        }
+    }
+
+    #[test]
+    fn encodes_unknown_reason_round_trip() {
+        let message = encode_byebye_request(ByeByeReason::Unknown(42));
+        assert_eq!(
+            decode_byebye_request(&message.body),
+            Ok(ByeByeReason::Unknown(42))
+        );
     }
 }

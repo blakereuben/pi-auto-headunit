@@ -485,7 +485,7 @@ use protocol_aap::{
     decode_byebye_request, decode_frame, decode_key_binding_request, decode_nav_focus_request,
     decode_ping_request, decode_ping_response, decode_sensor_request,
     decode_voice_session_notification, encode_audio_focus_notification,
-    encode_bluetooth_pairing_response, encode_byebye_response,
+    encode_bluetooth_pairing_response, encode_byebye_request, encode_byebye_response,
     encode_driving_status_unrestricted_batch, encode_frame, encode_key_binding_response,
     encode_key_event, encode_nav_focus_notification, encode_night_mode_batch, encode_ping_request,
     encode_ping_response, encode_sensor_response, encode_service_discovery_response,
@@ -1309,17 +1309,25 @@ pub fn run<T: SessionTransport>(
         )?;
     }
 
-    finish_probe_after_loop(channel_setup_complete, cancel.is_set(), &tls)
+    finish_probe_after_loop(
+        channel_setup_complete,
+        cancel.is_set(),
+        transport,
+        &mut tls,
+        limits,
+    )
 }
 
 /// `run()`'s outcome once its loop exits without an earlier explicit
 /// stop — either the deadline was reached or the operator cancelled
 /// (`Ctrl-C`) — split out purely to keep `run()` itself under
 /// `clippy::too_many_lines`.
-fn finish_probe_after_loop(
+fn finish_probe_after_loop<T: SessionTransport>(
     channel_setup_complete: bool,
     cancelled: bool,
-    tls: &OpenSslTlsClient,
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
 ) -> Result<(), CliError> {
     if cancelled {
         println!("probe_state=cancelled_by_operator");
@@ -1327,6 +1335,7 @@ fn finish_probe_after_loop(
         return Err(CliError::Cancelled);
     }
     if channel_setup_complete {
+        send_byebye_request(transport, tls, limits);
         println!("probe_result=observation_window_complete");
         return Ok(());
     }
@@ -1334,6 +1343,149 @@ fn finish_probe_after_loop(
     Err(CliError::Protocol(
         "auth/service-discovery/channel-setup probe timed out before completion".into(),
     ))
+}
+
+/// Best-effort courtesy notice sent to the phone right before a clean,
+/// deadline-reached stop (never on Ctrl-C — that path is treated as an
+/// abrupt stop, not a graceful one, matching real appliance behaviour
+/// when the operator forces a stop). Without this, the only prior signal
+/// the phone got that a session was ending was the transport silently
+/// dropping — no wire notice at all. Real-hardware-discovered gap
+/// (2026-08-18): a supervised `session-supervisor` reconnect cycle right
+/// after a clean stop got `encrypted frame received before TLS handshake
+/// completed` on its very next handshake, every single cycle, because the
+/// phone's prior session state was still fully live when the new cycle's
+/// TLS handshake started. `encode_byebye_request`'s doc comment has the
+/// full citation confirming this is a legitimate head-unit-initiated
+/// message, not phone-only. Failure to send is logged, not propagated —
+/// the observation window itself completed successfully either way, and
+/// this is a courtesy notice, not part of the probe's core result.
+fn send_byebye_request<T: SessionTransport>(
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
+) {
+    let message = encode_byebye_request(ByeByeReason::UserSelection);
+    let payload = match message.encode(DEFAULT_MAX_CONTROL_BODY_SIZE) {
+        Ok(payload) => payload,
+        Err(error) => {
+            println!("probe_state=byebye_request_encode_failed error={error}");
+            return;
+        }
+    };
+    match send_encrypted(transport, tls, 0, MessageType::Specific, &payload, limits) {
+        Ok(()) => println!("probe_state=byebye_request_sent"),
+        Err(error) => {
+            println!("probe_state=byebye_request_send_failed error={error}");
+            return;
+        }
+    }
+    wait_for_byebye_response(transport, tls, limits);
+}
+
+/// How long [`wait_for_byebye_response`] waits for the phone's
+/// `ByeByeResponse` before giving up and returning anyway — bounded, not
+/// indefinite, matching this project's "no unbounded silent waits"
+/// discipline.
+const BYEBYE_RESPONSE_WAIT: Duration = Duration::from_secs(3);
+/// Extra fixed grace period *after* the phone's `ByeByeResponse` actually
+/// arrives, before this probe returns — see the call site's doc comment
+/// for why this is needed even though the response was already confirmed
+/// received.
+const BYEBYE_TEARDOWN_GRACE: Duration = Duration::from_millis(750);
+
+/// Real-hardware-required (2026-08-18): sending [`send_byebye_request`]'s
+/// courtesy notice with no wait at all was not enough on its own — a
+/// `session-supervisor` reconnect cycle still raced the phone on *every*
+/// cycle, because the very next cycle's fresh TLS handshake started
+/// before the phone had any real chance to process the notice and reset
+/// its own session state, reproducing the exact same `encrypted frame
+/// received before TLS handshake completed` failure this whole fix was
+/// meant to prevent. A short, bounded wait for the phone's explicit
+/// `ByeByeResponse` (or just letting this much wall-clock time pass, if
+/// it never arrives) closes that race. Deliberately minimal compared to
+/// `run()`'s main loop: only channel 0 (control) can carry this response,
+/// so a one-channel `MessageAssembler` is enough, and any other message
+/// that arrives in the meantime (the session is ending regardless) is
+/// simply ignored rather than dispatched.
+fn wait_for_byebye_response<T: SessionTransport>(
+    transport: &mut T,
+    tls: &mut OpenSslTlsClient,
+    limits: ProtocolLimits,
+) {
+    let deadline = Instant::now() + BYEBYE_RESPONSE_WAIT;
+    let mut assembler = match MessageAssembler::new(1) {
+        Ok(assembler) => assembler,
+        Err(error) => {
+            println!("probe_state=byebye_response_wait_setup_failed error={error}");
+            return;
+        }
+    };
+    let mut received = Vec::new();
+    let mut read_buffer = vec![0_u8; AASDK_MAX_FRAME_PAYLOAD_SIZE + 8];
+    while Instant::now() < deadline {
+        let size = match transport.receive(&mut read_buffer) {
+            Ok(size) => size,
+            Err(TransportError::TimedOut) => continue,
+            Err(_) => {
+                println!("probe_state=byebye_response_wait_transport_closed");
+                return;
+            }
+        };
+        received.extend_from_slice(&read_buffer[..size]);
+        loop {
+            let frame = match decode_frame(&received, limits) {
+                Ok(frame) => frame,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => {
+                    println!("probe_state=byebye_response_wait_decode_failed");
+                    return;
+                }
+            };
+            let consumed = frame.consumed;
+            let outcome = push_decoded_frame(
+                frame,
+                &mut assembler,
+                tls,
+                HandshakeState::ServiceDiscoveryReceived,
+            );
+            received.drain(..consumed);
+            let message = match outcome {
+                Ok(Some(message)) => message,
+                Ok(None) => continue,
+                Err(_) => {
+                    println!("probe_state=byebye_response_wait_dispatch_failed");
+                    return;
+                }
+            };
+            if message.message_type != MessageType::Specific {
+                continue;
+            }
+            let Ok(control_message) =
+                ControlMessage::decode(&message.payload, DEFAULT_MAX_CONTROL_BODY_SIZE)
+            else {
+                continue;
+            };
+            if control_message.id == ControlMessageId::ByeByeResponse {
+                println!("probe_state=byebye_response_received");
+                // Real-hardware-required (2026-08-18): the phone's own
+                // teardown is asynchronous to its `ByeByeResponse` — AASDK's
+                // `ControlServiceChannel.cpp` describes the phone-side flow
+                // as "always replies, then tears the session down once the
+                // response is confirmed sent", i.e. teardown starts only
+                // *after* the reply, not before. Returning the instant the
+                // response arrives still raced the phone roughly half the
+                // time in a rapid back-to-back-cycle trial (2 of 5 cycles).
+                // A short fixed grace period after the acknowledged
+                // response — not spent waiting for anything further, just
+                // wall-clock time for the phone's own async teardown to
+                // actually finish — closes the remaining race.
+                std::thread::sleep(BYEBYE_TEARDOWN_GRACE);
+                return;
+            }
+        }
+    }
+    println!("probe_state=byebye_response_wait_timed_out");
 }
 
 /// Prints diagnostic lines for a [`ProbeOutcome`] and reports whether
