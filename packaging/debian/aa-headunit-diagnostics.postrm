@@ -1,0 +1,72 @@
+#!/bin/sh
+set -e
+
+# M5 install/upgrade/remove/purge testing surfaced that this package had
+# no postrm at all — `remove` already did the right thing by default
+# (dpkg only ever touches files it installed, so the dedicated
+# `aa-headunit` system user/group and `/var/lib/aa-headunit` all
+# correctly survived a plain remove, matching the expected "remove is
+# reversible" semantics), but `purge` left the same things behind too,
+# which isn't a real clean slate.
+#
+# Deliberately narrow, and deliberately never touches
+# `/etc/aa-headunit` at all: that directory holds `config.toml` (a
+# conffile dpkg already manages on its own) and — separately, entirely
+# outside dpkg's install manifest — a `credentials/` directory a human
+# operator provisions by hand (`credentials install`,
+# `docs/development/credential-provisioning.md`). dpkg's own standard
+# conffile/empty-directory handling already does the right thing here
+# (never removes a non-empty directory, never touches untracked files),
+# and that's relied on rather than reimplemented — this script has no
+# code path that could ever remove real credential material, on purpose.
+
+case "$1" in
+    purge)
+        # `loginctl enable-linger aa-headunit` (`postinst`) keeps a real
+        # `systemd --user` instance running for this user at all times —
+        # real-hardware finding, M5 packaging tests: `deluser` below
+        # refuses outright ("user aa-headunit is currently used by
+        # process ...") while that's still alive. Disabling lingering
+        # first lets systemd tear the user session down cleanly before
+        # `deluser` runs.
+        if command -v loginctl >/dev/null 2>&1; then
+            loginctl disable-linger aa-headunit >/dev/null 2>&1 || true
+            loginctl terminate-user aa-headunit >/dev/null 2>&1 || true
+        fi
+        # `terminate-user` above only *signals* the user manager to shut
+        # down — it does not block until every process is actually gone.
+        # A second real-hardware finding: calling `deluser` immediately
+        # after it raced ahead of the teardown and failed (silently, via
+        # the `|| true` below) on a real purge, even though the exact
+        # same two commands run by hand, moments apart, succeeded. Wait
+        # for the user's processes to actually exit first, bounded so a
+        # genuinely stuck process can't hang the purge forever.
+        wait_seconds=0
+        while pgrep -u aa-headunit >/dev/null 2>&1 && [ "$wait_seconds" -lt 10 ]; do
+            sleep 1
+            wait_seconds=$((wait_seconds + 1))
+        done
+        # The dedicated system user this package created (`postinst`) —
+        # safe to remove outright, it exists only for this package's own
+        # appliance service and nothing else references it.
+        if getent passwd aa-headunit >/dev/null 2>&1; then
+            deluser --system aa-headunit >/dev/null 2>&1 || true
+        fi
+        # Deliberately does NOT remove the `aa-headunit` *group* — unlike
+        # the user, the group is also used as a supplementary group for
+        # the interactive human operator
+        # (`docs/development/credential-provisioning.md`), a purpose
+        # entirely separate from the dedicated system user this package
+        # owns. Removing it here could silently break that operator's
+        # own already-working unprivileged access.
+        #
+        # Mutable runtime state (persisted settings — `settings.rs`'s
+        # `DEFAULT_SETTINGS_PATH`) — genuinely this package's own data,
+        # not shared with anything else, safe to remove on a real purge.
+        rm -rf /var/lib/aa-headunit
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

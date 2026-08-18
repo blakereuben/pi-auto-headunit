@@ -1,3 +1,18 @@
+aa-headunit (0.1.0-2) unstable; urgency=medium
+
+  * Wired Android Auto session (USB accessory transition, TLS handshake,
+    service discovery, video/audio/touch/microphone) real-hardware-
+    confirmed through Milestone 4.
+  * Milestone 5 in progress: dedicated unprivileged system user,
+    persistent display/rotation/audio/microphone/night-mode settings,
+    USB auto-discovery and reconnect loop, appliance preflight checks,
+    documented recovery path, and bounded persistent journald logging.
+  * Appliance kiosk boot (cage/systemd) written and packaged but not yet
+    enabled by default — real-hardware testing found it can hang the
+    board; see docs/development/appliance-recovery.md.
+
+ -- Pi Auto Head Unit Contributors <noreply@example.invalid>  Tue, 18 Aug 2026 23:50:00 +0100
+
 aa-headunit (0.1.0-1) unstable; urgency=medium
 
   * Initial Milestone 1 development diagnostic.
