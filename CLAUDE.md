@@ -120,7 +120,9 @@ assumes.
 been run on Pi 5 against a real phone (USB accessory transition, the phone
 re-enumerated as the documented Google AOA accessory ID) using the
 operator-authorised external identity, requiring `sudo` since
-`/etc/aa-headunit/credentials` is root-only (`0700`). It reached
+`/etc/aa-headunit/credentials` was root-only (`0700`) at the time — see the
+2026-08-18 correction near the end of this note: that path is no longer
+root-only and `sudo` is no longer required or advisable. It reached
 `probe_result=service_discovery_summary_received`: version negotiated, TLS
 handshake completed, `AuthComplete` sent, and — the specific behaviour this
 session's TLS application-data work targeted — the phone's real
@@ -157,10 +159,24 @@ accessory-mode checks made the command fail unconditionally regardless of
 device state; reconnect recovery was proven by physically replugging after
 that unplug and immediately re-running `auth-discovery-probe`
 successfully. `usb auth-discovery-probe --device <bus:address>
---allow-live-aap` needs `sudo` (credentials are root-only `0700`); the
+--allow-live-aap` needed `sudo` at the time (credentials were root-only
+`0700`) — no longer true, see the 2026-08-18 correction below. The
 installed `/usr/bin/aa-headunit-diagnostics` package is current and
 includes `auth-discovery-probe`, so either it or a freshly built
 `target/release/aa-headunit-diagnostics` works.
+
+**Correction, 2026-08-18: `sudo` is no longer needed to run this app, and
+should not be used.** `/etc/aa-headunit/credentials` is now owned
+`blakereuben:aa-headunit`, mode `0700` (the operator is both the owner
+and a member of the `aa-headunit` group — the group-based fix from M4's
+audio-unprivileged work, `MILESTONE_CHECKLIST.md` M4). Running under
+`sudo` strips `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`
+from the process environment, which silently breaks every render
+pipeline — video and all three audio channels — real-hardware-confirmed
+during M4's 60-minute soak (`gst_wl_window_ensure_fullscreen: assertion
+'self' failed`, `render pipeline state change failed`). Always run `usb
+auth-discovery-probe`/`session-supervisor`/`gtk-dev-ui` as the plain
+logged-in user, not `sudo`.
 
 Since the note above, the remaining `Service`/`ServiceDiscoveryResponse`
 schema mapping (all 13 nested kinds, every leaf enum/config message, and
