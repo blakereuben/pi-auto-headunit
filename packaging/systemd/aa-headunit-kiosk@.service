@@ -25,40 +25,38 @@
 # other things (backlight, GPU access outside a seat session) but isn't
 # what a kiosk compositor's own DRM master role depends on.
 #
-# **Real-hardware-tested, 2026-08-18, and found to hang the whole board.**
-# With `lightdm`/`labwc` (this session's interactive desktop, tty1)
-# stopped or disabled and this unit as the *only* compositor, `cage`
-# never spawned its child process at all — `/sys/class/drm/card1-HDMI-*`
-# (the `vc4` GPU node) was `disconnected`, while the physical panel was
-# actually `/sys/class/drm/card2-DSI-2` (`drm-rp1-dsi`, the RP1
-# southbridge's DSI driver) — `connected`. wlroots (cage's compositor
-# library) auto-selects a DRM device and appears to have picked the
-# disconnected `vc4` node, leaving cage waiting on a connector that would
-# never appear. `Environment=WLR_DRM_DEVICES=` below forces the correct
-# device explicitly, mirroring how this project's own GStreamer/GTK4
-# render path has always needed explicit output targeting rather than
-# relying on autodetection (see `crates/media-gstreamer/src/render.rs`'s
-# own history).
+# **Real-hardware-tested, 2026-08-18/19. `cage` gets stuck (unresponsive
+# to a graceful stop) after a `chvt` to this unit's VT, at least once
+# with the `WLR_DRM_DEVICES` fix below already in place** —
+# `/sys/class/drm/card1-HDMI-*` (the `vc4` GPU node) was `disconnected`
+# while the actual physical panel is `/sys/class/drm/card2-DSI-2`
+# (`drm-rp1-dsi`, the RP1 southbridge's DSI driver); `WLR_DRM_DEVICES`
+# forces the correct device, and a same-day real-hardware trial with it
+# applied survived a full 60 seconds past `chvt` (every earlier trial,
+# without the fix, hit trouble within that window) — genuine
+# improvement, but not a confirmed full fix, since the same trial still
+# got stuck a few minutes later.
 #
-# Separately — and this is the part that actually caused the real-hardware
-# finding above to matter — after a `chvt` to this unit's VT (both with
-# and without a second live compositor present), the *board itself*
-# hung hard enough to need a physical power cycle: VNC went grey, a
-# directly-attached keyboard stopped responding, and no kernel
-# panic/oops/hung-task message appears anywhere in the journal for that
-# boot (checked directly, including `-k` kernel-only output) — consistent
-# with a firmware/GPU-level lockup this OS never got to log, not a
-# userspace crash. A hardware watchdog (`bcm2835-wdt`, 1-minute timeout)
-# is active on this board, which may or may not be what actually
-# recovers a future occurrence. **The `WLR_DRM_DEVICES` fix above has NOT
-# been verified to resolve this** — testing stopped after multiple real
-# hangs required physical intervention, and this unit was disabled again
-# (`lightdm` re-enabled) rather than risk another one. Before the next
-# real test: confirm `WLR_DRM_DEVICES=/dev/dri/card2` is still the right
-# card path (`for f in /sys/class/drm/card*-*/status; do echo "$f:
-# $(cat $f)"; done` — look for `connected`), and treat a repeat hang as
-# evidence this is a real firmware/DRM-driver bug independent of the
-# wrong-device theory, not something this project's own code can fix.
+# **Important correction to an earlier version of this note**: this was
+# first believed to hang the *whole board*, requiring a physical power
+# cycle — VNC went grey, a directly-attached keyboard stopped
+# responding. Real-hardware investigation the same session found that's
+# not quite right: `cage` gets stuck and stops responding to `SIGTERM`
+# (confirmed via the journal: a `systemctl stop` sat for over a minute
+# with zero progress, and an earlier trial logged `State 'stop-sigterm'
+# timed out. Killing.` — systemd's own default 90s `TimeoutStopSec`),
+# but **SSH stayed fully responsive throughout every single occurrence**
+# — the kernel and the rest of the system were never actually frozen.
+# `TimeoutStopSec=10` below makes systemd escalate to `SIGKILL`
+# automatically and quickly instead of leaving an operator to wait out
+# (or manually endure) the 90s default — recovery should never again
+# require a physical power cycle; `systemctl kill -s KILL
+# aa-headunit-kiosk@<VT>.service` (or waiting ~10s for this unit's own
+# timeout to do it automatically) should be enough. See
+# `docs/development/appliance-recovery.md` for the corrected recovery
+# steps. The underlying question of *why* `cage` gets stuck at all is
+# still open — this note records what's actually been confirmed, not a
+# full fix.
 
 [Unit]
 Description=Android Auto head unit appliance kiosk session (%I)
@@ -83,6 +81,12 @@ Environment=WLR_DRM_DEVICES=/dev/dri/card2
 ExecStart=/usr/bin/cage -d -s -- /usr/bin/aa-headunit-diagnostics usb kiosk --allow-live-aap
 Restart=on-failure
 RestartSec=5
+# Real-hardware finding (2026-08-19): `cage` can get stuck and stop
+# responding to a graceful SIGTERM. The default `TimeoutStopSec` (90s)
+# left an operator either waiting almost a minute and a half or
+# incorrectly concluding the whole board had hung. A short timeout here
+# makes systemd escalate to SIGKILL quickly and automatically instead.
+TimeoutStopSec=10
 # Incremental hardening (ARCHITECTURE.md §8) — only the directive with
 # no plausible interaction with DRM/USB/audio/seat access is included
 # here; widen this once the unit above is real-hardware-confirmed

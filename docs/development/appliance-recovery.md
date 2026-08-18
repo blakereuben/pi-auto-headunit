@@ -1,14 +1,20 @@
 # Appliance recovery and development path
 
 How the M5 appliance boots, what to do if the graphical (kiosk) service
-fails or hangs the board, and how to get back to a normal development
-environment. Written from a real incident (2026-08-18): enabling and
-testing `aa-headunit-kiosk@.service` hard-hung this Pi 5 at least four
-times, each requiring a physical power cycle. The root cause is not yet
-confirmed — see `packaging/systemd/aa-headunit-kiosk@.service`'s own doc
-comment for the full investigation. This document assumes that failure
-mode can recur and describes how to work around it, not how to prevent
-it.
+gets stuck, and how to get back to a normal development environment.
+Written from a real incident (2026-08-18/19): enabling and testing
+`aa-headunit-kiosk@.service`, `cage` repeatedly got stuck and stopped
+responding to a graceful stop request. **This was first believed to
+hard-hang the whole board, requiring a physical power cycle every time
+— that turned out not to be quite right.** SSH stayed fully responsive
+through every single occurrence; what actually happened was `cage`
+itself becoming unresponsive to `SIGTERM` while holding the display, so
+the screen froze and a directly-attached keyboard stopped responding,
+which looks exactly like a full system hang unless you check SSH. The
+root cause of why `cage` gets stuck is still not confirmed — see
+`packaging/systemd/aa-headunit-kiosk@.service`'s own doc comment for the
+full investigation. This document assumes that failure mode can recur
+and describes how to recover from it over SSH, without a power cycle.
 
 ## How the appliance boots
 
@@ -46,40 +52,53 @@ Do not enable the kiosk unit expecting the hang to be fixed — it hasn't
 been confirmed fixed. See the unit file's own doc comment before trying
 again.
 
-## If the kiosk service hangs the board
+## If the kiosk service gets stuck
 
-Real-hardware symptom (observed repeatedly): a VNC session watching the
-display goes grey and stops updating, and a directly-attached keyboard
-stops responding. No kernel panic, oops, or hung-task warning has ever
-appeared in the journal for a crashed boot — this looks like a
-firmware/GPU-level lockup the OS itself never gets to log, not a
-userspace crash with a stack trace to chase.
+Real-hardware symptom (observed repeatedly): the display freezes/goes
+grey and a directly-attached keyboard stops responding, seconds to a
+couple of minutes after the kiosk service reaches its virtual terminal.
+This *looks* like the whole board hung, but real-hardware investigation
+found it isn't: **SSH stayed fully responsive through every single
+occurrence.** What's actually stuck is `cage` itself, holding the
+display, unresponsive to a graceful stop — confirmed directly in the
+journal, twice: once as `systemctl stop` sitting for over a minute with
+zero progress, once as systemd's own `State 'stop-sigterm' timed out.
+Killing.` (its default 90s `TimeoutStopSec`, now shortened to 10s in the
+unit itself, so this should self-resolve automatically going forward).
+No kernel panic, oops, or hung-task warning has ever appeared in the
+journal for any of these — consistent with `cage` being stuck, not the
+kernel.
 
-**SSH access kept working throughout every one of these hangs this
-session.** If you have an SSH session open (or can open a new one — the
-network stack and `sshd` are unaffected by a hung display), that is the
-reliable way to investigate and recover:
+**Recovery over SSH — no physical power cycle needed:**
 
 ```
 # Confirm what's actually running/enabled
 systemctl is-enabled lightdm.service aa-headunit-kiosk@tty2.service
 systemctl status aa-headunit-kiosk@tty2.service
 
+# Force-kill the stuck compositor directly — don't wait on a graceful
+# stop, and don't reach for the power button. This is the step that was
+# missed during the initial investigation, when a graceful stop
+# appeared to hang and was mistaken for the whole board being frozen.
+sudo systemctl kill -s KILL aa-headunit-kiosk@tty2.service
+
 # Disable the kiosk and restore the normal desktop boot
 sudo systemctl disable aa-headunit-kiosk@tty2.service
 sudo systemctl enable lightdm.service
 ```
 
-If SSH is also unresponsive (not observed yet, but plan for it): the
-board needs a physical power cycle. A short press of the power button
+If SSH is ever genuinely unresponsive too (not observed in any occurrence
+so far, despite `cage` itself getting stuck repeatedly): *then* a
+physical power cycle is the fallback. A short press of the power button
 is caught by `systemd-logind` as a normal shutdown request and — if the
-kernel and `systemd-logind` are still alive underneath the hung display,
-which they were in every occurrence so far — produces a clean, orderly
+kernel and `systemd-logind` are still alive, which they always were in
+every occurrence investigated so far — produces a clean, orderly
 shutdown (filesystems synced, services stopped in order). This is worth
-knowing: **a clean-looking shutdown sequence in the journal after a
-hang is evidence the recovery action worked, not evidence nothing was
-actually wrong.** Cross-check by searching for `Power key pressed` in
-the crashed boot's journal (see below) — its presence confirms a manual
+knowing regardless: **a clean-looking shutdown sequence in the journal
+after a "hang" is evidence a recovery action worked (whether SSH-based
+or a manual power-button press), not evidence nothing was actually
+wrong.** Cross-check by searching for `Power key pressed` in the
+journal (see below) — its presence confirms a manual power-button
 recovery happened at that point, not a spontaneous graceful shutdown.
 
 ## Investigating a crash after the fact
@@ -94,6 +113,7 @@ journalctl --list-boots
 sudo journalctl -b -1 --no-pager | tail -150   # the crashed boot, tail end
 sudo journalctl -b -1 -k --no-pager | grep -iE 'BUG:|Oops|panic|hung task'
 sudo journalctl -b -1 --no-pager | grep -i 'power key'
+sudo journalctl -b -1 -u aa-headunit-kiosk@tty2.service --no-pager   # the specific signature: a systemctl stop with no further progress, or "State 'stop-sigterm' timed out. Killing."
 vcgencmd get_throttled   # only reflects the *current* boot, not the crashed one
 vcgencmd measure_temp
 ```
