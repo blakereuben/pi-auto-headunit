@@ -19,22 +19,40 @@
 # group anchor (`/etc/aa-headunit`, `/var/lib/aa-headunit`, USB/GPIO
 # access), not a session identity.
 #
-# A per-user autostart file REPLACES the system default entirely rather
-# than adding to it, so the desktop components below are copied from
-# `/etc/xdg/labwc/autostart` on purpose, not incidentally — keep them in
-# sync if the base Raspberry Pi OS image ever changes its own default.
-/usr/bin/lwrespawn /usr/bin/pcmanfm-pi &
-/usr/bin/lwrespawn /usr/bin/wf-panel-pi &
-/usr/bin/kanshi &
-/usr/bin/lxsession-xdg-autostart &
-
-# Fails open to the plain desktop above rather than retrying a broken
-# kiosk session on every boot: preflight (ARCHITECTURE.md §9 — display,
-# touch input, writable state dir, USB, audio) gates whether the
-# fullscreen app is even attempted, exactly like the old unit's
-# `Requires=aa-headunit-preflight.service` did, just as a plain
-# in-script check instead of a separate systemd dependency now that
-# there is no longer a discrete unit for it to gate.
-if /usr/bin/aa-headunit-diagnostics preflight; then
+# Real-hardware finding (2026-08-19): `/usr/bin/labwc-pi` always execs
+# `labwc -m` ("merge-config" — confirmed via `labwc --help`: "Merge user
+# config files/theme in all XDG Base Dirs"), which runs BOTH the system
+# default (`/etc/xdg/labwc/autostart`) AND this per-user file — it does
+# NOT replace one with the other the way plain (non-`-m`) labwc's own
+# docs describe. An earlier version of this file assumed the opposite
+# and re-launched the panel/file-manager/kanshi/xdg-autostart itself "to
+# avoid losing them" — that was never actually at risk, and instead
+# caused every one of them to run twice (confirmed: two `wf-panel-pi`
+# processes, a visibly doubled taskbar, and periodic white/blank
+# flashes as both instances fought to composite the same outputs). This
+# file must contain ONLY what the system default does not already do —
+# the app launch below.
+#
+# Fails open to the plain desktop rather than retrying a broken
+# kiosk session on every boot: `launch-on-boot-enabled` checks the
+# operator's own persisted preference (Display settings page) — **off
+# by default** (2026-08-19, deliberate operator decision: a real-hardware
+# trial the same day found "return to desktop" can hang the whole
+# compositor with no recourse but a physical reboot; an unattended
+# appliance that can silently hang on boot with no way to intervene is
+# worse than one that boots to a plain, always-usable desktop — see
+# `docs/development/appliance-recovery.md`). Turning this on is an
+# explicit opt-in once that hang is confirmed fixed on real hardware.
+# Preflight (ARCHITECTURE.md §9 — display, touch input, writable state
+# dir, USB,
+# audio) gates whether the fullscreen app is even attempted, exactly
+# like the old unit's `Requires=aa-headunit-preflight.service` did, just
+# as a plain in-script check instead of a separate systemd dependency
+# now that there is no longer a discrete unit for it to gate. The
+# desktop shortcut (`aa-headunit.desktop`, `~/Desktop` and the
+# application menu) still launches the app manually regardless of the
+# "launch on boot" setting.
+if /usr/bin/aa-headunit-diagnostics launch-on-boot-enabled \
+    && /usr/bin/aa-headunit-diagnostics preflight; then
     exec /usr/bin/aa-headunit-diagnostics usb kiosk --allow-live-aap
 fi

@@ -88,7 +88,8 @@ const fn is_retryable(error: &CliError) -> bool {
         | CliError::Media(_)
         | CliError::Credentials(_)
         | CliError::Cancelled
-        | CliError::PreflightFailed(_) => false,
+        | CliError::PreflightFailed(_)
+        | CliError::LaunchOnBootDisabled => false,
     }
 }
 

@@ -378,6 +378,7 @@ fn activate_window(
     let settings_panel = build_settings_panel(
         gesture_settings.borrow().arm_window_seconds(),
         gesture_settings.borrow().mtp_popup_suppression_enabled(),
+        gesture_settings.borrow().launch_on_boot(),
         gesture_settings.borrow().display_brightness_percent(),
         gesture_settings.borrow().audio_output_device(),
         gesture_settings.borrow().microphone_input_device(),
@@ -507,6 +508,45 @@ fn wire_gesture_poll(
     })
 }
 
+/// Real-hardware finding (2026-08-19): this used to be a bare one-shot
+/// `glib::timeout_add_seconds_local` inlined at the end of
+/// `wire_session_polls`, unconditionally calling `application.quit()`
+/// once `hang_safety_net_seconds` elapsed — full stop, with no check of
+/// whether the session was actually hung. Every session, healthy or not,
+/// got force-quit at exactly that mark; `usb kiosk`'s own outer
+/// reconnect loop immediately relaunched a fresh one, so a real phone
+/// session looked like a recurring white-screen blip every
+/// `HANG_SAFETY_NET_SECONDS` (120s) rather than a one-time crash —
+/// confirmed against the operator's own real-hardware report ("white
+/// screen... after 2 mins of AA being active", matching
+/// `HANG_SAFETY_NET_SECONDS` to the second). This module's own doc
+/// comment on `HANG_SAFETY_NET_SECONDS` already stated the intended
+/// design — "Safety net only — normal shutdown happens the moment the
+/// session-result poll receives the background thread's outcome" — the
+/// bug was that the timer never actually got cancelled once that normal
+/// path was confirmed working. The returned `SourceId` handle is
+/// cancelled by `wire_session_polls`'s capability poll the first time it
+/// sees a real `DecoderCapability` (proof video setup — the AOA
+/// transition, protocol handshake, and TLS/service-discovery — completed
+/// and the session is no longer just sitting in early setup); after
+/// that, only an actual session-result (a real error, or an
+/// operator-requested stop) can end the session, matching the doc
+/// comment's intent. Sessions that never get that far (a genuine early
+/// hang) are still protected exactly as before.
+fn install_hang_safety_net(
+    application: &Application,
+    hang_safety_net_seconds: u32,
+) -> Rc<RefCell<Option<glib::SourceId>>> {
+    let application = application.clone();
+    Rc::new(RefCell::new(Some(glib::timeout_add_seconds_local(
+        hang_safety_net_seconds,
+        move || {
+            application.quit();
+            glib::ControlFlow::Break
+        },
+    ))))
+}
+
 /// Spawns the background protocol thread and wires every poll bridging it
 /// (and the settings/rotation gesture machinery) back to the GTK main
 /// thread. Extracted from `connect_activate`'s closure purely to keep
@@ -539,9 +579,15 @@ fn wire_session_polls(state: SessionPollState) {
         final_result,
     } = state;
 
+    let safety_net_id = install_hang_safety_net(&application, hang_safety_net_seconds);
+
+    let safety_net_id_for_capability = Rc::clone(&safety_net_id);
     let _capability_poll_id = glib::timeout_add_local(POLL_INTERVAL, move || {
         match capability_receiver.try_recv() {
             Ok(capability) => {
+                if let Some(id) = safety_net_id_for_capability.borrow_mut().take() {
+                    id.remove();
+                }
                 let outcome = build_gtk4_pipeline(&capability, &picture);
                 let _ = pipeline_sender.send(outcome);
                 glib::ControlFlow::Break
@@ -617,11 +663,6 @@ fn wire_session_polls(state: SessionPollState) {
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
         }
-    });
-
-    let _timeout_id = glib::timeout_add_seconds_local(hang_safety_net_seconds, move || {
-        application.quit();
-        glib::ControlFlow::Break
     });
 }
 
@@ -728,6 +769,7 @@ struct SettingsPanel {
     flip_screen_button: Button,
     arm_timeout_spin: SpinButton,
     mtp_suppression_check: CheckButton,
+    launch_on_boot_check: CheckButton,
     brightness_scale: Scale,
     audio_output_dropdown: DropDown,
     audio_output_devices: Rc<Vec<String>>,
@@ -1225,6 +1267,7 @@ struct DisplayPageBuild {
     flip_screen_button: Button,
     arm_timeout_spin: SpinButton,
     mtp_suppression_check: CheckButton,
+    launch_on_boot_check: CheckButton,
     brightness_scale: Scale,
     audio_output_dropdown: DropDown,
     audio_output_devices: Vec<String>,
@@ -1236,9 +1279,11 @@ struct DisplayPageBuild {
 
 /// Builds the Display page — split out of `build_settings_panel` purely
 /// to keep it under `clippy::too_many_lines`.
+#[allow(clippy::too_many_arguments)]
 fn build_display_page(
     initial_arm_window_seconds: u32,
     initial_mtp_popup_suppression_enabled: bool,
+    initial_launch_on_boot: bool,
     initial_display_brightness_percent: u8,
     initial_audio_output_device: Option<&str>,
     initial_microphone_input_device: Option<&str>,
@@ -1275,6 +1320,15 @@ fn build_display_page(
     mtp_suppression_check.set_active(initial_mtp_popup_suppression_enabled);
     page.append(&mtp_suppression_check);
 
+    // On by default (`HeadUnitSettings::launch_on_boot`'s doc comment) —
+    // an operator turns this off to get a plain desktop on boot instead
+    // of the fullscreen app, e.g. while testing. The desktop shortcut
+    // (`packaging/labwc/aa-headunit.desktop`) still launches it manually
+    // either way.
+    let launch_on_boot_check = CheckButton::with_label("Launch on boot");
+    launch_on_boot_check.set_active(initial_launch_on_boot);
+    page.append(&launch_on_boot_check);
+
     let (
         brightness_scale,
         audio_output_dropdown,
@@ -1305,6 +1359,7 @@ fn build_display_page(
         flip_screen_button,
         arm_timeout_spin,
         mtp_suppression_check,
+        launch_on_boot_check,
         brightness_scale,
         audio_output_dropdown,
         audio_output_devices,
@@ -1373,6 +1428,7 @@ fn build_themes_page() -> ThemesPageBuild {
 fn build_settings_panel(
     initial_arm_window_seconds: u32,
     initial_mtp_popup_suppression_enabled: bool,
+    initial_launch_on_boot: bool,
     initial_display_brightness_percent: u8,
     initial_audio_output_device: Option<&str>,
     initial_microphone_input_device: Option<&str>,
@@ -1382,6 +1438,7 @@ fn build_settings_panel(
     let display = build_display_page(
         initial_arm_window_seconds,
         initial_mtp_popup_suppression_enabled,
+        initial_launch_on_boot,
         initial_display_brightness_percent,
         initial_audio_output_device,
         initial_microphone_input_device,
@@ -1499,6 +1556,7 @@ fn build_settings_panel(
         flip_screen_button: display.flip_screen_button,
         arm_timeout_spin: display.arm_timeout_spin,
         mtp_suppression_check: display.mtp_suppression_check,
+        launch_on_boot_check: display.launch_on_boot_check,
         brightness_scale: display.brightness_scale,
         audio_output_dropdown: display.audio_output_dropdown,
         audio_output_devices: Rc::new(display.audio_output_devices),
@@ -1621,6 +1679,26 @@ fn wire_mtp_suppression_toggle(
                 .borrow()
                 .save(Path::new(DEFAULT_SETTINGS_PATH));
             crate::mtp_suppression::sync(enabled);
+        });
+}
+
+/// Mirrors [`wire_mtp_suppression_toggle`] for the "Launch on boot" check
+/// button — see `HeadUnitSettings::launch_on_boot`'s doc comment for what
+/// this actually gates.
+fn wire_launch_on_boot_toggle(
+    settings_panel: &SettingsPanel,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    let gesture_settings = Rc::clone(gesture_settings);
+    settings_panel
+        .launch_on_boot_check
+        .connect_toggled(move |check| {
+            gesture_settings
+                .borrow_mut()
+                .set_launch_on_boot(check.is_active());
+            let _ = gesture_settings
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
         });
 }
 
@@ -1935,6 +2013,7 @@ fn wire_settings_panel(
         });
 
     wire_mtp_suppression_toggle(settings_panel, gesture_settings);
+    wire_launch_on_boot_toggle(settings_panel, gesture_settings);
     wire_brightness_and_device_settings(settings_panel, gesture_settings);
 
     let settings_panel_for_cycle = settings_panel.clone();
@@ -2048,6 +2127,14 @@ fn build_gtk4_pipeline(
             )
         })?;
     picture.set_paintable(Some(&paintable));
+    // See `VideoRenderPipeline::set_window_size`'s doc comment — keeps
+    // the sink informed of the actual rendering surface size, last set
+    // (staler than ideal, but real) here at build time. `toggle_fullscreen`
+    // refreshes this again after every fullscreen↔windowed transition,
+    // which is the point this actually matters most.
+    let width = u32::try_from(picture.width()).unwrap_or(0);
+    let height = u32::try_from(picture.height()).unwrap_or(0);
+    pipeline.set_window_size(width, height);
     pipeline.start()?;
     Ok(pipeline)
 }

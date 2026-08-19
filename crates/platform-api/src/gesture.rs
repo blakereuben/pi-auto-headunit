@@ -83,8 +83,18 @@ const LONG_PRESS_MAX_DURATION_MICROS: u64 = 5_000_000;
 /// How far a single finger may drift and still count as "held still" for
 /// tap/long-press classification, rather than a swipe — squared, compared
 /// against squared displacement the same way the arming swipe's own
-/// threshold is (see [`ArmedGestureDetector`]'s doc comment).
-const STATIONARY_MAX_DISTANCE_SQUARED: u64 = 40 * 40;
+/// threshold is (see [`ArmedGestureDetector`]'s doc comment). Real-hardware
+/// finding (2026-08-19): a real finger tap that drifts *more* than this but
+/// still well short of the swipe threshold (`SETTINGS_GESTURE_SWIPE_THRESHOLD_PIXELS`,
+/// a quarter of the touch coordinate space's height) falls into
+/// [`SingleFingerOutcome::Ambiguous`] — neither a tap nor a swipe — which
+/// silently aborts an in-progress double-tap rather than counting as the
+/// first/second tap. The operator reported double-tap not always
+/// registering; raised from `40` (a real finger's natural wobble during a
+/// quick tap plausibly exceeds that) to shrink this dead zone, while
+/// staying well clear of the swipe threshold so a genuine short swipe still
+/// can't be misread as a tap.
+const STATIONARY_MAX_DISTANCE_SQUARED: u64 = 70 * 70;
 
 /// Which follow-up gesture completed while armed. Kept small and closed
 /// (not an open plugin system) — see this module's doc comment for why.

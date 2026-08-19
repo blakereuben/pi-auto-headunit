@@ -214,6 +214,31 @@ impl VideoRenderPipeline {
             .map(|element| element.property_value("paintable"))
     }
 
+    /// Real-hardware finding (2026-08-19): `gtk4paintablesink` exposes
+    /// `window-width`/`window-height` ("the width/height of the main
+    /// widget rendering the paintable" — `gst-inspect-1.0
+    /// gtk4paintablesink`, "changeable in NULL, READY, PAUSED or PLAYING
+    /// state") specifically so the embedding application can keep it
+    /// informed of the actual rendering surface's size; this crate never
+    /// set them, so the sink operated with stale/zero dimensions the
+    /// whole session. Investigated while chasing a real-hardware
+    /// compositor hang triggered by the fullscreen↔windowed transition
+    /// ("return to desktop") — a confirmed, real, and plausible
+    /// contributor (a resize the sink was never told about), though not
+    /// independently confirmed as the *sole* cause; a caller should set
+    /// this at pipeline build time and again whenever the rendering
+    /// widget's actual size changes, matching the property's own
+    /// documented intent. Safe to call from any thread — a plain
+    /// `GObject` property, unlike the `paintable`/`GdkPaintable` value
+    /// itself, which glib's `ThreadGuard` restricts to the creating
+    /// thread (see `VideoRenderPipeline`'s own `Drop` impl).
+    pub fn set_window_size(&self, width: u32, height: u32) {
+        if let Some(sink) = self.pipeline.by_name("gtk_paintable_sink") {
+            sink.set_property("window-width", width);
+            sink.set_property("window-height", height);
+        }
+    }
+
     /// Graceful shutdown: EOS, bounded wait for it to propagate, then
     /// `Null`. Consumes `self`; `Drop` below is the unconditional safety
     /// net for every other exit path (including error/unwind), so callers
@@ -237,9 +262,31 @@ impl VideoRenderPipeline {
 
 impl Drop for VideoRenderPipeline {
     fn drop(&mut self) {
-        // Best-effort; Drop cannot propagate errors, and EOS is not
+        // Real-hardware finding (2026-08-19): `RenderSink::Gtk4Paintable`'s
+        // `gtk4paintablesink` wraps a GTK-widget-bound `GObject` that
+        // `glib`'s `ThreadGuard` only allows the creating thread to touch
+        // — the GTK main thread, since `gtk_dev_ui.rs` always builds this
+        // pipeline from its `capability_receiver` poll (a
+        // `glib::timeout_add_local` callback). But the built pipeline is
+        // then handed across an `mpsc` channel to a background session
+        // thread (`auth_discovery_probe.rs`'s `VideoRenderState::Running`),
+        // which owns it for the rest of the session and is the thread
+        // that actually drops it once the session ends. A plain
+        // `set_state(Null)` here running on that thread panics
+        // ("Value accessed from different thread than where it was
+        // created") inside `gst_element_change_state` — and since that's
+        // a panic in a non-unwind-safe FFI callback, it hard-aborts the
+        // whole process rather than returning an error, confirmed via a
+        // real boot-to-kiosk session that crashed exactly this way right
+        // after a clean session end. Marshal the actual teardown onto the
+        // main `GLib` context instead (safe to call from any thread) —
+        // best-effort and fire-and-forget, matching this Drop impl's
+        // existing contract: Drop cannot propagate errors, and EOS is not
         // required for a safe teardown (Null is always sufficient).
-        let _ = self.pipeline.set_state(gst::State::Null);
+        let pipeline = self.pipeline.clone();
+        gst::glib::MainContext::default().invoke(move || {
+            let _ = pipeline.set_state(gst::State::Null);
+        });
     }
 }
 

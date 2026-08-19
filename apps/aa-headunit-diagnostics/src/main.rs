@@ -52,6 +52,7 @@ fn main() {
 fn run(args: &[String]) -> Result<(), CliError> {
     match args {
         [command] if command == "preflight" => preflight(),
+        [command] if command == "launch-on-boot-enabled" => launch_on_boot_enabled(),
         [command] if command == "wireless" => wireless(&[]),
         [command, rest @ ..] if command == "wireless" => wireless(rest),
         [group, command] if group == "media" && command == "probe" => media_probe(),
@@ -330,6 +331,7 @@ fn print_help() {
          \n\
          Commands:\n\
            preflight\n\
+           launch-on-boot-enabled\n\
            wireless [--wifi auto|onboard|STABLE_ID] [--bluetooth auto|onboard|STABLE_ID]\n\
            media probe\n\
            media mic-probe [--seconds N]\n\
@@ -532,6 +534,31 @@ fn preflight() -> Result<(), CliError> {
         return Err(CliError::PreflightFailed(appliance_failures.join("; ")));
     }
     Ok(())
+}
+
+/// Gates `packaging/labwc/aa-headunit-autostart`'s fullscreen auto-launch
+/// on the operator's persisted "launch on boot" preference
+/// (`settings::HeadUnitSettings::launch_on_boot`, **off by default** —
+/// see that method's own doc comment for why) — a plain shell script
+/// can't parse this project's TOML settings file directly, so it shells
+/// out to this exit-code-only check instead, exactly like it already
+/// does for `preflight`. A missing/unreadable settings file also reads
+/// as disabled: `HeadUnitSettings::load` falls back to `defaults()`
+/// (launch-on-boot `false`) in that case, so a fresh install boots to a
+/// plain desktop until an operator deliberately opts in.
+#[cfg(target_os = "linux")]
+fn launch_on_boot_enabled() -> Result<(), CliError> {
+    let path = std::path::Path::new(settings::DEFAULT_SETTINGS_PATH);
+    if settings::HeadUnitSettings::load(path).launch_on_boot() {
+        Ok(())
+    } else {
+        Err(CliError::LaunchOnBootDisabled)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn launch_on_boot_enabled() -> Result<(), CliError> {
+    Err(CliError::UnsupportedPlatform)
 }
 
 /// A connected DRM output means a display is actually plugged in and
@@ -1545,6 +1572,13 @@ enum CliError {
     /// change (a display plugged back in, `/var/lib/aa-headunit`
     /// recreated) without a different board or OS.
     PreflightFailed(String),
+    /// `launch-on-boot-enabled`'s check found the operator's persisted
+    /// preference (`settings::HeadUnitSettings::launch_on_boot`) turned
+    /// off — a deliberate operator choice, not a failure condition like
+    /// `PreflightFailed`, but still needs a non-zero exit so the plain
+    /// shell `if` in `packaging/labwc/aa-headunit-autostart` skips the
+    /// fullscreen launch.
+    LaunchOnBootDisabled,
 }
 
 impl CliError {
@@ -1567,6 +1601,7 @@ impl CliError {
             #[cfg(target_os = "linux")]
             Self::Cancelled => 22,
             Self::PreflightFailed(_) => 23,
+            Self::LaunchOnBootDisabled => 24,
         }
     }
 }
@@ -1590,6 +1625,9 @@ impl std::fmt::Display for CliError {
             #[cfg(target_os = "linux")]
             Self::Cancelled => write!(f, "cancelled by operator (Ctrl-C)"),
             Self::PreflightFailed(reason) => write!(f, "preflight: {reason}"),
+            Self::LaunchOnBootDisabled => {
+                write!(f, "launch-on-boot is disabled in settings")
+            }
         }
     }
 }

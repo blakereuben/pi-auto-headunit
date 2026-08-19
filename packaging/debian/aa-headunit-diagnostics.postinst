@@ -136,6 +136,28 @@ case "$1" in
                     "$active_home/.config/labwc" \
                     "$active_home/.config/labwc/autostart"
             fi
+            # A manual way to launch the app regardless of the
+            # "launch on boot" setting (`settings::HeadUnitSettings::
+            # launch_on_boot`) — both a real desktop icon (if the
+            # account has a Desktop folder — not created here if
+            # missing, since an operator who deleted/never wanted one
+            # shouldn't have it silently recreated) and an application-
+            # menu entry (always installed; `~/.local/share/applications`
+            # is a normal part of any XDG desktop account).
+            if [ -n "$active_home" ] && [ -d "$active_home" ] \
+                && [ -f /usr/share/aa-headunit/aa-headunit.desktop ]; then
+                if [ -d "$active_home/Desktop" ]; then
+                    install -m0755 /usr/share/aa-headunit/aa-headunit.desktop \
+                        "$active_home/Desktop/aa-headunit.desktop"
+                    chown "$active_user:$active_user" \
+                        "$active_home/Desktop/aa-headunit.desktop"
+                fi
+                mkdir -p "$active_home/.local/share/applications"
+                install -m0755 /usr/share/aa-headunit/aa-headunit.desktop \
+                    "$active_home/.local/share/applications/aa-headunit.desktop"
+                chown -R "$active_user:$active_user" \
+                    "$active_home/.local/share/applications"
+            fi
         fi
 
         # Obsolete files from earlier designs (the VT-templated

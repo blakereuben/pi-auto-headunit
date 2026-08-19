@@ -243,6 +243,8 @@ struct RawSettings {
     bluetooth_preference: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     theme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch_on_boot: Option<bool>,
 }
 
 /// `ProviderPreference` (`platform_api`) has no `Display`/serialization
@@ -329,6 +331,7 @@ pub struct HeadUnitSettings {
     wifi_preference: platform_api::ProviderPreference,
     bluetooth_preference: platform_api::ProviderPreference,
     theme: Option<String>,
+    launch_on_boot: bool,
 }
 
 impl HeadUnitSettings {
@@ -375,6 +378,7 @@ impl HeadUnitSettings {
             wifi_preference: platform_api::ProviderPreference::Auto,
             bluetooth_preference: platform_api::ProviderPreference::Auto,
             theme: None,
+            launch_on_boot: false,
         }
     }
 
@@ -552,6 +556,30 @@ impl HeadUnitSettings {
         self.theme = theme;
     }
 
+    /// Gates `packaging/labwc/aa-headunit-autostart`'s fullscreen
+    /// auto-launch (checked via the `launch-on-boot-enabled` CLI
+    /// subcommand, since a plain shell script can't parse this file's
+    /// TOML directly) — **off by default**. Deliberate operator decision
+    /// (2026-08-19), not an oversight: a real-hardware trial the same day
+    /// found the fullscreen↔windowed transition ("return to desktop")
+    /// can hang the whole compositor, with no way to recover short of a
+    /// physical reboot — see `docs/development/appliance-recovery.md`.
+    /// An unattended appliance that can silently hang on boot with no
+    /// recourse is a worse default than one that boots to a plain,
+    /// always-usable desktop; only turn this on once that hang is
+    /// confirmed fixed on real hardware. An operator can turn it on from
+    /// the Display settings page; the desktop shortcut
+    /// (`packaging/labwc/aa-headunit.desktop`) still launches the app
+    /// manually either way, regardless of this setting.
+    #[must_use]
+    pub fn launch_on_boot(&self) -> bool {
+        self.launch_on_boot
+    }
+
+    pub fn set_launch_on_boot(&mut self, enabled: bool) {
+        self.launch_on_boot = enabled;
+    }
+
     /// Loads from `path`; falls back to [`Self::defaults`] on any error
     /// (missing file, unreadable, malformed, or an unrecognized
     /// gesture/action key — forward/backward compatible with a future
@@ -601,6 +629,9 @@ impl HeadUnitSettings {
         if let Some(theme) = raw.theme {
             settings.set_theme(Some(theme));
         }
+        if let Some(enabled) = raw.launch_on_boot {
+            settings.set_launch_on_boot(enabled);
+        }
         Some(settings)
     }
 
@@ -609,7 +640,29 @@ impl HeadUnitSettings {
     /// permissions from packaging — this only ever needs `create_dir_all`
     /// for a fresh `/var/lib/aa-headunit` that already has the right
     /// parent permissions, never for `/var/lib` itself).
+    ///
+    /// Real-hardware finding (2026-08-19): the operator's `theme` choice
+    /// repeatedly vanished from disk across a session with heavy testing
+    /// activity (the app manually relaunched many times over, sometimes
+    /// with more than one instance briefly alive at once). Root cause: a
+    /// `HeadUnitSettings` in memory only ever reflects whatever was on
+    /// disk *at the moment it was loaded* — every call site here saves
+    /// the *whole* object on every single change (mtp toggle, rotation,
+    /// brightness, ...), so a process whose own in-memory copy predates
+    /// a field being set elsewhere silently writes that field back to
+    /// its own default the next time anything at all changes, clobbering
+    /// a concurrently-running process's more recent save. For every
+    /// `Option`-typed field, `None` unambiguously means "this process
+    /// never touched or loaded a value for this" (never "deliberately
+    /// cleared" — none of these fields have a UI path that sets `None`
+    /// on purpose), so it's safe to re-read whatever is currently on
+    /// disk for exactly those fields and defer to it instead of
+    /// overwriting with a stale `None`. Every other field lacks that
+    /// distinction (e.g. `false`/`0` are both real, legitimate,
+    /// deliberately-chosen values as well as defaults), so those are
+    /// unaffected and still save exactly what this in-memory copy holds.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        let on_disk = Self::try_load(path);
         let mut raw = RawSettings::default();
         for gesture in GestureId::all() {
             raw.set(gesture, self.action_for(gesture));
@@ -618,14 +671,28 @@ impl HeadUnitSettings {
         raw.suppress_phone_mtp_popups = Some(self.mtp_popup_suppression_enabled);
         raw.rotation_degrees = Some(rotation_to_degrees(self.rotation));
         raw.display_brightness_percent = Some(self.display_brightness_percent);
-        raw.audio_output_device
-            .clone_from(&self.audio_output_device);
-        raw.microphone_input_device
-            .clone_from(&self.microphone_input_device);
-        raw.night_mode_gpio_line = self.night_mode_gpio_line;
+        raw.audio_output_device = self.audio_output_device.clone().or_else(|| {
+            on_disk
+                .as_ref()
+                .and_then(|settings| settings.audio_output_device.clone())
+        });
+        raw.microphone_input_device = self.microphone_input_device.clone().or_else(|| {
+            on_disk
+                .as_ref()
+                .and_then(|settings| settings.microphone_input_device.clone())
+        });
+        raw.night_mode_gpio_line = self.night_mode_gpio_line.or_else(|| {
+            on_disk
+                .as_ref()
+                .and_then(|settings| settings.night_mode_gpio_line)
+        });
         raw.wifi_preference = Some(provider_preference_to_key(&self.wifi_preference));
         raw.bluetooth_preference = Some(provider_preference_to_key(&self.bluetooth_preference));
-        raw.theme.clone_from(&self.theme);
+        raw.theme = self
+            .theme
+            .clone()
+            .or_else(|| on_disk.as_ref().and_then(|settings| settings.theme.clone()));
+        raw.launch_on_boot = Some(self.launch_on_boot);
         let text = toml::to_string_pretty(&raw)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         if let Some(parent) = path.parent() {
@@ -991,6 +1058,66 @@ mod tests {
 
         let loaded = HeadUnitSettings::load(&path);
         assert_eq!(loaded.theme(), Some("sunset"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Real-hardware finding (2026-08-19): the operator's theme choice
+    /// repeatedly vanished from disk during a session with heavy testing
+    /// activity — traced to a second, independently-loaded (and thus
+    /// theme-unaware) `HeadUnitSettings` in a different process saving
+    /// over it. Reproduces that exact race in miniature: process A loads
+    /// fresh, sets a theme, saves; process B — already loaded *before*
+    /// that save, so its own `theme` is still `None` — then saves an
+    /// unrelated change. Without `save`'s on-disk merge for
+    /// `Option`-typed fields, process B's save would blindly overwrite
+    /// process A's theme with `None`.
+    #[test]
+    fn a_second_already_loaded_settings_instance_does_not_clobber_a_concurrently_saved_theme() {
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-concurrent-theme-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        // Both "processes" start from the same pre-theme on-disk state.
+        let mut process_a = HeadUnitSettings::defaults();
+        process_a.save(&path).expect("initial save succeeds");
+        let mut process_b = HeadUnitSettings::load(&path);
+
+        process_a.set_theme(Some("sunset".to_string()));
+        process_a.save(&path).expect("process a save succeeds");
+        assert_eq!(HeadUnitSettings::load(&path).theme(), Some("sunset"));
+
+        // process_b never learned about the theme — its own save (for
+        // something unrelated) must not erase it.
+        process_b.set_launch_on_boot(true);
+        process_b.save(&path).expect("process b save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.theme(), Some("sunset"));
+        assert!(loaded.launch_on_boot());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_on_boot_defaults_to_false_and_round_trips_enabled() {
+        let defaults = HeadUnitSettings::defaults();
+        assert!(!defaults.launch_on_boot());
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-launch-on-boot-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_launch_on_boot(true);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert!(loaded.launch_on_boot());
 
         let _ = fs::remove_dir_all(&dir);
     }

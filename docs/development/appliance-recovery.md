@@ -47,19 +47,31 @@ problem regardless of which design is active.
 - `aa-headunit` itself is no longer a login identity — it remains only
   as the permissions-group anchor for the points above. Nothing runs as
   that uid; the app runs as whichever real account was detected.
-- The installed autostart script starts the same desktop components
-  `/etc/xdg/labwc/autostart` does (panel, file manager, output/autostart
-  helpers) — a per-user autostart file replaces the system default
-  entirely rather than adding to it, so these have to be repeated, or
-  the operator's normal desktop would silently lose its panel/file
-  manager once autologin points at them. It then runs
+- The installed autostart script contains ONLY the app-launch gate below
+  — it does not repeat the panel/file-manager/output-config lines
+  `/etc/xdg/labwc/autostart` already starts. Real-hardware finding
+  (2026-08-19): `/usr/bin/labwc-pi` always execs `labwc -m`
+  ("merge-config"), which runs BOTH the system default and a per-user
+  `~/.config/labwc/autostart` — it does NOT replace one with the other.
+  An earlier version of this file assumed the opposite and duplicated
+  those lines "to avoid losing them," which instead made every one of
+  them run twice — two `wf-panel-pi` processes, a visibly doubled
+  taskbar, and periodic white/blank flashes as both instances fought to
+  composite the same outputs. `aa-headunit-diagnostics launch-on-boot-enabled`
+  checks the operator's own persisted preference (Display settings page)
+  — **off by default** (2026-08-19, deliberate operator decision — see
+  "Real-hardware confirmed" below: turning this on is an explicit opt-in
+  once the "return to desktop" hang is confirmed fixed, not something
+  this package should risk unattended). It then runs
   `aa-headunit-diagnostics preflight` (`ARCHITECTURE.md` §9: a connected
   display, a touchscreen input device, a writable `/var/lib/aa-headunit`,
   working USB access, at least one audio device) and only execs the
-  fullscreen app (`usb kiosk --allow-live-aap`) if that passes — failing
+  fullscreen app (`usb kiosk --allow-live-aap`) if both pass — failing
   open to the plain desktop otherwise, not retrying a broken session on
   every boot. Run preflight by hand any time with
-  `aa-headunit-diagnostics preflight`.
+  `aa-headunit-diagnostics preflight`. The desktop shortcut
+  (`aa-headunit.desktop`, `~/Desktop` and the application menu) still
+  launches the app manually regardless of the "launch on boot" setting.
 - The app requests its own window fullscreen via a normal Wayland
   `xdg-shell` call (`window.fullscreen()`,
   `apps/aa-headunit-diagnostics/src/gtk_dev_ui.rs`) — this is not
@@ -76,10 +88,48 @@ the `aa-headunit` group (already a member from earlier work — no-op),
 and wrote `/home/blakereuben/.config/labwc/autostart` with correct
 ownership; `lightdm.conf`'s pre-existing `autologin-user=blakereuben`
 was correctly left untouched (the "don't override an existing choice"
-guard). **Not yet confirmed**: an actual reboot/relogin picking up the
-new autostart file and successfully reaching the fullscreen app — the
-file has been installed but this Pi has not yet been rebooted with it in
-place.
+guard); a real reboot picked up the autostart file and reached a fully
+working fullscreen app — real video/audio streaming, a clean
+operator-initiated disconnect (`ByeByeRequest`), and the auto-reconnect
+loop all confirmed. Three real bugs were found and fixed via that same
+trial, all now real-hardware-confirmed fixed: the `labwc -m`
+merge-config duplicate-autostart bug described above (doubled
+panel/taskbar); a `VideoRenderPipeline` thread-safety panic on session
+teardown (`crates/media-gstreamer/src/render.rs`'s `Drop` impl called
+`set_state(Null)` on the wrong thread, hard-aborting the whole process —
+fixed by marshalling it onto the GTK main context); and
+`gtk_dev_ui.rs`'s `HANG_SAFETY_NET_SECONDS` (120s), which force-quit
+*every* session, healthy or not, because the timer was never cancelled
+once a session was confirmed working — every real phone session looked
+like a recurring white-screen blip exactly every 2 minutes. Now
+cancelled once the video pipeline is confirmed built, matching this
+constant's own always-stated ("safety net only") intent, and confirmed
+via a real multi-cycle session running well past 2 minutes with no
+force-quit.
+
+**A fourth issue remains open and unresolved**: "return to desktop"
+(the fullscreen↔windowed toggle from the settings panel) can hang the
+*entire* compositor — not just this app's window, confirmed by the
+taskbar going blank too — with no recourse but a physical reboot.
+Real-hardware-reproducible, not yet root-caused with certainty. One
+confirmed, real gap was found and fixed while investigating: the video
+sink (`gtk4paintablesink`) exposes `window-width`/`window-height`
+properties specifically so the embedding app can keep it informed of
+the actual rendering surface size, and this project never set them —
+now set at pipeline-build time
+(`VideoRenderPipeline::set_window_size`). This is a plausible
+contributor (a resize the sink was never told about) but **not
+confirmed as the full fix** — doing so would need updating this live on
+every resize, which requires reaching into the video pipeline from a
+different thread than the one that owns it, exactly the class of bug
+that caused the thread-safety panic above; that part was deliberately
+not attempted without a way to verify it on real hardware first.
+**Consequently, `HeadUnitSettings::launch_on_boot` now defaults to
+`false`** (2026-08-19, deliberate operator decision, not an oversight):
+an unattended appliance that can silently hang on boot with no way to
+intervene is worse than one that boots to a plain, always-usable
+desktop. Do not default this back to `true` until the compositor hang
+above is confirmed fixed on real hardware.
 
 Separately (from the earlier, now-abandoned dedicated-account design):
 real-hardware testing confirmed a `labwc` session only starts correctly

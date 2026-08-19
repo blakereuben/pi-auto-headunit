@@ -534,6 +534,32 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// attempts, to test whether the phone's endpoint ever answers a later
 /// proactive write after failing an earlier one.
 const PROACTIVE_WRITE_SURVIVAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Real-hardware finding (2026-08-19): this whole module was built as a
+/// bounded diagnostic probe — `PROBE_TIMEOUT` deliberately caps the
+/// *entire* session (handshake through however long the post-`Start`
+/// observation runs) so a diagnostic run can't hang a test indefinitely.
+/// `VideoRenderTarget::Gtk4Window` sessions (`usb gtk-dev-ui`, and via
+/// it `usb kiosk` — the real M5 production/appliance session) inherited
+/// that same 30s cap unintentionally: measured directly from a real
+/// phone's own media timestamps in a real session, `PROBE_TIMEOUT`
+/// really was cutting every kiosk session off at ~30s, which
+/// `usb_kiosk`'s own reconnect loop then silently papered over by
+/// immediately restarting a fresh session — full teardown and rebuild
+/// of the AOA/TLS/handshake/service-discovery state each time, not just
+/// the video pipeline. What looked to the operator like a stable video
+/// session running for a couple of minutes before a hang was actually
+/// several of these ~30s cycles chaining together, and the repeated
+/// churn is a real, plausible contributor to that eventual hang (a real
+/// driving session should never be torn down and rebuilt every 30
+/// seconds in the first place, regardless of what the hang's exact
+/// mechanism turns out to be). A real head-unit session has no natural
+/// bound — it should keep running as long as the phone stays connected
+/// — so `Gtk4Window` sessions get this instead, long enough to never be
+/// the practical limit (a genuine hang/disconnect surfaces through the
+/// normal error/cancellation paths, not this deadline). `Wayland`
+/// sessions (the diagnostic probes `observation_window` originally
+/// existed for) are completely unaffected.
+const KIOSK_OBSERVATION_WINDOW: Duration = Duration::from_secs(60 * 60 * 24);
 /// Matches `OpenAuto`'s `AndroidAutoEntityFactory.cpp`, which constructs its
 /// `Pinger` with a hard-coded 5000ms interval
 /// (`std::make_shared<Pinger>(ioService_, 5000)`), armed from
@@ -1257,7 +1283,7 @@ pub fn run<T: SessionTransport>(
     process_actions(&mut actions, &mut handshake, &mut tls, transport, limits)?;
     println!("probe_state=version_request_sent");
 
-    let deadline = Instant::now() + observation_window(&experiment_flags);
+    let deadline = Instant::now() + observation_window(&experiment_flags, &video_render_target);
     // Not armed at session start (see `PingState`'s doc comment) — this
     // probe never sends a `PingRequest` until `ServiceDiscoveryResponse`
     // has actually been sent.
@@ -2213,11 +2239,23 @@ fn touch_settings_handoff(target: &VideoRenderTarget) -> Option<&TouchSettingsHa
 }
 
 /// Resolves how long the receive loop's deadline should be from `run()`'s
-/// own start, given the operator's chosen experiment flags. Extracted
-/// purely to keep `run()` itself under `clippy::too_many_lines`.
-fn observation_window(experiment_flags: &ExperimentFlags) -> Duration {
+/// own start, given the operator's chosen experiment flags and which
+/// [`VideoRenderTarget`] this session is for — see
+/// [`KIOSK_OBSERVATION_WINDOW`]'s doc comment for why `Gtk4Window`
+/// sessions get a different, effectively-unbounded budget instead of
+/// the diagnostic-probe default. An explicit
+/// `AA_HEADUNIT_OBSERVATION_WINDOW_SECONDS` override still wins
+/// regardless of target, since that's an operator's deliberate choice
+/// either way. Extracted purely to keep `run()` itself under
+/// `clippy::too_many_lines`.
+fn observation_window(
+    experiment_flags: &ExperimentFlags,
+    video_render_target: &VideoRenderTarget,
+) -> Duration {
     experiment_flags.observation_window_override.unwrap_or(
-        if experiment_flags.survive_proactive_write_timeout {
+        if matches!(video_render_target, VideoRenderTarget::Gtk4Window(..)) {
+            KIOSK_OBSERVATION_WINDOW
+        } else if experiment_flags.survive_proactive_write_timeout {
             PROACTIVE_WRITE_SURVIVAL_TIMEOUT
         } else {
             PROBE_TIMEOUT

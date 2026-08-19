@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Android Auto Head Unit
+Comment=Launch the head unit fullscreen (same app the autostart normally launches)
+Exec=/usr/bin/aa-headunit-diagnostics usb kiosk --allow-live-aap
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;
