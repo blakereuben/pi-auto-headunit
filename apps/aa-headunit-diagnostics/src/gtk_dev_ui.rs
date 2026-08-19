@@ -567,22 +567,23 @@ struct GestureSelector {
 type GestureSelectors = Vec<(GestureId, GestureSelector)>;
 
 /// A full-panel action picker: tapping a gesture's [`GestureSelector`]
-/// hides [`SettingsPanel::main_page`] and shows this instead, with seven
-/// big, ordinary `Button`s — one per `Action` — plus a "Back" button.
-/// Tapping an action applies it to whichever gesture is currently being
-/// edited ([`Self::editing_gesture`], set the moment the picker opens)
-/// and returns to the main page; "Back" returns without changing
-/// anything. Both pages share the settings panel's single outer
-/// `ScrolledWindow` — real-hardware feedback, 2026-08-16: two earlier
-/// designs (a popup `DropDown`, then a `MenuButton`+`Popover` holding a
-/// `ListBox` in its own nested `ScrolledWindow` with a hand-rolled
-/// touch-drag-to-scroll gesture) each broke in a different, real way on
-/// this project's touchscreen — the `DropDown` clipped options off
-/// screen, and the popover version's nested scroll-vs-row-click gesture
-/// arbitration misfired, silently reassigning several gestures to the
-/// wrong action while the operator was trying to scroll. Plain, ordinary
-/// buttons in one already-reliable scrollable page have no such gesture
-/// to arbitrate — every tap unambiguously means "select this."
+/// hides [`SettingsPanel::gestures_page`] and shows this instead, with
+/// seven big, ordinary `Button`s — one per `Action` — plus a "Back"
+/// button. Tapping an action applies it to whichever gesture is
+/// currently being edited ([`Self::editing_gesture`], set the moment the
+/// picker opens) and returns to the gestures page; "Back" returns
+/// without changing anything. Both pages share the settings panel's
+/// single outer `ScrolledWindow` — real-hardware feedback, 2026-08-16:
+/// two earlier designs (a popup `DropDown`, then a `MenuButton`+`Popover`
+/// holding a `ListBox` in its own nested `ScrolledWindow` with a
+/// hand-rolled touch-drag-to-scroll gesture) each broke in a different,
+/// real way on this project's touchscreen — the `DropDown` clipped
+/// options off screen, and the popover version's nested
+/// scroll-vs-row-click gesture arbitration misfired, silently
+/// reassigning several gestures to the wrong action while the operator
+/// was trying to scroll. Plain, ordinary buttons in one already-reliable
+/// scrollable page have no such gesture to arbitrate — every tap
+/// unambiguously means "select this."
 #[derive(Clone)]
 struct ActionPicker {
     root: GtkBox,
@@ -592,6 +593,40 @@ struct ActionPicker {
     editing_gesture: Rc<Cell<Option<GestureId>>>,
 }
 
+/// Every page the settings panel can show. At the operator's explicit
+/// request (2026-08-19), the panel opened by the arm-swipe-then-gesture
+/// is a top-level menu of buttons, each leading to its own page, rather
+/// than one long flat page of every control — the gesture-assignment
+/// controls and the previously-flat display/audio/mtp/night-mode
+/// controls split out into their own `Gestures`/`Display` pages, and
+/// five more sibling pages exist as placeholders for planned features
+/// not yet implemented.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Menu,
+    Gestures,
+    Display,
+    Themes,
+    Equalizer,
+    RearCamera,
+    DashCam,
+    ScreenMirroring,
+}
+
+/// One of the settings menu's not-yet-implemented sibling pages (Themes,
+/// EQ, Rear Camera, `DashCam`, Screen Mirroring) — just a name and a Back
+/// button for now; real controls land here as each feature is actually
+/// built. All five share this identical shape, so they're built and
+/// wired in a loop (see `build_stub_page`) rather than as five separate
+/// named struct fields.
+#[derive(Clone)]
+struct StubPage {
+    page: SettingsPage,
+    root: GtkBox,
+    open_button: Button,
+    back_button: Button,
+}
+
 /// The settings panel's widgets, kept together so `run()`'s closures can
 /// show/hide it and read its controls without threading five separate
 /// widget handles around. `Clone` is cheap (GTK widgets are themselves
@@ -599,7 +634,14 @@ struct ActionPicker {
 #[derive(Clone)]
 struct SettingsPanel {
     root: ScrolledWindow,
-    main_page: GtkBox,
+    menu_page: GtkBox,
+    gestures_page: GtkBox,
+    gestures_button: Button,
+    gestures_back_button: Button,
+    display_page: GtkBox,
+    display_button: Button,
+    display_back_button: Button,
+    stub_pages: Rc<Vec<StubPage>>,
     rotation_label: Label,
     gesture_selectors: Rc<GestureSelectors>,
     picker: ActionPicker,
@@ -615,6 +657,26 @@ struct SettingsPanel {
     microphone_input_devices: Rc<Vec<String>>,
     night_mode_gpio_enabled_check: CheckButton,
     night_mode_gpio_spin: SpinButton,
+}
+
+/// Hides every settings page except `page`, including the top-level
+/// menu itself — navigating to any page always leaves exactly one
+/// visible. Does not touch [`ActionPicker`], which is shown/hidden
+/// separately by the gesture-editing flow (it isn't reachable from the
+/// top-level menu, only from within [`SettingsPage::Gestures`]).
+fn show_settings_page(settings_panel: &SettingsPanel, page: SettingsPage) {
+    settings_panel
+        .menu_page
+        .set_visible(page == SettingsPage::Menu);
+    settings_panel
+        .gestures_page
+        .set_visible(page == SettingsPage::Gestures);
+    settings_panel
+        .display_page
+        .set_visible(page == SettingsPage::Display);
+    for stub in settings_panel.stub_pages.iter() {
+        stub.root.set_visible(stub.page == page);
+    }
 }
 
 /// A full-overlay opaque indicator shown for exactly as long as
@@ -876,7 +938,7 @@ fn selected_device(dropdown: &DropDown, devices: &[String]) -> Option<String> {
 }
 
 /// Builds the brightness slider and the two audio-device dropdowns and
-/// appends them to `main_page` — split out of `build_settings_panel`
+/// appends them to the Display page — split out of `build_settings_panel`
 /// purely to keep it under `clippy::too_many_lines`. None of the three
 /// live-apply: brightness takes effect the next time the screen is
 /// turned off/on (no live-brightness-while-lit handle exists the way
@@ -891,7 +953,7 @@ fn selected_device(dropdown: &DropDown, devices: &[String]) -> Option<String> {
 /// hot-swappable mid-stream.
 #[allow(clippy::too_many_arguments)]
 fn build_media_settings_controls(
-    main_page: &GtkBox,
+    display_page: &GtkBox,
     initial_display_brightness_percent: u8,
     initial_audio_output_device: Option<&str>,
     initial_microphone_input_device: Option<&str>,
@@ -917,7 +979,7 @@ fn build_media_settings_controls(
     brightness_scale.set_value(f64::from(initial_display_brightness_percent));
     brightness_row.append(&brightness_label);
     brightness_row.append(&brightness_scale);
-    main_page.append(&brightness_row);
+    display_page.append(&brightness_row);
 
     let audio_output_devices = list_pulse_devices("sinks");
     let audio_output_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -927,7 +989,7 @@ fn build_media_settings_controls(
     audio_output_dropdown.set_hexpand(true);
     audio_output_row.append(&audio_output_label);
     audio_output_row.append(&audio_output_dropdown);
-    main_page.append(&audio_output_row);
+    display_page.append(&audio_output_row);
 
     let microphone_input_devices = list_pulse_devices("sources");
     let microphone_input_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -937,7 +999,7 @@ fn build_media_settings_controls(
     microphone_input_dropdown.set_hexpand(true);
     microphone_input_row.append(&microphone_input_label);
     microphone_input_row.append(&microphone_input_dropdown);
-    main_page.append(&microphone_input_row);
+    display_page.append(&microphone_input_row);
 
     // Unchecked/0 (the default) means night mode is disabled — see
     // `HeadUnitSettings::night_mode_gpio_line`'s doc comment. The spin
@@ -956,7 +1018,7 @@ fn build_media_settings_controls(
     ));
     night_mode_row.append(&night_mode_gpio_enabled_check);
     night_mode_row.append(&night_mode_gpio_spin);
-    main_page.append(&night_mode_row);
+    display_page.append(&night_mode_row);
 
     (
         brightness_scale,
@@ -969,25 +1031,149 @@ fn build_media_settings_controls(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_settings_panel(
+impl SettingsPage {
+    /// The label shown both on the top-level menu's button for this page
+    /// and as that page's own title.
+    fn label(self) -> &'static str {
+        match self {
+            SettingsPage::Menu => "Settings",
+            SettingsPage::Gestures => "Gestures",
+            SettingsPage::Display => "Display",
+            SettingsPage::Themes => "Themes",
+            SettingsPage::Equalizer => "EQ",
+            SettingsPage::RearCamera => "Rear Camera",
+            SettingsPage::DashCam => "DashCam",
+            SettingsPage::ScreenMirroring => "Screen Mirroring",
+        }
+    }
+}
+
+/// Builds one of the settings menu's not-yet-implemented sibling pages
+/// (Themes, EQ, Rear Camera, `DashCam`, Screen Mirroring) — a title and a
+/// Back button, nothing else yet; real controls land here as each
+/// feature is actually built. `open_button` (what the top-level menu
+/// grid actually holds) is built here too so a page's full navigation
+/// wiring lives in one place.
+fn build_stub_page(page: SettingsPage) -> StubPage {
+    let root = GtkBox::new(Orientation::Vertical, 8);
+    root.set_visible(false);
+
+    let title = Label::new(Some(page.label()));
+    root.append(&title);
+
+    let coming_soon = Label::new(Some("Coming soon."));
+    root.append(&coming_soon);
+
+    let back_button = Button::with_label("Back");
+    root.append(&back_button);
+
+    let open_button = Button::with_label(page.label());
+    open_button.set_hexpand(true);
+
+    StubPage {
+        page,
+        root,
+        open_button,
+        back_button,
+    }
+}
+
+/// Everything [`build_gestures_page`] builds — bundled into a struct
+/// (rather than a long tuple) purely for readability at the call site.
+struct GesturesPageBuild {
+    page: GtkBox,
+    open_button: Button,
+    back_button: Button,
+    selectors: Vec<(GestureId, GestureSelector)>,
+}
+
+/// Builds the Gestures page — split out of `build_settings_panel` purely
+/// to keep it under `clippy::too_many_lines`.
+fn build_gestures_page() -> GesturesPageBuild {
+    let page = GtkBox::new(Orientation::Vertical, 8);
+    page.set_visible(false);
+
+    let mappings_title = Label::new(Some("Gesture assignments"));
+    page.append(&mappings_title);
+
+    // Two columns of gesture rows rather than one tall column — at the
+    // operator's explicit request, 2026-08-16, so the page fits the
+    // full-screen panel without needing to scroll at all.
+    let gesture_grid = Grid::new();
+    gesture_grid.set_row_spacing(8);
+    gesture_grid.set_column_spacing(16);
+    gesture_grid.set_column_homogeneous(true);
+    gesture_grid.set_hexpand(true);
+    page.append(&gesture_grid);
+
+    let mut selectors = Vec::new();
+    for (index, gesture) in GestureId::all().into_iter().enumerate() {
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.set_hexpand(true);
+        let label = Label::new(Some(crate::settings::gesture_label(gesture)));
+        let change_button = Button::new();
+        change_button.set_hexpand(true);
+        row.append(&label);
+        row.append(&change_button);
+        let index = i32::try_from(index).unwrap_or(0);
+        gesture_grid.attach(&row, index % 2, index / 2, 1, 1);
+        selectors.push((gesture, GestureSelector { change_button }));
+    }
+
+    let back_button = Button::with_label("Back");
+    page.append(&back_button);
+
+    let open_button = Button::with_label(SettingsPage::Gestures.label());
+    open_button.set_hexpand(true);
+
+    GesturesPageBuild {
+        page,
+        open_button,
+        back_button,
+        selectors,
+    }
+}
+
+/// Everything [`build_display_page`] builds — bundled into a struct
+/// (rather than a long tuple) purely for readability at the call site.
+struct DisplayPageBuild {
+    page: GtkBox,
+    open_button: Button,
+    back_button: Button,
+    rotation_label: Label,
+    flip_screen_button: Button,
+    arm_timeout_spin: SpinButton,
+    mtp_suppression_check: CheckButton,
+    brightness_scale: Scale,
+    audio_output_dropdown: DropDown,
+    audio_output_devices: Vec<String>,
+    microphone_input_dropdown: DropDown,
+    microphone_input_devices: Vec<String>,
+    night_mode_gpio_enabled_check: CheckButton,
+    night_mode_gpio_spin: SpinButton,
+}
+
+/// Builds the Display page — split out of `build_settings_panel` purely
+/// to keep it under `clippy::too_many_lines`.
+fn build_display_page(
     initial_arm_window_seconds: u32,
     initial_mtp_popup_suppression_enabled: bool,
     initial_display_brightness_percent: u8,
     initial_audio_output_device: Option<&str>,
     initial_microphone_input_device: Option<&str>,
     initial_night_mode_gpio_line: Option<u32>,
-) -> SettingsPanel {
-    let main_page = GtkBox::new(Orientation::Vertical, 8);
+) -> DisplayPageBuild {
+    let page = GtkBox::new(Orientation::Vertical, 8);
+    page.set_visible(false);
 
-    let title = Label::new(Some("Head unit settings"));
-    main_page.append(&title);
+    let display_title = Label::new(Some(SettingsPage::Display.label()));
+    page.append(&display_title);
 
     let rotation_label = Label::new(Some("Screen: normal"));
-    main_page.append(&rotation_label);
+    page.append(&rotation_label);
 
     let flip_screen_button = Button::with_label("Flip screen");
-    main_page.append(&flip_screen_button);
+    page.append(&flip_screen_button);
 
     let timeout_row = GtkBox::new(Orientation::Horizontal, 8);
     let timeout_label = Label::new(Some("Gesture timeout (seconds)"));
@@ -999,14 +1185,14 @@ fn build_settings_panel(
     arm_timeout_spin.set_value(f64::from(initial_arm_window_seconds));
     timeout_row.append(&timeout_label);
     timeout_row.append(&arm_timeout_spin);
-    main_page.append(&timeout_row);
+    page.append(&timeout_row);
 
     // Off by default — see `mtp_popup_suppression_enabled`'s doc comment
     // for the real-hardware finding and the file-browsing trade-off.
     let mtp_suppression_check =
         CheckButton::with_label("Suppress phone file-browser popups on reconnect");
     mtp_suppression_check.set_active(initial_mtp_popup_suppression_enabled);
-    main_page.append(&mtp_suppression_check);
+    page.append(&mtp_suppression_check);
 
     let (
         brightness_scale,
@@ -1017,50 +1203,112 @@ fn build_settings_panel(
         night_mode_gpio_enabled_check,
         night_mode_gpio_spin,
     ) = build_media_settings_controls(
-        &main_page,
+        &page,
         initial_display_brightness_percent,
         initial_audio_output_device,
         initial_microphone_input_device,
         initial_night_mode_gpio_line,
     );
 
-    let mappings_title = Label::new(Some("Gesture assignments"));
-    main_page.append(&mappings_title);
+    let back_button = Button::with_label("Back");
+    page.append(&back_button);
 
-    // Two columns of gesture rows rather than one tall column — at the
-    // operator's explicit request, 2026-08-16, so the main list fits the
-    // full-screen panel without needing to scroll at all.
-    let gesture_grid = Grid::new();
-    gesture_grid.set_row_spacing(8);
-    gesture_grid.set_column_spacing(16);
-    gesture_grid.set_column_homogeneous(true);
-    gesture_grid.set_hexpand(true);
-    main_page.append(&gesture_grid);
+    let open_button = Button::with_label(SettingsPage::Display.label());
+    open_button.set_hexpand(true);
 
-    let mut gesture_selectors = Vec::new();
-    for (index, gesture) in GestureId::all().into_iter().enumerate() {
-        let row = GtkBox::new(Orientation::Horizontal, 8);
-        row.set_hexpand(true);
-        let label = Label::new(Some(crate::settings::gesture_label(gesture)));
-        let change_button = Button::new();
-        change_button.set_hexpand(true);
-        row.append(&label);
-        row.append(&change_button);
+    DisplayPageBuild {
+        page,
+        open_button,
+        back_button,
+        rotation_label,
+        flip_screen_button,
+        arm_timeout_spin,
+        mtp_suppression_check,
+        brightness_scale,
+        audio_output_dropdown,
+        audio_output_devices,
+        microphone_input_dropdown,
+        microphone_input_devices,
+        night_mode_gpio_enabled_check,
+        night_mode_gpio_spin,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_settings_panel(
+    initial_arm_window_seconds: u32,
+    initial_mtp_popup_suppression_enabled: bool,
+    initial_display_brightness_percent: u8,
+    initial_audio_output_device: Option<&str>,
+    initial_microphone_input_device: Option<&str>,
+    initial_night_mode_gpio_line: Option<u32>,
+) -> SettingsPanel {
+    let gestures = build_gestures_page();
+    let display = build_display_page(
+        initial_arm_window_seconds,
+        initial_mtp_popup_suppression_enabled,
+        initial_display_brightness_percent,
+        initial_audio_output_device,
+        initial_microphone_input_device,
+        initial_night_mode_gpio_line,
+    );
+
+    // --- The five not-yet-implemented sibling pages ---
+    let stub_pages: Vec<StubPage> = [
+        SettingsPage::Themes,
+        SettingsPage::Equalizer,
+        SettingsPage::RearCamera,
+        SettingsPage::DashCam,
+        SettingsPage::ScreenMirroring,
+    ]
+    .into_iter()
+    .map(build_stub_page)
+    .collect();
+
+    // --- Top-level menu page ---
+    // At the operator's explicit request (2026-08-19): the panel opened
+    // by the arm-swipe-then-gesture is a page full of buttons, each
+    // leading to its own page, rather than one long flat page of every
+    // control.
+    let menu_page = GtkBox::new(Orientation::Vertical, 8);
+
+    let title = Label::new(Some("Head unit settings"));
+    menu_page.append(&title);
+
+    // A two-column grid, like the gesture/action grids elsewhere in this
+    // panel — real-hardware feedback (2026-08-16) already ruled out
+    // `FlowBox` for this touchscreen/compositor combination (it didn't
+    // actually wrap into two columns), so `Grid`'s explicit row/column
+    // placement is used here too.
+    let menu_grid = Grid::new();
+    menu_grid.set_row_spacing(8);
+    menu_grid.set_column_spacing(8);
+    menu_grid.set_column_homogeneous(true);
+    menu_grid.set_hexpand(true);
+    menu_page.append(&menu_grid);
+
+    let mut menu_buttons: Vec<&Button> = vec![&gestures.open_button, &display.open_button];
+    menu_buttons.extend(stub_pages.iter().map(|stub| &stub.open_button));
+    for (index, button) in menu_buttons.into_iter().enumerate() {
         let index = i32::try_from(index).unwrap_or(0);
-        gesture_grid.attach(&row, index % 2, index / 2, 1, 1);
-        gesture_selectors.push((gesture, GestureSelector { change_button }));
+        menu_grid.attach(button, index % 2, index / 2, 1, 1);
     }
 
     let close_button = Button::with_label("Close");
-    main_page.append(&close_button);
+    menu_page.append(&close_button);
 
     let toggle_fullscreen_button = Button::with_label("Return to desktop");
-    main_page.append(&toggle_fullscreen_button);
+    menu_page.append(&toggle_fullscreen_button);
 
     let picker = build_action_picker();
 
     let content = GtkBox::new(Orientation::Vertical, 8);
-    content.append(&main_page);
+    content.append(&menu_page);
+    content.append(&gestures.page);
+    content.append(&display.page);
+    for stub in &stub_pages {
+        content.append(&stub.root);
+    }
     content.append(&picker.root);
 
     let root = ScrolledWindow::builder()
@@ -1089,22 +1337,29 @@ fn build_settings_panel(
 
     SettingsPanel {
         root,
-        main_page,
-        rotation_label,
-        gesture_selectors: Rc::new(gesture_selectors),
+        menu_page,
+        gestures_page: gestures.page,
+        gestures_button: gestures.open_button,
+        gestures_back_button: gestures.back_button,
+        display_page: display.page,
+        display_button: display.open_button,
+        display_back_button: display.back_button,
+        stub_pages: Rc::new(stub_pages),
+        rotation_label: display.rotation_label,
+        gesture_selectors: Rc::new(gestures.selectors),
         picker,
         close_button,
         toggle_fullscreen_button,
-        flip_screen_button,
-        arm_timeout_spin,
-        mtp_suppression_check,
-        brightness_scale,
-        audio_output_dropdown,
-        audio_output_devices: Rc::new(audio_output_devices),
-        microphone_input_dropdown,
-        microphone_input_devices: Rc::new(microphone_input_devices),
-        night_mode_gpio_enabled_check,
-        night_mode_gpio_spin,
+        flip_screen_button: display.flip_screen_button,
+        arm_timeout_spin: display.arm_timeout_spin,
+        mtp_suppression_check: display.mtp_suppression_check,
+        brightness_scale: display.brightness_scale,
+        audio_output_dropdown: display.audio_output_dropdown,
+        audio_output_devices: Rc::new(display.audio_output_devices),
+        microphone_input_dropdown: display.microphone_input_dropdown,
+        microphone_input_devices: Rc::new(display.microphone_input_devices),
+        night_mode_gpio_enabled_check: display.night_mode_gpio_enabled_check,
+        night_mode_gpio_spin: display.night_mode_gpio_spin,
     }
 }
 
@@ -1167,12 +1422,12 @@ fn toggle_fullscreen_button_label(is_fullscreen: bool) -> &'static str {
 }
 
 /// Hides the whole settings panel and resets it back to
-/// [`SettingsPanel::main_page`] — so reopening it later never resumes
-/// showing a stale [`ActionPicker`] left open from a previous visit.
+/// [`SettingsPage::Menu`] — so reopening it later never resumes showing
+/// a stale [`ActionPicker`] or sub-page left open from a previous visit.
 fn close_settings_panel(settings_panel: &SettingsPanel) {
     settings_panel.root.set_visible(false);
     settings_panel.picker.root.set_visible(false);
-    settings_panel.main_page.set_visible(true);
+    show_settings_page(settings_panel, SettingsPage::Menu);
 }
 
 /// Flips between fullscreen video and the plain desktop, always closing
@@ -1366,22 +1621,20 @@ fn wire_brightness_and_device_settings(
         });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn wire_settings_panel(
+/// Wires the gesture-assignment flow: tapping a gesture's selector opens
+/// [`ActionPicker`] over the Gestures page, tapping an action applies it
+/// and returns, and the picker's own Back button returns unchanged —
+/// split out of `wire_settings_panel` purely to keep it under
+/// `clippy::too_many_lines`.
+fn wire_gesture_editing(
     settings_panel: &SettingsPanel,
-    armed_mask: &ArmedMask,
-    window: &ApplicationWindow,
-    rotation_handle: &Rc<RefCell<Option<SharedRotation>>>,
-    current_rotation: &Rc<Cell<Rotation>>,
-    arm_window_handle: &Rc<RefCell<Option<SharedArmWindow>>>,
-    is_fullscreen: &Rc<Cell<bool>>,
     gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
 ) {
     for (gesture, selector) in settings_panel.gesture_selectors.iter() {
         let initial = gesture_settings.borrow().action_for(*gesture);
         selector.change_button.set_label(initial.label());
         let gesture = *gesture;
-        let main_page = settings_panel.main_page.clone();
+        let gestures_page = settings_panel.gestures_page.clone();
         let picker = settings_panel.picker.clone();
         selector.change_button.connect_clicked(move |_| {
             picker.editing_gesture.set(Some(gesture));
@@ -1389,22 +1642,22 @@ fn wire_settings_panel(
                 "{}: choose an action",
                 crate::settings::gesture_label(gesture)
             ));
-            main_page.set_visible(false);
+            gestures_page.set_visible(false);
             picker.root.set_visible(true);
         });
     }
 
-    let main_page_for_back = settings_panel.main_page.clone();
+    let gestures_page_for_back = settings_panel.gestures_page.clone();
     let picker_for_back = settings_panel.picker.clone();
     settings_panel.picker.back_button.connect_clicked(move |_| {
         picker_for_back.root.set_visible(false);
-        main_page_for_back.set_visible(true);
+        gestures_page_for_back.set_visible(true);
     });
 
     for (action, action_button) in settings_panel.picker.action_buttons.iter() {
         let action = *action;
         let picker = settings_panel.picker.clone();
-        let main_page = settings_panel.main_page.clone();
+        let gestures_page = settings_panel.gestures_page.clone();
         let gesture_settings = Rc::clone(gesture_settings);
         let gesture_selectors = Rc::clone(&settings_panel.gesture_selectors);
         action_button.connect_clicked(move |_| {
@@ -1421,9 +1674,64 @@ fn wire_settings_panel(
                 }
             }
             picker.root.set_visible(false);
-            main_page.set_visible(true);
+            gestures_page.set_visible(true);
         });
     }
+}
+
+/// Wires the top-level settings menu's navigation: each of Gestures/
+/// Display and the five placeholder pages opens on its own button and
+/// returns to the menu on its own Back button — split out of
+/// `wire_settings_panel` purely to keep it under `clippy::too_many_lines`.
+fn wire_settings_navigation(settings_panel: &SettingsPanel) {
+    let settings_panel_for_gestures_open = settings_panel.clone();
+    settings_panel.gestures_button.connect_clicked(move |_| {
+        show_settings_page(&settings_panel_for_gestures_open, SettingsPage::Gestures);
+    });
+    let settings_panel_for_gestures_back = settings_panel.clone();
+    settings_panel
+        .gestures_back_button
+        .connect_clicked(move |_| {
+            show_settings_page(&settings_panel_for_gestures_back, SettingsPage::Menu);
+        });
+
+    let settings_panel_for_display_open = settings_panel.clone();
+    settings_panel.display_button.connect_clicked(move |_| {
+        show_settings_page(&settings_panel_for_display_open, SettingsPage::Display);
+    });
+    let settings_panel_for_display_back = settings_panel.clone();
+    settings_panel
+        .display_back_button
+        .connect_clicked(move |_| {
+            show_settings_page(&settings_panel_for_display_back, SettingsPage::Menu);
+        });
+
+    for stub in settings_panel.stub_pages.iter() {
+        let page = stub.page;
+        let settings_panel_for_open = settings_panel.clone();
+        stub.open_button.connect_clicked(move |_| {
+            show_settings_page(&settings_panel_for_open, page);
+        });
+        let settings_panel_for_back = settings_panel.clone();
+        stub.back_button.connect_clicked(move |_| {
+            show_settings_page(&settings_panel_for_back, SettingsPage::Menu);
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_settings_panel(
+    settings_panel: &SettingsPanel,
+    armed_mask: &ArmedMask,
+    window: &ApplicationWindow,
+    rotation_handle: &Rc<RefCell<Option<SharedRotation>>>,
+    current_rotation: &Rc<Cell<Rotation>>,
+    arm_window_handle: &Rc<RefCell<Option<SharedArmWindow>>>,
+    is_fullscreen: &Rc<Cell<bool>>,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    wire_gesture_editing(settings_panel, gesture_settings);
+    wire_settings_navigation(settings_panel);
 
     let arm_window_handle_for_spin = Rc::clone(arm_window_handle);
     let gesture_settings_for_spin = Rc::clone(gesture_settings);
