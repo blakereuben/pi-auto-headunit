@@ -241,6 +241,8 @@ struct RawSettings {
     wifi_preference: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bluetooth_preference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
 }
 
 /// `ProviderPreference` (`platform_api`) has no `Display`/serialization
@@ -326,6 +328,7 @@ pub struct HeadUnitSettings {
     night_mode_gpio_line: Option<u32>,
     wifi_preference: platform_api::ProviderPreference,
     bluetooth_preference: platform_api::ProviderPreference,
+    theme: Option<String>,
 }
 
 impl HeadUnitSettings {
@@ -371,6 +374,7 @@ impl HeadUnitSettings {
             night_mode_gpio_line: None,
             wifi_preference: platform_api::ProviderPreference::Auto,
             bluetooth_preference: platform_api::ProviderPreference::Auto,
+            theme: None,
         }
     }
 
@@ -529,6 +533,25 @@ impl HeadUnitSettings {
         self.bluetooth_preference = preference;
     }
 
+    /// `None` (the default) means the ordinary GTK4 theme with no custom
+    /// stylesheet applied — this project's behaviour before this setting
+    /// existed. `Some(name)` names a `.css` file the operator dropped
+    /// into the themes directory (`gtk_dev_ui::THEMES_DIR`), stored here
+    /// as just the file's stem (no directory, no `.css` extension) so a
+    /// theme keeps working if that directory ever moves. No validation
+    /// that the file still exists — a theme deleted since it was chosen
+    /// simply fails to load at apply time, matching this project's
+    /// existing device-dropdown precedent (`build_device_dropdown`'s doc
+    /// comment) of falling back to the default rather than erroring.
+    #[must_use]
+    pub fn theme(&self) -> Option<&str> {
+        self.theme.as_deref()
+    }
+
+    pub fn set_theme(&mut self, theme: Option<String>) {
+        self.theme = theme;
+    }
+
     /// Loads from `path`; falls back to [`Self::defaults`] on any error
     /// (missing file, unreadable, malformed, or an unrecognized
     /// gesture/action key — forward/backward compatible with a future
@@ -575,6 +598,9 @@ impl HeadUnitSettings {
         if let Some(preference) = raw.bluetooth_preference {
             settings.set_bluetooth_preference(platform_api::ProviderPreference::parse(&preference));
         }
+        if let Some(theme) = raw.theme {
+            settings.set_theme(Some(theme));
+        }
         Some(settings)
     }
 
@@ -599,6 +625,7 @@ impl HeadUnitSettings {
         raw.night_mode_gpio_line = self.night_mode_gpio_line;
         raw.wifi_preference = Some(provider_preference_to_key(&self.wifi_preference));
         raw.bluetooth_preference = Some(provider_preference_to_key(&self.bluetooth_preference));
+        raw.theme.clone_from(&self.theme);
         let text = toml::to_string_pretty(&raw)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         if let Some(parent) = path.parent() {
@@ -945,6 +972,25 @@ mod tests {
             loaded.bluetooth_preference(),
             &platform_api::ProviderPreference::StableId("usb:1234:5678:1-2".to_string())
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn theme_defaults_to_none_and_round_trips() {
+        let defaults = HeadUnitSettings::defaults();
+        assert_eq!(defaults.theme(), None);
+
+        let dir =
+            std::env::temp_dir().join(format!("aa-headunit-settings-theme-{}", std::process::id()));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_theme(Some("sunset".to_string()));
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.theme(), Some("sunset"));
 
         let _ = fs::remove_dir_all(&dir);
     }

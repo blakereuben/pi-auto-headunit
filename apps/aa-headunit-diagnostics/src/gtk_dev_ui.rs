@@ -277,6 +277,74 @@ fn install_flipped_panel_css() {
     );
 }
 
+/// Directory an operator drops custom GTK4 CSS theme files into — one
+/// `.css` file per theme, discovered and offered on the Themes settings
+/// page (`build_themes_page`). Same parent as `DEFAULT_SETTINGS_PATH`
+/// (`/var/lib/aa-headunit`, already group-writable for the operator from
+/// packaging) rather than a package-shipped location, since a theme is
+/// operator-supplied content, not admin config — `settings.rs`'s module
+/// doc comment explains the `/etc` vs `/var/lib` split this follows.
+/// GTK4's own CSS support (`gtk4::CssProvider`, already used by
+/// `install_flipped_panel_css` above) is the "common standard" this
+/// builds on rather than a project-specific format: a theme is real,
+/// ordinary GTK CSS, documented externally, not something this project
+/// invents.
+const THEMES_DIR: &str = "/var/lib/aa-headunit/themes";
+
+/// Every `.css` file directly inside [`THEMES_DIR`], as theme names (the
+/// file's stem — no directory, no extension), sorted for a stable menu
+/// order. Empty on any failure (missing directory, unreadable) — matches
+/// `list_pulse_devices`'s existing "empty on any failure" precedent; an
+/// operator with no themes installed just sees "System default" alone.
+fn list_theme_names() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(THEMES_DIR) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("css") {
+                return None;
+            }
+            path.file_stem()?.to_str().map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Removes whichever theme `CssProvider` is currently active (if any)
+/// and, if `name` is `Some`, loads and installs `{THEMES_DIR}/{name}.css`
+/// in its place. `None` — or a name whose file no longer exists — leaves
+/// the display with no custom theme (the ordinary GTK4 default) rather
+/// than erroring, matching `build_device_dropdown`'s existing
+/// "falls back to the default" precedent for a setting naming something
+/// no longer present.
+fn apply_theme(active_theme_provider: &Rc<RefCell<Option<gtk4::CssProvider>>>, name: Option<&str>) {
+    let Some(display) = gtk4::gdk::Display::default() else {
+        return;
+    };
+    if let Some(previous) = active_theme_provider.borrow_mut().take() {
+        gtk4::style_context_remove_provider_for_display(&display, &previous);
+    }
+    let Some(name) = name else {
+        return;
+    };
+    let path = Path::new(THEMES_DIR).join(format!("{name}.css"));
+    if !path.is_file() {
+        return;
+    }
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_path(&path);
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    active_theme_provider.replace(Some(provider));
+}
+
 fn activate_window(
     application: &Application,
     state: ActivationState,
@@ -314,6 +382,10 @@ fn activate_window(
         gesture_settings.borrow().audio_output_device(),
         gesture_settings.borrow().microphone_input_device(),
         gesture_settings.borrow().night_mode_gpio_line(),
+    );
+    apply_theme(
+        &settings_panel.active_theme_provider,
+        gesture_settings.borrow().theme(),
     );
     overlay.add_overlay(&settings_panel.root);
     // `settings_panel.root`'s own visibility is the single source of
@@ -598,9 +670,10 @@ struct ActionPicker {
 /// is a top-level menu of buttons, each leading to its own page, rather
 /// than one long flat page of every control — the gesture-assignment
 /// controls and the previously-flat display/audio/mtp/night-mode
-/// controls split out into their own `Gestures`/`Display` pages, and
-/// five more sibling pages exist as placeholders for planned features
-/// not yet implemented.
+/// controls split out into their own `Gestures`/`Display` pages;
+/// `Themes` is a real page (`build_themes_page`) picking a GTK4 CSS
+/// stylesheet from `THEMES_DIR`; the remaining four sibling pages exist
+/// as placeholders for planned features not yet implemented.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
     Menu,
@@ -613,11 +686,11 @@ enum SettingsPage {
     ScreenMirroring,
 }
 
-/// One of the settings menu's not-yet-implemented sibling pages (Themes,
-/// EQ, Rear Camera, `DashCam`, Screen Mirroring) — just a name and a Back
+/// One of the settings menu's not-yet-implemented sibling pages (EQ,
+/// Rear Camera, `DashCam`, Screen Mirroring) — just a name and a Back
 /// button for now; real controls land here as each feature is actually
-/// built. All five share this identical shape, so they're built and
-/// wired in a loop (see `build_stub_page`) rather than as five separate
+/// built. All four share this identical shape, so they're built and
+/// wired in a loop (see `build_stub_page`) rather than as four separate
 /// named struct fields.
 #[derive(Clone)]
 struct StubPage {
@@ -641,6 +714,11 @@ struct SettingsPanel {
     display_page: GtkBox,
     display_button: Button,
     display_back_button: Button,
+    themes_page: GtkBox,
+    themes_button: Button,
+    themes_back_button: Button,
+    theme_buttons: Rc<Vec<(Option<String>, Button)>>,
+    active_theme_provider: Rc<RefCell<Option<gtk4::CssProvider>>>,
     stub_pages: Rc<Vec<StubPage>>,
     rotation_label: Label,
     gesture_selectors: Rc<GestureSelectors>,
@@ -674,6 +752,9 @@ fn show_settings_page(settings_panel: &SettingsPanel, page: SettingsPage) {
     settings_panel
         .display_page
         .set_visible(page == SettingsPage::Display);
+    settings_panel
+        .themes_page
+        .set_visible(page == SettingsPage::Themes);
     for stub in settings_panel.stub_pages.iter() {
         stub.root.set_visible(stub.page == page);
     }
@@ -1049,11 +1130,11 @@ impl SettingsPage {
 }
 
 /// Builds one of the settings menu's not-yet-implemented sibling pages
-/// (Themes, EQ, Rear Camera, `DashCam`, Screen Mirroring) — a title and a
-/// Back button, nothing else yet; real controls land here as each
-/// feature is actually built. `open_button` (what the top-level menu
-/// grid actually holds) is built here too so a page's full navigation
-/// wiring lives in one place.
+/// (EQ, Rear Camera, `DashCam`, Screen Mirroring) — a title and a Back
+/// button, nothing else yet; real controls land here as each feature is
+/// actually built. `open_button` (what the top-level menu grid actually
+/// holds) is built here too so a page's full navigation wiring lives in
+/// one place.
 fn build_stub_page(page: SettingsPage) -> StubPage {
     let root = GtkBox::new(Orientation::Vertical, 8);
     root.set_visible(false);
@@ -1234,6 +1315,60 @@ fn build_display_page(
     }
 }
 
+/// Everything [`build_themes_page`] builds — bundled into a struct for
+/// readability at the call site. `theme_buttons` pairs each button with
+/// the persistable value tapping it should apply: `None` for "System
+/// default", `Some(name)` for a discovered theme file.
+struct ThemesPageBuild {
+    page: GtkBox,
+    open_button: Button,
+    back_button: Button,
+    theme_buttons: Vec<(Option<String>, Button)>,
+}
+
+/// Builds the Themes page: "System default" plus one button per
+/// `.css` file [`list_theme_names`] finds in [`THEMES_DIR`] — split out
+/// of `build_settings_panel` purely to keep it under
+/// `clippy::too_many_lines`.
+fn build_themes_page() -> ThemesPageBuild {
+    let page = GtkBox::new(Orientation::Vertical, 8);
+    page.set_visible(false);
+
+    let title = Label::new(Some(SettingsPage::Themes.label()));
+    page.append(&title);
+
+    let theme_grid = Grid::new();
+    theme_grid.set_row_spacing(8);
+    theme_grid.set_column_spacing(8);
+    theme_grid.set_column_homogeneous(true);
+    theme_grid.set_hexpand(true);
+    page.append(&theme_grid);
+
+    let mut theme_buttons: Vec<(Option<String>, Button)> =
+        vec![(None, Button::with_label("System default"))];
+    for name in list_theme_names() {
+        theme_buttons.push((Some(name.clone()), Button::with_label(&name)));
+    }
+    for (index, (_, button)) in theme_buttons.iter().enumerate() {
+        button.set_hexpand(true);
+        let index = i32::try_from(index).unwrap_or(0);
+        theme_grid.attach(button, index % 2, index / 2, 1, 1);
+    }
+
+    let back_button = Button::with_label("Back");
+    page.append(&back_button);
+
+    let open_button = Button::with_label(SettingsPage::Themes.label());
+    open_button.set_hexpand(true);
+
+    ThemesPageBuild {
+        page,
+        open_button,
+        back_button,
+        theme_buttons,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_settings_panel(
     initial_arm_window_seconds: u32,
@@ -1253,9 +1388,10 @@ fn build_settings_panel(
         initial_night_mode_gpio_line,
     );
 
-    // --- The five not-yet-implemented sibling pages ---
+    let themes = build_themes_page();
+
+    // --- The four not-yet-implemented sibling pages ---
     let stub_pages: Vec<StubPage> = [
-        SettingsPage::Themes,
         SettingsPage::Equalizer,
         SettingsPage::RearCamera,
         SettingsPage::DashCam,
@@ -1287,7 +1423,11 @@ fn build_settings_panel(
     menu_grid.set_hexpand(true);
     menu_page.append(&menu_grid);
 
-    let mut menu_buttons: Vec<&Button> = vec![&gestures.open_button, &display.open_button];
+    let mut menu_buttons: Vec<&Button> = vec![
+        &gestures.open_button,
+        &display.open_button,
+        &themes.open_button,
+    ];
     menu_buttons.extend(stub_pages.iter().map(|stub| &stub.open_button));
     for (index, button) in menu_buttons.into_iter().enumerate() {
         let index = i32::try_from(index).unwrap_or(0);
@@ -1306,6 +1446,7 @@ fn build_settings_panel(
     content.append(&menu_page);
     content.append(&gestures.page);
     content.append(&display.page);
+    content.append(&themes.page);
     for stub in &stub_pages {
         content.append(&stub.root);
     }
@@ -1344,6 +1485,11 @@ fn build_settings_panel(
         display_page: display.page,
         display_button: display.open_button,
         display_back_button: display.back_button,
+        themes_page: themes.page,
+        themes_button: themes.open_button,
+        themes_back_button: themes.back_button,
+        theme_buttons: Rc::new(themes.theme_buttons),
+        active_theme_provider: Rc::new(RefCell::new(None)),
         stub_pages: Rc::new(stub_pages),
         rotation_label: display.rotation_label,
         gesture_selectors: Rc::new(gestures.selectors),
@@ -1680,8 +1826,8 @@ fn wire_gesture_editing(
 }
 
 /// Wires the top-level settings menu's navigation: each of Gestures/
-/// Display and the five placeholder pages opens on its own button and
-/// returns to the menu on its own Back button — split out of
+/// Display/Themes and the four placeholder pages opens on its own
+/// button and returns to the menu on its own Back button — split out of
 /// `wire_settings_panel` purely to keep it under `clippy::too_many_lines`.
 fn wire_settings_navigation(settings_panel: &SettingsPanel) {
     let settings_panel_for_gestures_open = settings_panel.clone();
@@ -1706,6 +1852,15 @@ fn wire_settings_navigation(settings_panel: &SettingsPanel) {
             show_settings_page(&settings_panel_for_display_back, SettingsPage::Menu);
         });
 
+    let settings_panel_for_themes_open = settings_panel.clone();
+    settings_panel.themes_button.connect_clicked(move |_| {
+        show_settings_page(&settings_panel_for_themes_open, SettingsPage::Themes);
+    });
+    let settings_panel_for_themes_back = settings_panel.clone();
+    settings_panel.themes_back_button.connect_clicked(move |_| {
+        show_settings_page(&settings_panel_for_themes_back, SettingsPage::Menu);
+    });
+
     for stub in settings_panel.stub_pages.iter() {
         let page = stub.page;
         let settings_panel_for_open = settings_panel.clone();
@@ -1715,6 +1870,33 @@ fn wire_settings_navigation(settings_panel: &SettingsPanel) {
         let settings_panel_for_back = settings_panel.clone();
         stub.back_button.connect_clicked(move |_| {
             show_settings_page(&settings_panel_for_back, SettingsPage::Menu);
+        });
+    }
+}
+
+/// Wires the Themes page: tapping a theme button applies it immediately
+/// (like the brightness slider, not the audio/mic dropdowns — a theme
+/// picker with no visible preview would be a bad experience) and
+/// persists the choice — split out of `wire_settings_panel` purely to
+/// keep it under `clippy::too_many_lines`.
+fn wire_theme_selection(
+    settings_panel: &SettingsPanel,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    for (name, button) in settings_panel.theme_buttons.iter() {
+        let name = name.clone();
+        let gesture_settings = Rc::clone(gesture_settings);
+        let active_theme_provider = Rc::clone(&settings_panel.active_theme_provider);
+        button.connect_clicked(move |_| {
+            println!(
+                "probe_state=theme_selected theme={}",
+                name.as_deref().unwrap_or("system_default")
+            );
+            apply_theme(&active_theme_provider, name.as_deref());
+            gesture_settings.borrow_mut().set_theme(name.clone());
+            let _ = gesture_settings
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
         });
     }
 }
@@ -1732,6 +1914,7 @@ fn wire_settings_panel(
 ) {
     wire_gesture_editing(settings_panel, gesture_settings);
     wire_settings_navigation(settings_panel);
+    wire_theme_selection(settings_panel, gesture_settings);
 
     let arm_window_handle_for_spin = Rc::clone(arm_window_handle);
     let gesture_settings_for_spin = Rc::clone(gesture_settings);
