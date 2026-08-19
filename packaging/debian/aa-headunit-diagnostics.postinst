@@ -14,54 +14,88 @@ set -e
 # can traverse/write the *parent* directory to create their own credential
 # files there, once, unprivileged.
 
+# Best-effort: the real login account (if any) already running the
+# desktop on seat0 at install time — used only to auto-configure
+# autologin/group-membership/autostart for whichever account the
+# operator is already using (ARCHITECTURE.md §8, see the "M5" block
+# below). This app installs onto an existing PiOS desktop and should
+# run as whoever's already using it, not a separate dedicated account
+# (that was an earlier design, dropped — see
+# `packaging/labwc/aa-headunit-autostart`'s own header comment). Never
+# used for anything security-sensitive on its own — worst case of a
+# wrong/empty detection is simply that autologin/autostart don't get
+# configured automatically, requiring the one-time manual steps in
+# `docs/development/credential-provisioning.md` instead.
+detect_active_desktop_user() {
+    if ! command -v loginctl >/dev/null 2>&1; then
+        return 0
+    fi
+    for session_id in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+        seat=$(loginctl show-session "$session_id" -p Seat --value 2>/dev/null || true)
+        state=$(loginctl show-session "$session_id" -p State --value 2>/dev/null || true)
+        if [ "$seat" = "seat0" ] && [ "$state" = "active" ]; then
+            loginctl show-session "$session_id" -p Name --value 2>/dev/null || true
+            return 0
+        fi
+    done
+}
+
 case "$1" in
     configure)
         if ! getent group aa-headunit >/dev/null 2>&1; then
             addgroup --system aa-headunit
         fi
-        # M5: a dedicated, unprivileged system user for the appliance
-        # service itself (ARCHITECTURE.md §8), distinct from the
-        # interactive-operator group-membership model above (still used
-        # for the human-run diagnostics CLI). No login shell, no created
-        # home directory (state already lives in /var/lib/aa-headunit,
-        # which this account joins via its primary group like any other
-        # `aa-headunit` group member). Supplementary groups are narrow —
-        # exactly what this app has ever actually needed on real
-        # hardware: `video` (backlight brightness), `plugdev` (USB, the
-        # existing `70-aa-headunit.rules` grants this group access),
-        # `render` (GPU/Wayland), `input` (evdev touch), `gpio`
-        # (`/dev/gpiochip*`, the M5 night-mode GPIO input — Raspberry Pi
-        # OS's own default udev rules already grant this group access to
-        # the chardev, so no project-owned udev rule is needed here,
-        # unlike `plugdev`/USB). `adduser <user> <group>` is idempotent
-        # on Debian (a no-op with exit 0 if already a member), safe to
-        # re-run on every upgrade.
+        # M5: a dedicated system group (ARCHITECTURE.md §8) anchoring
+        # unprivileged access to /etc/aa-headunit, /var/lib/aa-headunit,
+        # and (via `70-aa-headunit.rules`) USB — not a login identity.
+        # The account itself is still created (some file ownership below
+        # still names it directly), but nothing runs as this uid and
+        # nothing logs in as it; the app runs as whichever real account
+        # is detected below. No login shell, no created home directory.
         if ! getent passwd aa-headunit >/dev/null 2>&1; then
             adduser --system --ingroup aa-headunit --no-create-home \
                 --home /var/lib/aa-headunit --shell /usr/sbin/nologin \
                 aa-headunit
         fi
+
+        active_user=$(detect_active_desktop_user)
+        case "$active_user" in
+            [a-zA-Z_][a-zA-Z0-9_-]*) ;;
+            *) active_user="" ;;
+        esac
+        if [ -n "$active_user" ] && ! getent passwd "$active_user" >/dev/null 2>&1; then
+            active_user=""
+        fi
+
+        # Supplementary groups are narrow — exactly what this app has
+        # ever actually needed on real hardware: `video` (backlight
+        # brightness), `plugdev` (USB, `70-aa-headunit.rules`), `render`
+        # (GPU/Wayland), `input` (evdev touch), `gpio` (`/dev/gpiochip*`,
+        # the M5 night-mode GPIO input — Raspberry Pi OS's own default
+        # udev rules already grant this group access to the chardev, so
+        # no project-owned udev rule is needed here, unlike
+        # `plugdev`/USB). Granted to both the (no-longer-logged-into)
+        # `aa-headunit` account, for anything that still checks it
+        # directly, and to the real detected account, which is what
+        # actually needs device access now that the app runs as them.
+        # `adduser <user> <group>` is idempotent on Debian (a no-op with
+        # exit 0 if already a member), safe to re-run on every upgrade.
         for supplementary_group in video plugdev render input gpio; do
             if getent group "$supplementary_group" >/dev/null 2>&1; then
                 adduser aa-headunit "$supplementary_group"
+                if [ -n "$active_user" ]; then
+                    adduser "$active_user" "$supplementary_group"
+                fi
             fi
         done
-        # PipeWire/Wayland need a real user session (XDG_RUNTIME_DIR,
-        # a systemd --user instance) — lingering starts one at boot
-        # without an interactive login, matching how the *human*
-        # operator's own already-working audio path depends on owning
-        # their session's XDG_RUNTIME_DIR (see the note above this
-        # case statement). This is independent of the `aa-headunit-kiosk@.service`
-        # template below, which gets its own real logind session/seat
-        # via `pam_systemd.so` (`/etc/pam.d/aa-headunit-kiosk`), not
-        # this lingering one — lingering exists for PipeWire's own
-        # session needs, not for DRM/seat access. Credential access for
-        # this user is *not* set up here —
-        # `docs/development/credential-provisioning.md` has the
-        # ownership-migration steps for when that's needed, and this
-        # script never touches real credential file ownership itself.
-        if command -v loginctl >/dev/null 2>&1; then
-            loginctl enable-linger aa-headunit || true
+        # Also give the detected account unprivileged access to
+        # /etc/aa-headunit and /var/lib/aa-headunit below — previously a
+        # manual step (`docs/development/credential-provisioning.md`),
+        # now automatic for whoever installs the package. Real
+        # credential *file* ownership migration is still not handled
+        # here — see that doc.
+        if [ -n "$active_user" ]; then
+            adduser "$active_user" aa-headunit
         fi
         if [ -d /etc/aa-headunit ]; then
             chown root:aa-headunit /etc/aa-headunit
@@ -75,6 +109,46 @@ case "$1" in
         mkdir -p /var/lib/aa-headunit
         chown root:aa-headunit /var/lib/aa-headunit
         chmod 0770 /var/lib/aa-headunit
+
+        # M5: point LightDM's autologin at the detected account and
+        # install the fullscreen-app autostart into their own session —
+        # only if autologin isn't already configured (never override an
+        # operator's own choice, including one made before this package
+        # was installed) and only if a real account was actually
+        # detected. `/etc/lightdm/lightdm.conf` is not this package's
+        # own file; this is a deliberate, narrow integration edit, not a
+        # general rewrite.
+        lightdm_conf=/etc/lightdm/lightdm.conf
+        if [ -n "$active_user" ] && [ -f "$lightdm_conf" ] \
+            && ! grep -Eq '^autologin-user=' "$lightdm_conf" \
+            && grep -Eq '^\[Seat:\*\]' "$lightdm_conf"; then
+            sed -i "/^\[Seat:\*\]/a autologin-session=rpd-labwc" "$lightdm_conf"
+            sed -i "/^\[Seat:\*\]/a autologin-user=$active_user" "$lightdm_conf"
+        fi
+        if [ -n "$active_user" ]; then
+            active_home=$(getent passwd "$active_user" | cut -d: -f6)
+            if [ -n "$active_home" ] && [ -d "$active_home" ] \
+                && [ -f /usr/share/aa-headunit/labwc-autostart ]; then
+                mkdir -p "$active_home/.config/labwc"
+                install -m0644 /usr/share/aa-headunit/labwc-autostart \
+                    "$active_home/.config/labwc/autostart"
+                chown "$active_user:$active_user" \
+                    "$active_home/.config/labwc" \
+                    "$active_home/.config/labwc/autostart"
+            fi
+        fi
+
+        # Obsolete files from earlier designs (the VT-templated
+        # `aa-headunit-kiosk@.service`/`cage` session, and its
+        # `/var/lib/aa-headunit/.config/labwc/autostart` successor) — a
+        # package upgrade does not remove these on its own since they
+        # were shipped as plain, non-conffile files in earlier builds;
+        # clean them up explicitly rather than leaving stale,
+        # unreferenced files behind.
+        rm -f /etc/pam.d/aa-headunit-kiosk
+        rm -f /usr/lib/systemd/system/aa-headunit-kiosk@.service
+        rm -f /usr/lib/systemd/system/aa-headunit-preflight.service
+        rm -f /var/lib/aa-headunit/.config/labwc/autostart
         # Real-hardware finding (2026-08-18): installing/updating
         # `70-aa-headunit.rules` here via a plain `install -D` in
         # `packaging/debian/rules`, not `dh_installudev`, does not by
@@ -92,33 +166,18 @@ case "$1" in
         if command -v udevadm >/dev/null 2>&1; then
             udevadm control --reload-rules || true
         fi
-        # M5: `aa-headunit-preflight.service` and the
-        # `aa-headunit-kiosk@.service` template (`packaging/systemd/`)
-        # are installed by `packaging/debian/rules`'s plain `install -D`
-        # (not `dh_installsystemd`), so nothing else makes systemd aware
-        # of them — a `daemon-reload` is needed for `systemctl` to even
-        # see them as installable/enableable. Deliberately does **not**
-        # enable or start anything: real-hardware testing of the kiosk
-        # unit takes over DRM master from whatever compositor already
-        # owns the display, and enabling it changes what a reboot does
-        # — both a real operator decision, not something a package
-        # install should make unilaterally. See
-        # `aa-headunit-kiosk@.service`'s own doc comment for what's
-        # still unverified before an operator should enable it.
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl daemon-reload || true
-        fi
         # M5: bounded, persistent journald logging
         # (`packaging/systemd/journald-40-rpi-volatile-storage.conf`) —
         # without this, a crashed boot's logs are gone the moment the
         # board reboots (real-hardware finding, same session: this
         # exact gap made the M5 appliance kiosk service's real hangs
         # undiagnosable until fixed — see
-        # `docs/development/appliance-recovery.md`). A plain
-        # `daemon-reload` above does not apply a journald.conf.d change
-        # to the *already-running* daemon — confirmed directly, a
-        # `restart` alone left it still writing to the volatile runtime
-        # location, and only an explicit `--flush` actually migrated it.
+        # `docs/development/appliance-recovery.md`). Merely restarting
+        # `systemd-journald` does not apply a journald.conf.d change to
+        # the *already-running* daemon on its own — confirmed directly,
+        # a `restart` alone left it still writing to the volatile
+        # runtime location, and only an explicit `--flush` actually
+        # migrated it.
         if command -v systemctl >/dev/null 2>&1; then
             systemctl restart systemd-journald || true
         fi

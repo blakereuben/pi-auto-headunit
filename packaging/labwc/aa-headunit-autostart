@@ -1,0 +1,40 @@
+#!/bin/sh
+# M5 appliance autostart template (ARCHITECTURE.md §8/§9,
+# docs/development/appliance-recovery.md). Shipped at
+# /usr/share/aa-headunit/labwc-autostart; `postinst` copies it to
+# ~/.config/labwc/autostart for whichever real account is already
+# running the desktop at install time (not a dedicated login account —
+# this app installs onto an existing PiOS desktop and runs as whoever's
+# already using it, overwritten on every install/upgrade since it's
+# package-managed content, not something meant to be hand-edited).
+#
+# Supersedes two earlier designs: `aa-headunit-kiosk@.service` (a
+# separately-managed `cage` session on a spare VT, dropped because the
+# operator wants a real desktop underneath the kiosk app, not a bare
+# compositor), and a dedicated `aa-headunit` *login* account (dropped
+# because this is a program installed onto someone's own already-set-up
+# Pi, not appliance hardware with its own dedicated account — the
+# installing user's own account should autologin, matching how they
+# already use the machine). `aa-headunit` remains only as a permissions
+# group anchor (`/etc/aa-headunit`, `/var/lib/aa-headunit`, USB/GPIO
+# access), not a session identity.
+#
+# A per-user autostart file REPLACES the system default entirely rather
+# than adding to it, so the desktop components below are copied from
+# `/etc/xdg/labwc/autostart` on purpose, not incidentally — keep them in
+# sync if the base Raspberry Pi OS image ever changes its own default.
+/usr/bin/lwrespawn /usr/bin/pcmanfm-pi &
+/usr/bin/lwrespawn /usr/bin/wf-panel-pi &
+/usr/bin/kanshi &
+/usr/bin/lxsession-xdg-autostart &
+
+# Fails open to the plain desktop above rather than retrying a broken
+# kiosk session on every boot: preflight (ARCHITECTURE.md §9 — display,
+# touch input, writable state dir, USB, audio) gates whether the
+# fullscreen app is even attempted, exactly like the old unit's
+# `Requires=aa-headunit-preflight.service` did, just as a plain
+# in-script check instead of a separate systemd dependency now that
+# there is no longer a discrete unit for it to gate.
+if /usr/bin/aa-headunit-diagnostics preflight; then
+    exec /usr/bin/aa-headunit-diagnostics usb kiosk --allow-live-aap
+fi

@@ -1,105 +1,126 @@
 # Appliance recovery and development path
 
-How the M5 appliance boots, what to do if the graphical (kiosk) service
-gets stuck, and how to get back to a normal development environment.
-Written from a real incident (2026-08-18/19): enabling and testing
-`aa-headunit-kiosk@.service`, `cage` repeatedly got stuck and stopped
-responding to a graceful stop request. **This was first believed to
-hard-hang the whole board, requiring a physical power cycle every time
-— that turned out not to be quite right.** SSH stayed fully responsive
-through every single occurrence; what actually happened was `cage`
-itself becoming unresponsive to `SIGTERM` while holding the display, so
-the screen froze and a directly-attached keyboard stopped responding,
-which looks exactly like a full system hang unless you check SSH. The
-root cause of why `cage` gets stuck is still not confirmed — see
-`packaging/systemd/aa-headunit-kiosk@.service`'s own doc comment for the
-full investigation. This document assumes that failure mode can recur
-and describes how to recover from it over SSH, without a power cycle.
+How the M5 appliance boots, what's proven and what isn't about that
+transition, and how to get back to a normal development environment if
+something goes wrong.
 
-## How the appliance boots
+**Design history**: an earlier design (`aa-headunit-kiosk@.service`, now
+removed) ran `cage`, a bare Wayland kiosk compositor, as a
+separately-managed session on a spare VT, alongside whatever desktop the
+operator already had running. Real-hardware testing (2026-08-18/19)
+found `cage` itself would repeatedly get stuck and stop responding to a
+graceful stop request — **first believed to hard-hang the whole board,
+requiring a physical power cycle; that turned out not to be quite
+right.** SSH stayed fully responsive through every occurrence; what
+actually happened was `cage` becoming unresponsive to `SIGTERM` while
+holding the display, so the screen froze and a directly-attached
+keyboard stopped responding, which looks exactly like a full system hang
+unless you check SSH. The design itself was then dropped for an
+unrelated, more fundamental reason: it never gave the operator a real
+desktop underneath the kiosk app, which is a hard requirement, not just
+a nice-to-have. A second design then briefly considered a dedicated
+`aa-headunit` *login* account (its own desktop session, autologin
+pointed at it) — also dropped, same day: this is a program installed
+onto someone's own already-set-up PiOS desktop, not appliance hardware
+shipping with its own dedicated account, so it should autologin as
+whoever already uses the machine, not switch to a separate identity.
+The current design (below) reflects that. The general recovery guidance
+later in this document (SSH-first, don't assume a frozen screen means a
+frozen board) remains good practice for any future graphical-boot
+problem regardless of which design is active.
 
-- `aa-headunit-preflight.service` (a oneshot unit, runs as the dedicated
-  `aa-headunit` user) checks the five conditions `ARCHITECTURE.md` §9
-  requires before the graphical service should even attempt to start: a
-  connected display, a touchscreen input device, a writable
-  `/var/lib/aa-headunit`, working USB access, and at least one audio
-  device. Run it by hand any time with
-  `aa-headunit-diagnostics preflight` or `systemctl start
-  aa-headunit-preflight.service`.
-- `aa-headunit-kiosk@<VT>.service` (a template unit, e.g.
-  `aa-headunit-kiosk@tty2.service`) depends on preflight succeeding
-  (`Requires=`/`After=`) and runs `cage` (a minimal Wayland kiosk
-  compositor) with this project's own binary as its single fullscreen
-  client, on whichever virtual terminal it's instantiated against.
-- Neither unit is enabled by the package install itself — `postinst`
-  only runs `systemctl daemon-reload` so `systemctl` is aware of them.
-  Enabling the kiosk unit, and picking which VT to instantiate it
-  against, is a deliberate operator decision (`packaging/README.md`).
+## How the appliance boots (current design)
+
+- `postinst` detects whichever real account is running the active
+  desktop session (`seat0`) at install time, and for that account:
+  - adds it to the `aa-headunit` group (unprivileged access to
+    `/etc/aa-headunit`, `/var/lib/aa-headunit`, USB, GPIO — previously a
+    manual step, see `docs/development/credential-provisioning.md`);
+  - copies `packaging/labwc/aa-headunit-autostart` (shipped at
+    `/usr/share/aa-headunit/labwc-autostart`) to that account's own
+    `~/.config/labwc/autostart`, overwriting it on every install/upgrade
+    — it's package-managed content;
+  - points LightDM's `autologin-user` at that account, but **only if
+    autologin isn't already configured** — an existing choice (including
+    one made before this package was ever installed, as on this
+    development Pi) is never overridden.
+- `aa-headunit` itself is no longer a login identity — it remains only
+  as the permissions-group anchor for the points above. Nothing runs as
+  that uid; the app runs as whichever real account was detected.
+- The installed autostart script starts the same desktop components
+  `/etc/xdg/labwc/autostart` does (panel, file manager, output/autostart
+  helpers) — a per-user autostart file replaces the system default
+  entirely rather than adding to it, so these have to be repeated, or
+  the operator's normal desktop would silently lose its panel/file
+  manager once autologin points at them. It then runs
+  `aa-headunit-diagnostics preflight` (`ARCHITECTURE.md` §9: a connected
+  display, a touchscreen input device, a writable `/var/lib/aa-headunit`,
+  working USB access, at least one audio device) and only execs the
+  fullscreen app (`usb kiosk --allow-live-aap`) if that passes — failing
+  open to the plain desktop otherwise, not retrying a broken session on
+  every boot. Run preflight by hand any time with
+  `aa-headunit-diagnostics preflight`.
+- The app requests its own window fullscreen via a normal Wayland
+  `xdg-shell` call (`window.fullscreen()`,
+  `apps/aa-headunit-diagnostics/src/gtk_dev_ui.rs`) — this is not
+  compositor-specific, so it works the same under `labwc` as it did
+  under `cage`. "Return to desktop" (the fullscreen-toggle action)
+  un-fullscreens the window rather than quitting it, revealing the
+  operator's own real desktop underneath (panel, file manager, and
+  everything else already on it) — this is the actual point of the
+  redesign.
+
+**Real-hardware confirmed, 2026-08-19, on this development Pi**: package
+install correctly detected the active `blakereuben` session, added it to
+the `aa-headunit` group (already a member from earlier work — no-op),
+and wrote `/home/blakereuben/.config/labwc/autostart` with correct
+ownership; `lightdm.conf`'s pre-existing `autologin-user=blakereuben`
+was correctly left untouched (the "don't override an existing choice"
+guard). **Not yet confirmed**: an actual reboot/relogin picking up the
+new autostart file and successfully reaching the fullscreen app — the
+file has been installed but this Pi has not yet been rebooted with it in
+place.
+
+Separately (from the earlier, now-abandoned dedicated-account design):
+real-hardware testing confirmed a `labwc` session only starts correctly
+once its VT is actually the foreground/active one — a background VT
+produces a silent exit after ~10 seconds with no output, the same
+seat/DRM-access pattern `cage` needed a `WLR_DRM_DEVICES` override for
+(the real DSI panel is `card2`, not the disconnected `card1` HDMI node
+autodetection preferred). Not expected to be relevant to the current
+design (a normal LightDM autologin for an already-working account
+already brings the session up in the foreground, proven every day by
+the operator's own desktop), but noted here in case the same symptom
+ever reappears.
+
+The `wayvnc` PAM change made earlier the same day
+(`/etc/pam.d/wayvnc`, `pam_allow_desktopuser.so` removed) is unrelated
+to this design — it was investigated as a blocker for the abandoned
+dedicated-account design, where a separate login identity with no
+password could have locked the operator out of VNC. Under the current
+design, VNC and the desktop are always the same account, so that
+specific risk never applied — the PAM change is a harmless, low-risk
+simplification (`wayvnc` already accepts any authenticated local user
+and shows whatever's on screen regardless), not a required fix.
 
 ## Current known-safe state
 
-As of 2026-08-18, this development Pi's boot configuration is
-deliberately left as: `lightdm.service` **enabled** (boots into the
-normal interactive desktop), `aa-headunit-kiosk@tty2.service`
-**disabled**. A plain reboot boots the desktop, not the kiosk. Confirm
+As of 2026-08-19, this development Pi's boot configuration is:
+`lightdm.service` **enabled**, `autologin-user` **`blakereuben`**
+(`/etc/lightdm/lightdm.conf`, pre-existing, unchanged by this package).
+`/home/blakereuben/.config/labwc/autostart` now exists and will run the
+fullscreen app on the next login/reboot if preflight passes. Confirm
 with:
 
 ```
-systemctl is-enabled lightdm.service aa-headunit-kiosk@tty2.service
+grep -i autologin-user /etc/lightdm/lightdm.conf
 ```
 
-Do not enable the kiosk unit expecting the hang to be fixed — it hasn't
-been confirmed fixed. See the unit file's own doc comment before trying
-again.
-
-## If the kiosk service gets stuck
-
-Real-hardware symptom (observed repeatedly): the display freezes/goes
-grey and a directly-attached keyboard stops responding, seconds to a
-couple of minutes after the kiosk service reaches its virtual terminal.
-This *looks* like the whole board hung, but real-hardware investigation
-found it isn't: **SSH stayed fully responsive through every single
-occurrence.** What's actually stuck is `cage` itself, holding the
-display, unresponsive to a graceful stop — confirmed directly in the
-journal, twice: once as `systemctl stop` sitting for over a minute with
-zero progress, once as systemd's own `State 'stop-sigterm' timed out.
-Killing.` (its default 90s `TimeoutStopSec`, now shortened to 10s in the
-unit itself, so this should self-resolve automatically going forward).
-No kernel panic, oops, or hung-task warning has ever appeared in the
-journal for any of these — consistent with `cage` being stuck, not the
-kernel.
-
-**Recovery over SSH — no physical power cycle needed:**
-
-```
-# Confirm what's actually running/enabled
-systemctl is-enabled lightdm.service aa-headunit-kiosk@tty2.service
-systemctl status aa-headunit-kiosk@tty2.service
-
-# Force-kill the stuck compositor directly — don't wait on a graceful
-# stop, and don't reach for the power button. This is the step that was
-# missed during the initial investigation, when a graceful stop
-# appeared to hang and was mistaken for the whole board being frozen.
-sudo systemctl kill -s KILL aa-headunit-kiosk@tty2.service
-
-# Disable the kiosk and restore the normal desktop boot
-sudo systemctl disable aa-headunit-kiosk@tty2.service
-sudo systemctl enable lightdm.service
-```
-
-If SSH is ever genuinely unresponsive too (not observed in any occurrence
-so far, despite `cage` itself getting stuck repeatedly): *then* a
-physical power cycle is the fallback. A short press of the power button
-is caught by `systemd-logind` as a normal shutdown request and — if the
-kernel and `systemd-logind` are still alive, which they always were in
-every occurrence investigated so far — produces a clean, orderly
-shutdown (filesystems synced, services stopped in order). This is worth
-knowing regardless: **a clean-looking shutdown sequence in the journal
-after a "hang" is evidence a recovery action worked (whether SSH-based
-or a manual power-button press), not evidence nothing was actually
-wrong.** Cross-check by searching for `Power key pressed` in the
-journal (see below) — its presence confirms a manual power-button
-recovery happened at that point, not a spontaneous graceful shutdown.
+Reboot to actually exercise the new autostart file — not yet done as of
+this writing. If it doesn't reach the fullscreen app as expected, log in
+normally (SSH or the greeter) and check `~/.config/labwc/autostart` was
+written as expected and that `aa-headunit-diagnostics preflight`
+succeeds when run by hand.
 
 ## Investigating a crash after the fact
 
@@ -113,7 +134,7 @@ journalctl --list-boots
 sudo journalctl -b -1 --no-pager | tail -150   # the crashed boot, tail end
 sudo journalctl -b -1 -k --no-pager | grep -iE 'BUG:|Oops|panic|hung task'
 sudo journalctl -b -1 --no-pager | grep -i 'power key'
-sudo journalctl -b -1 -u aa-headunit-kiosk@tty2.service --no-pager   # the specific signature: a systemctl stop with no further progress, or "State 'stop-sigterm' timed out. Killing."
+sudo journalctl -b -1 --user-unit labwc --no-pager   # the operator's own labwc desktop session
 vcgencmd get_throttled   # only reflects the *current* boot, not the crashed one
 vcgencmd measure_temp
 ```
