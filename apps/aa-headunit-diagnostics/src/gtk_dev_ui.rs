@@ -277,6 +277,37 @@ fn install_flipped_panel_css() {
     );
 }
 
+/// `picture` (the video widget) has no paintable set until a phone
+/// finishes connecting and `build_gtk4_pipeline` runs — before that, and
+/// again between sessions in the reconnect loop, it painted nothing at
+/// all, showing through to GTK's own default window background (plain
+/// white/light grey under the stock theme). Real-hardware feedback: an
+/// operator staring at a stark white "waiting for phone" screen read as
+/// indistinguishable from the actual white-screen bugs this session fixed
+/// elsewhere. Fixed at the application-provider priority (lowest — an
+/// operator theme's own `.video-picture` rule, loaded via `apply_theme` at
+/// `STYLE_PROVIDER_PRIORITY_APPLICATION` too but installed *after* this
+/// one, wins the cascade) so this is purely a sane default, not a ceiling:
+/// a theme CSS file can set `background-image: url(...)` on
+/// `.video-picture` for a real custom image, using the exact same
+/// operator-authored-GTK-CSS mechanism `THEMES_DIR` already documents —
+/// no separate image-asset pipeline needed. Once the video paintable is
+/// set, `Picture`'s default `content-fit: contain` still lets this show
+/// through as letterboxing if the stream's aspect ratio doesn't exactly
+/// fill the panel.
+fn install_default_video_background_css() {
+    let Some(display) = gtk4::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_data(".video-picture { background-color: #1a1a1a; }");
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 /// Directory an operator drops custom GTK4 CSS theme files into — one
 /// `.css` file per theme, discovered and offered on the Themes settings
 /// page (`build_themes_page`). Same parent as `DEFAULT_SETTINGS_PATH`
@@ -372,7 +403,9 @@ fn activate_window(
     ));
 
     install_flipped_panel_css();
+    install_default_video_background_css();
     let picture = Picture::new();
+    picture.add_css_class("video-picture");
     let overlay = Overlay::new();
     overlay.set_child(Some(&picture));
     let settings_panel = build_settings_panel(
