@@ -447,15 +447,7 @@ fn activate_window(
     picture.add_css_class("video-picture");
     let overlay = Overlay::new();
     overlay.set_child(Some(&picture));
-    let settings_panel = build_settings_panel(
-        gesture_settings.borrow().arm_window_seconds(),
-        gesture_settings.borrow().mtp_popup_suppression_enabled(),
-        gesture_settings.borrow().launch_on_boot(),
-        gesture_settings.borrow().display_brightness_percent(),
-        gesture_settings.borrow().audio_output_device(),
-        gesture_settings.borrow().microphone_input_device(),
-        gesture_settings.borrow().night_mode_gpio_line(),
-    );
+    let settings_panel = build_settings_panel_from(&gesture_settings);
     apply_theme(
         &settings_panel.active_theme_provider,
         gesture_settings.borrow().theme(),
@@ -474,6 +466,9 @@ fn activate_window(
         .connect_visible_notify(move |root| panel_visibility.set(root.is_visible()));
     let armed_mask = build_armed_mask();
     overlay.add_overlay(&armed_mask.root);
+
+    build_and_wire_experimental_disclaimer(&overlay, &gesture_settings);
+
     let window = ApplicationWindow::builder()
         .application(application)
         .title("pi-auto-headunit live session")
@@ -544,6 +539,16 @@ fn activate_window(
 /// the armed-state mask, and for a completed gesture, looks up and
 /// dispatches its currently-mapped [`Action`]. Extracted from
 /// `wire_session_polls` purely to keep it under `clippy::too_many_lines`.
+///
+/// Self-terminates (`glib::ControlFlow::Break`) once `gesture_receiver`
+/// disconnects, matching every other per-session poll in this file
+/// (`capability`/`rotation`/`arm_window`) — previously always returned
+/// `Continue` regardless, which was harmless for `run`/`run_with_cancel`
+/// (the whole `Application` quits shortly after any one session ends
+/// anyway) but would leak one perpetual timer per reconnect once
+/// `usb kiosk`'s window started persisting across many sessions
+/// (2026-08-21, `run_kiosk`) — found and fixed while building that,
+/// before it ever shipped.
 #[allow(clippy::too_many_arguments)]
 fn wire_gesture_poll(
     gesture_receiver: mpsc::Receiver<GestureEvent>,
@@ -556,27 +561,30 @@ fn wire_gesture_poll(
     gesture_settings: Rc<RefCell<HeadUnitSettings>>,
 ) -> glib::SourceId {
     glib::timeout_add_local(POLL_INTERVAL, move || {
-        while let Ok(event) = gesture_receiver.try_recv() {
-            match event {
-                GestureEvent::Armed => armed_mask.root.set_visible(true),
-                GestureEvent::Disarmed => armed_mask.root.set_visible(false),
-                GestureEvent::Completed(gesture) => {
-                    armed_mask.root.set_visible(false);
-                    let action = gesture_settings.borrow().action_for(gesture);
-                    dispatch_action(
-                        action,
-                        &settings_panel,
-                        &armed_mask,
-                        &window,
-                        &rotation_handle,
-                        &current_rotation,
-                        &is_fullscreen,
-                        &gesture_settings,
-                    );
-                }
+        loop {
+            match gesture_receiver.try_recv() {
+                Ok(event) => match event {
+                    GestureEvent::Armed => armed_mask.root.set_visible(true),
+                    GestureEvent::Disarmed => armed_mask.root.set_visible(false),
+                    GestureEvent::Completed(gesture) => {
+                        armed_mask.root.set_visible(false);
+                        let action = gesture_settings.borrow().action_for(gesture);
+                        dispatch_action(
+                            action,
+                            &settings_panel,
+                            &armed_mask,
+                            &window,
+                            &rotation_handle,
+                            &current_rotation,
+                            &is_fullscreen,
+                            &gesture_settings,
+                        );
+                    }
+                },
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
             }
         }
-        glib::ControlFlow::Continue
     })
 }
 
@@ -738,6 +746,512 @@ fn wire_session_polls(state: SessionPollState) {
     });
 }
 
+/// How often `usb kiosk` polls for a phone when none is currently
+/// connected — unchanged from the discovery interval `usb_kiosk` always
+/// used in `main.rs` before its reconnect loop moved here.
+const KIOSK_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long `usb kiosk` waits after one session attempt ends (success or
+/// failure) before starting the next — unchanged from `main.rs`'s
+/// previous `RECONNECT_DELAY`.
+const KIOSK_RECONNECT_DELAY_SECONDS: u32 = 2;
+
+/// Everything built exactly once, for the whole lifetime of the
+/// `usb kiosk` process — see [`run_kiosk`]'s doc comment for why this now
+/// persists across reconnects instead of being rebuilt every cycle the
+/// way [`run`]/[`run_with_cancel`] still do (deliberately unchanged
+/// there: `usb gtk-dev-ui --device X` targets one specific
+/// operator-supplied device for one session and should still exit, not
+/// loop forever).
+struct KioskWindow {
+    application: Application,
+    window: ApplicationWindow,
+    picture: Picture,
+    settings_panel: SettingsPanel,
+    armed_mask: ArmedMask,
+    rotation_handle: Rc<RefCell<Option<SharedRotation>>>,
+    current_rotation: Rc<Cell<Rotation>>,
+    arm_window_handle: Rc<RefCell<Option<SharedArmWindow>>>,
+    is_fullscreen: Rc<Cell<bool>>,
+    gesture_settings: Rc<RefCell<HeadUnitSettings>>,
+    panel_visibility: SharedPanelVisibility,
+}
+
+/// Builds the fullscreen window, its overlays, and every widget
+/// `usb kiosk` needs — once, not once per reconnect. Mirrors the
+/// non-session parts of [`activate_window`] exactly (CSS, `Picture`,
+/// `Overlay`, `SettingsPanel`, `ArmedMask`, the experimental disclaimer,
+/// the fullscreen `ApplicationWindow`, `wire_settings_panel`); kept as
+/// its own function rather than reused directly because `activate_window`
+/// intertwines this with per-session channel setup in a way that can't
+/// be split without changing its own still-correct behavior for
+/// [`run`]/[`run_with_cancel`].
+fn build_kiosk_window(application: &Application) -> KioskWindow {
+    let gesture_settings: Rc<RefCell<HeadUnitSettings>> = Rc::new(RefCell::new(
+        HeadUnitSettings::load(Path::new(DEFAULT_SETTINGS_PATH)),
+    ));
+
+    install_flipped_panel_css();
+    install_default_video_background_css();
+    install_minimum_touch_target_css();
+    let picture = Picture::new();
+    picture.add_css_class("video-picture");
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&picture));
+    let settings_panel = build_settings_panel_from(&gesture_settings);
+    apply_theme(
+        &settings_panel.active_theme_provider,
+        gesture_settings.borrow().theme(),
+    );
+    overlay.add_overlay(&settings_panel.root);
+    let panel_visibility = SharedPanelVisibility::new(false);
+    let panel_visibility_for_notify = panel_visibility.clone();
+    settings_panel
+        .root
+        .connect_visible_notify(move |root| panel_visibility_for_notify.set(root.is_visible()));
+    let armed_mask = build_armed_mask();
+    overlay.add_overlay(&armed_mask.root);
+
+    build_and_wire_experimental_disclaimer(&overlay, &gesture_settings);
+
+    let window = ApplicationWindow::builder()
+        .application(application)
+        .title("pi-auto-headunit live session")
+        .child(&overlay)
+        .build();
+    window.fullscreen();
+    window.present();
+
+    let rotation_handle: Rc<RefCell<Option<SharedRotation>>> = Rc::new(RefCell::new(None));
+    let current_rotation: Rc<Cell<Rotation>> =
+        Rc::new(Cell::new(gesture_settings.borrow().rotation()));
+    settings_panel
+        .rotation_label
+        .set_text(rotation_label_text(current_rotation.get()));
+    if current_rotation.get() == Rotation::Flipped180 {
+        settings_panel.root.add_css_class("flipped-panel");
+        armed_mask.root.add_css_class("flipped-panel");
+    }
+    let arm_window_handle: Rc<RefCell<Option<SharedArmWindow>>> = Rc::new(RefCell::new(None));
+    let is_fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+
+    wire_settings_panel(
+        &settings_panel,
+        &armed_mask,
+        &window,
+        &rotation_handle,
+        &current_rotation,
+        &arm_window_handle,
+        &is_fullscreen,
+        &gesture_settings,
+    );
+
+    KioskWindow {
+        application: application.clone(),
+        window,
+        picture,
+        settings_panel,
+        armed_mask,
+        rotation_handle,
+        current_rotation,
+        arm_window_handle,
+        is_fullscreen,
+        gesture_settings,
+        panel_visibility,
+    }
+}
+
+/// Same discovery strategy `main.rs`'s original `find_candidate_device`
+/// used before `usb kiosk`'s reconnect loop moved here (2026-08-21, the
+/// real black-screen hang fix — see [`run_kiosk`]'s doc comment): prefer
+/// a device already in AOA accessory mode (the common case right after a
+/// reconnect), otherwise probe every other non-root-hub device with the
+/// documented AOA `GetProtocol` vendor request. `Ok(None)` (not an
+/// error) means no candidate yet — the expected steady state for a head
+/// unit at boot with no phone plugged in.
+fn find_kiosk_candidate_device()
+-> Result<Option<transport_api::UsbDeviceId>, transport_api::AoaError> {
+    use transport_api::AoaBackend;
+    const LINUX_FOUNDATION_ROOT_HUB_VENDOR_ID: u16 = 0x1d6b;
+
+    let mut backend = transport_usb::LibUsbAoaBackend::new()?;
+    let devices = backend.list_devices()?;
+    if let Some(device) = devices
+        .iter()
+        .find(|device| transport_usb::is_accessory_id(device.vendor_id, device.product_id))
+    {
+        return Ok(Some(device.clone()));
+    }
+    for device in &devices {
+        if device.vendor_id == LINUX_FOUNDATION_ROOT_HUB_VENDOR_ID {
+            continue;
+        }
+        if backend.query_protocol(device).is_ok() {
+            return Ok(Some(device.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The kiosk background thread's full body for one attempt: poll for a
+/// candidate device, then run one `AAP` session against it. Combines what
+/// used to be `usb_kiosk`'s own discovery loop (`main.rs`) with
+/// `run_session` — moved here so the whole reconnect loop lives on one
+/// background thread per attempt instead of a synchronous loop in
+/// `main.rs` that used to rebuild the GTK window every cycle.
+fn discover_and_run_kiosk_session(
+    tls12_compatibility: bool,
+    handoff: Gtk4WindowHandoff,
+    touch_settings: TouchSettingsHandoff,
+    cancel: &CancellationFlag,
+) -> Result<(), CliError> {
+    let selector = loop {
+        if cancel.is_set() {
+            return Ok(());
+        }
+        match find_kiosk_candidate_device() {
+            Ok(Some(device)) => break format!("{}:{}", device.bus, device.address),
+            Ok(None) => thread::sleep(KIOSK_DISCOVERY_POLL_INTERVAL),
+            Err(error) => {
+                println!("probe_state=kiosk_discovery_failed error={error}");
+                thread::sleep(KIOSK_DISCOVERY_POLL_INTERVAL);
+            }
+        }
+    };
+    println!("probe_state=kiosk_device_selected selector={selector}");
+    run_session(
+        &selector,
+        tls12_compatibility,
+        handoff,
+        touch_settings,
+        cancel,
+    )
+}
+
+/// Installs this attempt's hang safety net — same purpose and same
+/// derived duration as [`install_hang_safety_net`], but on firing it ends
+/// *this attempt* via [`end_kiosk_attempt`] (schedule a retry, or quit if
+/// cancelled) instead of unconditionally quitting the whole application,
+/// since the window now outlives any single attempt.
+#[allow(clippy::too_many_arguments)]
+fn install_kiosk_hang_safety_net(
+    window: Rc<KioskWindow>,
+    tls12_compatibility: bool,
+    hang_safety_net_seconds: u32,
+    cancel: CancellationFlag,
+    final_result: Rc<RefCell<Option<Result<(), CliError>>>>,
+    attempt_ended: Rc<Cell<bool>>,
+) -> Rc<RefCell<Option<glib::SourceId>>> {
+    let safety_net_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let safety_net_id_for_install = Rc::clone(&safety_net_id);
+    let safety_net_id_for_end = Rc::clone(&safety_net_id);
+    *safety_net_id_for_install.borrow_mut() = Some(glib::timeout_add_seconds_local(
+        hang_safety_net_seconds,
+        move || {
+            end_kiosk_attempt(
+                Rc::clone(&window),
+                tls12_compatibility,
+                hang_safety_net_seconds,
+                cancel.clone(),
+                Rc::clone(&final_result),
+                &attempt_ended,
+                &safety_net_id_for_end,
+                Err(CliError::Protocol(
+                    "kiosk session attempt hit the hang safety net with no result".into(),
+                )),
+            );
+            glib::ControlFlow::Break
+        },
+    ));
+    safety_net_id
+}
+
+/// Runs exactly once per session attempt, however it ended (a real
+/// result from `session_result_receiver`, or the hang safety net firing
+/// with none ever arriving) — guarded by `attempt_ended` against running
+/// twice for the same attempt (both can legitimately fire; only the
+/// first should act). Safe without a lock: every closure this file
+/// registers runs on the GTK main thread, and `glib` never runs two
+/// callbacks concurrently. Resets the window back to a clean
+/// "waiting for a phone" state (clears the video paintable, drops the
+/// now-stale rotation/arm-window handles from the ended session) without
+/// touching the window/`Application` themselves, then either quits (if
+/// cancelled) or schedules the next attempt after
+/// [`KIOSK_RECONNECT_DELAY_SECONDS`] via [`start_kiosk_session`] — the
+/// core of what this whole redesign is for: reconnecting never rebuilds
+/// the window.
+#[allow(clippy::too_many_arguments)]
+fn end_kiosk_attempt(
+    window: Rc<KioskWindow>,
+    tls12_compatibility: bool,
+    hang_safety_net_seconds: u32,
+    cancel: CancellationFlag,
+    final_result: Rc<RefCell<Option<Result<(), CliError>>>>,
+    attempt_ended: &Rc<Cell<bool>>,
+    safety_net_id: &Rc<RefCell<Option<glib::SourceId>>>,
+    result: Result<(), CliError>,
+) {
+    if attempt_ended.replace(true) {
+        return;
+    }
+    if let Some(id) = safety_net_id.borrow_mut().take() {
+        id.remove();
+    }
+    match &result {
+        Ok(()) => println!("probe_state=kiosk_session_ended"),
+        Err(error) => println!("probe_state=kiosk_session_ended error={error}"),
+    }
+
+    window
+        .picture
+        .set_paintable(Option::<&gtk4::gdk::Paintable>::None);
+    *window.rotation_handle.borrow_mut() = None;
+    *window.arm_window_handle.borrow_mut() = None;
+
+    if cancel.is_set() {
+        *final_result.borrow_mut() = Some(result);
+        window.application.quit();
+        return;
+    }
+
+    glib::timeout_add_seconds_local(KIOSK_RECONNECT_DELAY_SECONDS, move || {
+        start_kiosk_session(
+            &window,
+            tls12_compatibility,
+            hang_safety_net_seconds,
+            &cancel,
+            &final_result,
+        );
+        glib::ControlFlow::Break
+    });
+}
+
+/// Starts one `AAP` session attempt against the persistent
+/// [`KioskWindow`]: discovers a device and runs the session on a
+/// background thread, and wires every poll needed to bridge that thread
+/// back to the (already-existing, reused) window widgets — mirrors
+/// [`wire_session_polls`] closely, differing only in reusing `window`'s
+/// widgets instead of building fresh ones, and in routing session-end
+/// through [`end_kiosk_attempt`] instead of unconditionally quitting.
+/// Re-invoked by `end_kiosk_attempt` for every subsequent reconnect, so
+/// the whole `usb kiosk` process only ever calls [`build_kiosk_window`]
+/// once.
+/// Wires the rotation and arm-window one-shot handle deliveries into
+/// `window`'s persistent state — split out of [`start_kiosk_session`]
+/// purely to keep it under `clippy::too_many_lines`. Each poll
+/// self-terminates once it delivers (`Ok` → `Break`) or the sending
+/// session ends without ever delivering one (`Disconnected` → `Break`),
+/// same as every other per-session poll in this file.
+fn wire_kiosk_handle_polls(
+    window: &Rc<KioskWindow>,
+    rotation_receiver: mpsc::Receiver<Option<SharedRotation>>,
+    arm_window_receiver: mpsc::Receiver<SharedArmWindow>,
+) {
+    let rotation_handle_for_poll = Rc::clone(&window.rotation_handle);
+    let current_rotation_for_poll = Rc::clone(&window.current_rotation);
+    let _rotation_poll_id =
+        glib::timeout_add_local(POLL_INTERVAL, move || match rotation_receiver.try_recv() {
+            Ok(handle) => {
+                if let Some(handle) = &handle {
+                    handle.set(current_rotation_for_poll.get());
+                }
+                *rotation_handle_for_poll.borrow_mut() = handle;
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        });
+
+    let arm_window_handle_for_poll = Rc::clone(&window.arm_window_handle);
+    let _arm_window_poll_id = glib::timeout_add_local(POLL_INTERVAL, move || {
+        match arm_window_receiver.try_recv() {
+            Ok(handle) => {
+                *arm_window_handle_for_poll.borrow_mut() = Some(handle);
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+}
+
+fn start_kiosk_session(
+    window: &Rc<KioskWindow>,
+    tls12_compatibility: bool,
+    hang_safety_net_seconds: u32,
+    cancel: &CancellationFlag,
+    final_result: &Rc<RefCell<Option<Result<(), CliError>>>>,
+) {
+    let (capability_sender, capability_receiver) = mpsc::channel::<DecoderCapability>();
+    let (pipeline_sender, pipeline_receiver) = mpsc::channel();
+    let (session_result_sender, session_result_receiver) = mpsc::channel::<Result<(), CliError>>();
+    let (rotation_sender, rotation_receiver) = mpsc::channel::<Option<SharedRotation>>();
+    let (arm_window_sender, arm_window_receiver) = mpsc::channel::<SharedArmWindow>();
+    let (gesture_sender, gesture_receiver) = mpsc::channel::<GestureEvent>();
+
+    let handoff = Gtk4WindowHandoff {
+        capability_sender,
+        pipeline_receiver,
+    };
+    let touch_settings = TouchSettingsHandoff {
+        rotation_sender,
+        arm_window_sender,
+        gesture_sender,
+        panel_visibility: window.panel_visibility.clone(),
+    };
+
+    let attempt_ended = Rc::new(Cell::new(false));
+    let safety_net_id = install_kiosk_hang_safety_net(
+        Rc::clone(window),
+        tls12_compatibility,
+        hang_safety_net_seconds,
+        cancel.clone(),
+        Rc::clone(final_result),
+        Rc::clone(&attempt_ended),
+    );
+
+    let safety_net_id_for_capability = Rc::clone(&safety_net_id);
+    let picture_for_capability = window.picture.clone();
+    let _capability_poll_id = glib::timeout_add_local(POLL_INTERVAL, move || {
+        match capability_receiver.try_recv() {
+            Ok(capability) => {
+                if let Some(id) = safety_net_id_for_capability.borrow_mut().take() {
+                    id.remove();
+                }
+                let outcome = build_gtk4_pipeline(&capability, &picture_for_capability);
+                let _ = pipeline_sender.send(outcome);
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+
+    wire_kiosk_handle_polls(window, rotation_receiver, arm_window_receiver);
+
+    let _gesture_poll_id = wire_gesture_poll(
+        gesture_receiver,
+        window.settings_panel.clone(),
+        window.armed_mask.clone(),
+        window.window.clone(),
+        Rc::clone(&window.rotation_handle),
+        Rc::clone(&window.current_rotation),
+        Rc::clone(&window.is_fullscreen),
+        Rc::clone(&window.gesture_settings),
+    );
+
+    let cancel_for_thread = cancel.clone();
+    thread::spawn(move || {
+        let result = discover_and_run_kiosk_session(
+            tls12_compatibility,
+            handoff,
+            touch_settings,
+            &cancel_for_thread,
+        );
+        let _ = session_result_sender.send(result);
+    });
+
+    let window_for_result = Rc::clone(window);
+    let final_result_for_result = Rc::clone(final_result);
+    let cancel_for_result = cancel.clone();
+    let attempt_ended_for_result = Rc::clone(&attempt_ended);
+    let safety_net_id_for_result = Rc::clone(&safety_net_id);
+    let _result_poll_id = glib::timeout_add_local(POLL_INTERVAL, move || {
+        match session_result_receiver.try_recv() {
+            Ok(result) => {
+                end_kiosk_attempt(
+                    Rc::clone(&window_for_result),
+                    tls12_compatibility,
+                    hang_safety_net_seconds,
+                    cancel_for_result.clone(),
+                    Rc::clone(&final_result_for_result),
+                    &attempt_ended_for_result,
+                    &safety_net_id_for_result,
+                    result,
+                );
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+}
+
+/// Entry point for `usb kiosk --allow-live-aap [--tls12-compat]` — the
+/// unattended, boot-time, reconnect-forever equivalent of
+/// [`run`]/[`run_with_cancel`]. Builds the fullscreen window exactly once
+/// ([`build_kiosk_window`]) and keeps it alive for the whole process
+/// lifetime, running one `AAP` session attempt after another against it
+/// ([`start_kiosk_session`]) without ever tearing down or recreating the
+/// window/`Application` in between.
+///
+/// **Why this exists (2026-08-21)**: the previous design called
+/// `run_with_cancel` fresh for every single reconnect attempt from a loop
+/// in `main.rs` — each call built a brand new `gtk4::Application` and
+/// window from scratch and tore it down (`application.quit()`) when the
+/// attempt ended, whether it succeeded or failed. A real black-screen
+/// hang, needing a physical reboot to recover from, was reproduced when
+/// this hit the known reconnect-race
+/// (`docs/protocol/session-supervisor-reconnect-race.md`) from a cold
+/// start: several consecutive failed cycles meant creating and
+/// destroying a full window/Wayland surface every 2-4 seconds, many
+/// times in a row — far more rapid and repetitive than any
+/// previously-tested long-lived-session scenario. The working
+/// hypothesis: if that teardown isn't fully synchronous with the
+/// compositor, hammering it that fast can desync or exhaust `labwc`
+/// itself. This redesign removes the repeated window churn entirely —
+/// only the protocol session (background thread, video pipeline,
+/// per-session channels) gets rebuilt on reconnect; the window, its
+/// overlays, and their GTK state persist untouched for the whole process
+/// lifetime.
+///
+/// **Unconfirmed on real hardware as of this writing** — the hypothesis
+/// this fixes was never proven, only reasoned from code; treat this the
+/// way this project treats every other reverse-engineered/unconfirmed
+/// behavior: a real-hardware trial is needed before trusting it,
+/// including specifically retrying the reconnect-race scenario that
+/// caused the original hang.
+pub(crate) fn run_kiosk(
+    tls12_compatibility: bool,
+    cancel: &CancellationFlag,
+) -> Result<(), CliError> {
+    let hang_safety_net_seconds = hang_safety_net_seconds()?;
+    let final_result: Rc<RefCell<Option<Result<(), CliError>>>> = Rc::new(RefCell::new(None));
+
+    let application = Application::builder()
+        .application_id("dev.pi-auto-headunit.gtk-dev-ui")
+        .build();
+
+    // `connect_activate` requires `Fn`, callable more than once in
+    // principle — this guard (mirroring `run`/`run_with_cancel`'s own
+    // `RefCell<Option<..>>.take()` guard against the same theoretical
+    // double-activation) ensures the window is still only ever built
+    // once even if it were.
+    let already_started = Rc::new(Cell::new(false));
+    let final_result_for_activate = Rc::clone(&final_result);
+    let cancel_for_activate = cancel.clone();
+    application.connect_activate(move |application| {
+        if already_started.replace(true) {
+            return;
+        }
+        let window = Rc::new(build_kiosk_window(application));
+        start_kiosk_session(
+            &window,
+            tls12_compatibility,
+            hang_safety_net_seconds,
+            &cancel_for_activate,
+            &final_result_for_activate,
+        );
+    });
+
+    let _exit_code = application.run_with_args::<&str>(&[]);
+
+    let result = final_result.borrow_mut().take().unwrap_or(Ok(()));
+    if result.is_err() {
+        connection_state::report(ConnectionState::Error);
+    }
+    result
+}
+
 /// One gesture's action-assignment control: a plain `Button` labeled with
 /// the gesture's currently assigned action. Tapping it opens
 /// [`ActionPicker`] — see that type's doc comment for why this ended up
@@ -797,6 +1311,7 @@ enum SettingsPage {
     RearCamera,
     DashCam,
     ScreenMirroring,
+    Legal,
 }
 
 /// One of the settings menu's not-yet-implemented sibling pages (EQ,
@@ -832,11 +1347,25 @@ struct SettingsPanel {
     themes_back_button: Button,
     theme_buttons: Rc<Vec<(Option<String>, Button)>>,
     active_theme_provider: Rc<RefCell<Option<gtk4::CssProvider>>>,
+    equalizer_page: GtkBox,
+    equalizer_button: Button,
+    equalizer_back_button: Button,
+    /// One `Scale` per `equalizer-10bands` band, in `band0..band9` order —
+    /// see `build_equalizer_page`'s doc comment.
+    eq_scales: Rc<Vec<Scale>>,
     stub_pages: Rc<Vec<StubPage>>,
     rotation_label: Label,
     gesture_selectors: Rc<GestureSelectors>,
     picker: ActionPicker,
-    close_button: Button,
+    /// The "Android Auto" entry in the top-level settings menu grid —
+    /// dismisses the settings panel to reveal the live AA view
+    /// underneath, exactly like the plain "Close" button this replaced
+    /// (2026-08-21, extras roadmap: AA is a menu entry like any other
+    /// page — Gestures/Display/Themes/etc. — not a fixed backdrop
+    /// everything else sits on top of). The live video/audio pipeline
+    /// was never paused by the settings panel being open in the first
+    /// place, so this is a pure navigation change — nothing to restart.
+    android_auto_button: Button,
     toggle_fullscreen_button: Button,
     flip_screen_button: Button,
     arm_timeout_spin: SpinButton,
@@ -869,6 +1398,9 @@ fn show_settings_page(settings_panel: &SettingsPanel, page: SettingsPage) {
     settings_panel
         .themes_page
         .set_visible(page == SettingsPage::Themes);
+    settings_panel
+        .equalizer_page
+        .set_visible(page == SettingsPage::Equalizer);
     for stub in settings_panel.stub_pages.iter() {
         stub.root.set_visible(stub.page == page);
     }
@@ -899,6 +1431,133 @@ fn build_armed_mask() -> ArmedMask {
     label.set_vexpand(true);
     root.append(&label);
     ArmedMask { root }
+}
+
+/// Shown on the boot popup itself — deliberately short (`RISK_REGISTER.md`
+/// R-021 calls for a "prominent" disclaimer, not a wall of text nobody
+/// reads) and deliberately general, covering the head unit as a whole
+/// rather than one feature, since Blake's own reasoning (2026-08-21) was
+/// that a separate disclaimer per experimental feature (dashcam, `DeX`,
+/// wireless AA, ...) would just stack up over time. The full detail
+/// lives on [`SettingsPage::Legal`] instead — see
+/// [`LEGAL_PAGE_DETAILED_TEXT`].
+const EXPERIMENTAL_DISCLAIMER_SUMMARY_TEXT: &str = "This head unit and its experimental \
+features (including dashcam/rear camera, the equalizer, DeX, and wireless Android Auto) are \
+provided with no warranty and used at your own risk. See Settings → Legal for full details.";
+
+/// Plain-language draft text, not reviewed by a lawyer — see this
+/// feature's own design discussion (2026-08-21) for why: it deliberately
+/// does not claim anything about court admissibility (software can't
+/// dictate that), and instead names the two concrete things this project
+/// genuinely cannot guarantee for dashcam/rear-camera footage specifically
+/// — that recording is continuous or complete, and that any timestamp/GPS
+/// data attached to a clip is accurate for that specific recording. Take
+/// this to a lawyer before relying on it as real liability protection;
+/// this is a starting point, not the real thing. Shown in full on
+/// [`SettingsPage::Legal`], reachable any time — not just on the boot
+/// popup — so an operator can review it whenever they want, not only in
+/// the moment they're asked to agree to it.
+const LEGAL_PAGE_DETAILED_TEXT: &str = "This head unit is independent, community software, \
+not affiliated with or certified by any vehicle or phone manufacturer. It is provided with no \
+warranty, under the terms of the GNU General Public License (see the project's own LICENSE \
+file). Use while driving is at your own risk — this software has no safety-critical controls \
+and should never be relied upon as one.\n\n\
+Dashcam and rear-camera recording are experimental features. Recording may fail, be \
+interrupted, or be incomplete. Timestamps and GPS/location data attached to a recording are \
+not independently verified and may be inaccurate for that specific clip. Do not rely on this \
+footage or its metadata as an accurate record of when or where something happened, including \
+for insurance, legal, or law-enforcement purposes.\n\n\
+Other experimental features on this head unit (including but not limited to the equalizer, \
+Samsung DeX support, and wireless Android Auto) carry the same no-warranty, use-at-your-own-risk \
+terms and may be incomplete or unreliable.";
+
+/// The head-unit-wide experimental-software disclaimer, shown on every
+/// boot (see `RISK_REGISTER.md` R-021, "prominent experimental
+/// disclaimer") until the operator explicitly agrees — clicking "I
+/// Agree" is the only way past it; there is no other way to close or
+/// bypass this overlay, by design (2026-08-21, Blake's explicit
+/// requirement: the operator must agree before being able to use the
+/// head unit at all). Whether that agreement is remembered across future
+/// boots is a separate, off-by-default choice
+/// (`dont_show_again_check`) — defaulting to "ask again next boot" is
+/// the more conservative choice absent further direction.
+#[derive(Clone)]
+struct ExperimentalDisclaimer {
+    root: GtkBox,
+    dont_show_again_check: CheckButton,
+    agree_button: Button,
+}
+
+fn build_experimental_disclaimer() -> ExperimentalDisclaimer {
+    let root = GtkBox::new(Orientation::Vertical, 16);
+    root.set_halign(gtk4::Align::Fill);
+    root.set_valign(gtk4::Align::Fill);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root.set_visible(false);
+    root.add_css_class("background");
+    root.set_margin_top(24);
+    root.set_margin_bottom(24);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+
+    let title = Label::new(Some("Experimental Software — Use At Your Own Risk"));
+    title.set_halign(gtk4::Align::Center);
+    root.append(&title);
+
+    let body = Label::new(Some(EXPERIMENTAL_DISCLAIMER_SUMMARY_TEXT));
+    body.set_wrap(true);
+    body.set_justify(gtk4::Justification::Center);
+    body.set_vexpand(true);
+    body.set_valign(gtk4::Align::Center);
+    root.append(&body);
+
+    let dont_show_again_check = CheckButton::with_label("Don't show this again");
+    dont_show_again_check.set_halign(gtk4::Align::Center);
+    root.append(&dont_show_again_check);
+
+    let agree_button = Button::with_label("I Agree");
+    root.append(&agree_button);
+
+    ExperimentalDisclaimer {
+        root,
+        dont_show_again_check,
+        agree_button,
+    }
+}
+
+/// Builds the disclaimer, adds it to `overlay`, sets its initial
+/// visibility from the persisted setting, and wires the "I Agree"
+/// button — split out of `activate_window` purely to keep it under
+/// `clippy::too_many_lines`. Nothing else in this function offers a way
+/// to hide the overlay — see [`ExperimentalDisclaimer`]'s doc comment
+/// for why that's deliberate.
+fn build_and_wire_experimental_disclaimer(
+    overlay: &Overlay,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    let disclaimer = build_experimental_disclaimer();
+    disclaimer.root.set_visible(
+        !gesture_settings
+            .borrow()
+            .experimental_disclaimer_dismissed(),
+    );
+    overlay.add_overlay(&disclaimer.root);
+
+    let gesture_settings_for_disclaimer = Rc::clone(gesture_settings);
+    let disclaimer_root_for_agree = disclaimer.root.clone();
+    let dont_show_again_check_for_agree = disclaimer.dont_show_again_check.clone();
+    disclaimer.agree_button.connect_clicked(move |_| {
+        if dont_show_again_check_for_agree.is_active() {
+            gesture_settings_for_disclaimer
+                .borrow_mut()
+                .set_experimental_disclaimer_dismissed(true);
+            let _ = gesture_settings_for_disclaimer
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+        }
+        disclaimer_root_for_agree.set_visible(false);
+    });
 }
 
 /// How far a press has to move before it's treated as a scroll drag
@@ -1239,6 +1898,7 @@ impl SettingsPage {
             SettingsPage::RearCamera => "Rear Camera",
             SettingsPage::DashCam => "DashCam",
             SettingsPage::ScreenMirroring => "Screen Mirroring",
+            SettingsPage::Legal => "Legal",
         }
     }
 }
@@ -1267,6 +1927,36 @@ fn build_stub_page(page: SettingsPage) -> StubPage {
 
     StubPage {
         page,
+        root,
+        open_button,
+        back_button,
+    }
+}
+
+/// The detailed, always-reachable counterpart to the boot-time
+/// disclaimer popup — see [`LEGAL_PAGE_DETAILED_TEXT`] for what it says
+/// and why. Reuses [`StubPage`]'s shape (it's the same
+/// title/content/Back layout, just with real content instead of "Coming
+/// soon.") rather than inventing a near-identical struct.
+fn build_legal_page() -> StubPage {
+    let root = GtkBox::new(Orientation::Vertical, 8);
+    root.set_visible(false);
+
+    let title = Label::new(Some(SettingsPage::Legal.label()));
+    root.append(&title);
+
+    let body = Label::new(Some(LEGAL_PAGE_DETAILED_TEXT));
+    body.set_wrap(true);
+    root.append(&body);
+
+    let back_button = Button::with_label("Back");
+    root.append(&back_button);
+
+    let open_button = Button::with_label(SettingsPage::Legal.label());
+    open_button.set_hexpand(true);
+
+    StubPage {
+        page: SettingsPage::Legal,
         root,
         open_button,
         back_button,
@@ -1442,6 +2132,78 @@ fn build_display_page(
     }
 }
 
+/// Everything [`build_equalizer_page`] builds.
+struct EqualizerPageBuild {
+    page: GtkBox,
+    open_button: Button,
+    back_button: Button,
+    /// `band0..band9` order, matching `equalizer-10bands`' own property
+    /// naming and `crate::settings::HeadUnitSettings::eq_bands`'s array
+    /// order — see that method's doc comment.
+    band_scales: Vec<Scale>,
+}
+
+/// Builds the Equalizer page: one vertical `Scale` per
+/// `equalizer-10bands` band (extras roadmap, 2026-08-21 — see
+/// `crates/media-gstreamer/src/audio.rs`'s matching pipeline change).
+/// Labeled generically ("Band 1".."Band 10", lowest to highest
+/// frequency) rather than asserting specific center-frequency numbers
+/// this project hasn't confirmed against a pinned `GStreamer` source —
+/// same evidentiary standard this project applies to the AAP protocol
+/// itself, just applied to a dependency's own documented behavior
+/// instead. Settings persist immediately (debounced, matching the
+/// brightness slider) but do not live-apply to an already-running
+/// session — see `HeadUnitSettings::eq_bands`'s doc comment for why
+/// that's a deliberate, already-established precedent for audio
+/// settings, not a shortcut taken here.
+fn build_equalizer_page(
+    initial_eq_bands: [f64; crate::settings::EQ_BAND_COUNT],
+) -> EqualizerPageBuild {
+    let page = GtkBox::new(Orientation::Vertical, 8);
+    page.set_visible(false);
+
+    let title = Label::new(Some(SettingsPage::Equalizer.label()));
+    page.append(&title);
+
+    let band_grid = Grid::new();
+    band_grid.set_row_spacing(8);
+    band_grid.set_column_spacing(8);
+    band_grid.set_hexpand(true);
+    page.append(&band_grid);
+
+    let mut band_scales = Vec::with_capacity(crate::settings::EQ_BAND_COUNT);
+    for (index, initial_gain_db) in initial_eq_bands.into_iter().enumerate() {
+        let column = i32::try_from(index).unwrap_or(0);
+        let label = Label::new(Some(&format!("Band {}", index + 1)));
+        band_grid.attach(&label, column, 0, 1, 1);
+
+        let scale = Scale::with_range(
+            Orientation::Vertical,
+            crate::settings::MIN_EQ_BAND_GAIN_DB,
+            crate::settings::MAX_EQ_BAND_GAIN_DB,
+            1.0,
+        );
+        scale.set_value(initial_gain_db);
+        scale.set_vexpand(true);
+        scale.set_inverted(true);
+        band_grid.attach(&scale, column, 1, 1, 1);
+        band_scales.push(scale);
+    }
+
+    let back_button = Button::with_label("Back");
+    page.append(&back_button);
+
+    let open_button = Button::with_label(SettingsPage::Equalizer.label());
+    open_button.set_hexpand(true);
+
+    EqualizerPageBuild {
+        page,
+        open_button,
+        back_button,
+        band_scales,
+    }
+}
+
 /// Everything [`build_themes_page`] builds — bundled into a struct for
 /// readability at the call site. `theme_buttons` pairs each button with
 /// the persistable value tapping it should apply: `None` for "System
@@ -1496,45 +2258,32 @@ fn build_themes_page() -> ThemesPageBuild {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_settings_panel(
-    initial_arm_window_seconds: u32,
-    initial_mtp_popup_suppression_enabled: bool,
-    initial_launch_on_boot: bool,
-    initial_display_brightness_percent: u8,
-    initial_audio_output_device: Option<&str>,
-    initial_microphone_input_device: Option<&str>,
-    initial_night_mode_gpio_line: Option<u32>,
-) -> SettingsPanel {
-    let gestures = build_gestures_page();
-    let display = build_display_page(
-        initial_arm_window_seconds,
-        initial_mtp_popup_suppression_enabled,
-        initial_launch_on_boot,
-        initial_display_brightness_percent,
-        initial_audio_output_device,
-        initial_microphone_input_device,
-        initial_night_mode_gpio_line,
-    );
+/// Reads every setting `build_settings_panel` needs out of `gesture_settings`
+/// and calls it — split out of `activate_window` purely to keep it under
+/// `clippy::too_many_lines`, not because this borrowing sequence does
+/// anything `activate_window` itself couldn't.
+fn build_settings_panel_from(gesture_settings: &Rc<RefCell<HeadUnitSettings>>) -> SettingsPanel {
+    build_settings_panel(
+        gesture_settings.borrow().arm_window_seconds(),
+        gesture_settings.borrow().mtp_popup_suppression_enabled(),
+        gesture_settings.borrow().launch_on_boot(),
+        gesture_settings.borrow().display_brightness_percent(),
+        gesture_settings.borrow().audio_output_device(),
+        gesture_settings.borrow().microphone_input_device(),
+        gesture_settings.borrow().night_mode_gpio_line(),
+        gesture_settings.borrow().eq_bands(),
+    )
+}
 
-    let themes = build_themes_page();
-
-    // --- The four not-yet-implemented sibling pages ---
-    let stub_pages: Vec<StubPage> = [
-        SettingsPage::Equalizer,
-        SettingsPage::RearCamera,
-        SettingsPage::DashCam,
-        SettingsPage::ScreenMirroring,
-    ]
-    .into_iter()
-    .map(build_stub_page)
-    .collect();
-
-    // --- Top-level menu page ---
-    // At the operator's explicit request (2026-08-19): the panel opened
-    // by the arm-swipe-then-gesture is a page full of buttons, each
-    // leading to its own page, rather than one long flat page of every
-    // control.
+/// Builds the top-level settings menu page: a title, a two-column grid of
+/// `buttons` (one per destination page — Android Auto, Gestures, Display,
+/// etc.), and the "Return to desktop" fullscreen toggle below it. Split
+/// out of `build_settings_panel` purely to keep it under
+/// `clippy::too_many_lines`. At the operator's explicit request
+/// (2026-08-19): the panel opened by the arm-swipe-then-gesture is a page
+/// full of buttons, each leading to its own page, rather than one long
+/// flat page of every control.
+fn build_menu_page(buttons: &[&Button]) -> (GtkBox, Button) {
     let menu_page = GtkBox::new(Orientation::Vertical, 8);
 
     let title = Label::new(Some("Head unit settings"));
@@ -1552,22 +2301,70 @@ fn build_settings_panel(
     menu_grid.set_hexpand(true);
     menu_page.append(&menu_grid);
 
-    let mut menu_buttons: Vec<&Button> = vec![
-        &gestures.open_button,
-        &display.open_button,
-        &themes.open_button,
-    ];
-    menu_buttons.extend(stub_pages.iter().map(|stub| &stub.open_button));
-    for (index, button) in menu_buttons.into_iter().enumerate() {
+    for (index, button) in buttons.iter().enumerate() {
         let index = i32::try_from(index).unwrap_or(0);
-        menu_grid.attach(button, index % 2, index / 2, 1, 1);
+        menu_grid.attach(*button, index % 2, index / 2, 1, 1);
     }
-
-    let close_button = Button::with_label("Close");
-    menu_page.append(&close_button);
 
     let toggle_fullscreen_button = Button::with_label("Return to desktop");
     menu_page.append(&toggle_fullscreen_button);
+
+    (menu_page, toggle_fullscreen_button)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_settings_panel(
+    initial_arm_window_seconds: u32,
+    initial_mtp_popup_suppression_enabled: bool,
+    initial_launch_on_boot: bool,
+    initial_display_brightness_percent: u8,
+    initial_audio_output_device: Option<&str>,
+    initial_microphone_input_device: Option<&str>,
+    initial_night_mode_gpio_line: Option<u32>,
+    initial_eq_bands: [f64; crate::settings::EQ_BAND_COUNT],
+) -> SettingsPanel {
+    let gestures = build_gestures_page();
+    let display = build_display_page(
+        initial_arm_window_seconds,
+        initial_mtp_popup_suppression_enabled,
+        initial_launch_on_boot,
+        initial_display_brightness_percent,
+        initial_audio_output_device,
+        initial_microphone_input_device,
+        initial_night_mode_gpio_line,
+    );
+
+    let themes = build_themes_page();
+    let equalizer = build_equalizer_page(initial_eq_bands);
+
+    // --- The three still-not-yet-implemented sibling pages ---
+    let mut stub_pages: Vec<StubPage> = [
+        SettingsPage::RearCamera,
+        SettingsPage::DashCam,
+        SettingsPage::ScreenMirroring,
+    ]
+    .into_iter()
+    .map(build_stub_page)
+    .collect();
+    // Reuses the exact same `StubPage` shape (title/content/Back) as the
+    // stubs above — real content instead of "Coming soon.", but no
+    // dedicated `SettingsPanel` fields needed since the existing stub
+    // visibility/open/back-button wiring already handles it generically.
+    stub_pages.push(build_legal_page());
+
+    // "Android Auto" leads the grid — the live AA view is the primary
+    // destination, the rest are settings pages, matching the OpenAuto-style
+    // "AA is one of the buttons" menu the operator asked for.
+    let android_auto_button = Button::with_label("Android Auto");
+    let mut menu_buttons: Vec<&Button> = vec![
+        &android_auto_button,
+        &gestures.open_button,
+        &display.open_button,
+        &themes.open_button,
+        &equalizer.open_button,
+    ];
+    menu_buttons.extend(stub_pages.iter().map(|stub| &stub.open_button));
+    let (menu_page, toggle_fullscreen_button) = build_menu_page(&menu_buttons);
 
     let picker = build_action_picker();
 
@@ -1576,6 +2373,7 @@ fn build_settings_panel(
     content.append(&gestures.page);
     content.append(&display.page);
     content.append(&themes.page);
+    content.append(&equalizer.page);
     for stub in &stub_pages {
         content.append(&stub.root);
     }
@@ -1619,11 +2417,15 @@ fn build_settings_panel(
         themes_back_button: themes.back_button,
         theme_buttons: Rc::new(themes.theme_buttons),
         active_theme_provider: Rc::new(RefCell::new(None)),
+        equalizer_page: equalizer.page,
+        equalizer_button: equalizer.open_button,
+        equalizer_back_button: equalizer.back_button,
+        eq_scales: Rc::new(equalizer.band_scales),
         stub_pages: Rc::new(stub_pages),
         rotation_label: display.rotation_label,
         gesture_selectors: Rc::new(gestures.selectors),
         picker,
-        close_button,
+        android_auto_button,
         toggle_fullscreen_button,
         flip_screen_button: display.flip_screen_button,
         arm_timeout_spin: display.arm_timeout_spin,
@@ -1917,6 +2719,45 @@ fn wire_brightness_and_device_settings(
         });
 }
 
+/// Wires the 10 equalizer band sliders — persist-only, like the audio
+/// device dropdowns above, not the live-applying brightness slider
+/// (`HeadUnitSettings::eq_bands`'s doc comment explains why: EQ settings
+/// are picked up at the next audio pipeline build, not mid-session).
+/// Debounced ([`BRIGHTNESS_SAVE_DEBOUNCE`]) with one shared timer for all
+/// 10 sliders, not one per band — every slider's handler saves the
+/// *whole* current settings snapshot regardless of which band moved, so
+/// a single shared debounce is already correct: rapid drags across
+/// multiple sliders collapse into one save, same as rapid drags on one.
+fn wire_equalizer_sliders(
+    settings_panel: &SettingsPanel,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    let pending_eq_save: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    for (index, scale) in settings_panel.eq_scales.iter().enumerate() {
+        let gesture_settings = Rc::clone(gesture_settings);
+        let pending_eq_save = Rc::clone(&pending_eq_save);
+        scale.connect_value_changed(move |scale| {
+            gesture_settings
+                .borrow_mut()
+                .set_eq_band(index, scale.value());
+
+            if let Some(source_id) = pending_eq_save.take() {
+                source_id.remove();
+            }
+            let gesture_settings_for_save = Rc::clone(&gesture_settings);
+            let pending_eq_save_for_timeout = Rc::clone(&pending_eq_save);
+            let source_id = glib::timeout_add_local(BRIGHTNESS_SAVE_DEBOUNCE, move || {
+                let _ = gesture_settings_for_save
+                    .borrow()
+                    .save(Path::new(DEFAULT_SETTINGS_PATH));
+                pending_eq_save_for_timeout.set(None);
+                glib::ControlFlow::Break
+            });
+            pending_eq_save.set(Some(source_id));
+        });
+    }
+}
+
 /// Wires the gesture-assignment flow: tapping a gesture's selector opens
 /// [`ActionPicker`] over the Gestures page, tapping an action applies it
 /// and returns, and the picker's own Back button returns unchanged —
@@ -2011,6 +2852,17 @@ fn wire_settings_navigation(settings_panel: &SettingsPanel) {
         show_settings_page(&settings_panel_for_themes_back, SettingsPage::Menu);
     });
 
+    let settings_panel_for_equalizer_open = settings_panel.clone();
+    settings_panel.equalizer_button.connect_clicked(move |_| {
+        show_settings_page(&settings_panel_for_equalizer_open, SettingsPage::Equalizer);
+    });
+    let settings_panel_for_equalizer_back = settings_panel.clone();
+    settings_panel
+        .equalizer_back_button
+        .connect_clicked(move |_| {
+            show_settings_page(&settings_panel_for_equalizer_back, SettingsPage::Menu);
+        });
+
     for stub in settings_panel.stub_pages.iter() {
         let page = stub.page;
         let settings_panel_for_open = settings_panel.clone();
@@ -2087,6 +2939,7 @@ fn wire_settings_panel(
     wire_mtp_suppression_toggle(settings_panel, gesture_settings);
     wire_launch_on_boot_toggle(settings_panel, gesture_settings);
     wire_brightness_and_device_settings(settings_panel, gesture_settings);
+    wire_equalizer_sliders(settings_panel, gesture_settings);
 
     let settings_panel_for_cycle = settings_panel.clone();
     let armed_mask_for_cycle = armed_mask.clone();
@@ -2106,9 +2959,11 @@ fn wire_settings_panel(
     });
 
     let settings_panel_for_close = settings_panel.clone();
-    settings_panel.close_button.connect_clicked(move |_| {
-        close_settings_panel(&settings_panel_for_close);
-    });
+    settings_panel
+        .android_auto_button
+        .connect_clicked(move |_| {
+            close_settings_panel(&settings_panel_for_close);
+        });
 
     let window_for_toggle = window.clone();
     let settings_panel_for_toggle = settings_panel.clone();

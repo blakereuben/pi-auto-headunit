@@ -137,18 +137,18 @@ Architecture and automated tests must remain portable throughout development, bu
 
 ## M7 — Complete wireless Android Auto on Pi 5
 
-- [ ] Approve and document the wireless Android Auto protocol source and security model.
-- [ ] Detect onboard Pi 5 Wi-Fi and Bluetooth capability and health.
-- [ ] Detect supported external USB Wi-Fi and Bluetooth adapters by stable identity.
+- [ ] Approve and document the wireless Android Auto protocol source and security model. Substantial progress already exists but this item stays unchecked pending explicit confirmation it covers the full scope: `docs/protocol/wireless-source-assessment.md` (485 lines, 2026-08-15) documents the real cold-start bootstrap chain end to end with citations against this project's already-approved AASDK/LIVI revisions — standard Bluetooth SDP/pairing → the `aaw` protobuf-over-RFCOMM credential exchange → standard Wi-Fi association → an ordinary AAP session over TCP reusing this project's existing transport-agnostic TLS/protocol stack unmodified (i.e. the wired security model already applies here, not a separate one). A minimal proof-of-concept (`apps/aa-headunit-diagnostics/src/wireless_bootstrap.rs`) was built from an explicitly-approved implementation plan and real-hardware-confirmed 2026-08-16 (see below) — but its own module doc comment is explicit that it is deliberately the smallest possible slice, "not the full M7 milestone."
+- [x] Detect onboard Pi 5 Wi-Fi and Bluetooth capability and health. Real, already-exercised code: `platform_linux::discover_radios()` (`crates/platform-linux/src/lib.rs`) enumerates `/sys/class/net` and `/sys/class/bluetooth`, classifies each as onboard/USB/other from its device-link path, and reports `platform_api::CapabilityState::{Absent, Ready, Disabled, Degraded}` (rfkill-blocked → `Disabled`, no bound driver → `Degraded`) — exactly the four states M0 specified. Already wired into and exercised by the `preflight` and `wireless` CLI commands, both in real production use, not new/untested code.
+- [x] Detect supported external USB Wi-Fi and Bluetooth adapters by stable identity. Same `discover_radios()` path: a USB-connected radio's device link is detected (`ProviderKind::Usb`), its USB vendor:product ID is read (`find_usb_id`), and a `stable_id` is derived from it — so a USB adapter is identified by its own stable identity, not by interface name/enumeration order, which can change across reboots.
 - [ ] Test onboard/onboard radio operation.
 - [ ] Test USB/USB radio operation when suitable adapters are available.
 - [ ] Test mixed onboard/USB and USB/onboard combinations where hardware permits.
-- [ ] Provide independent `Auto`, `Onboard`, and named USB selections for both radios.
-- [ ] Persist radio selections across reboot.
-- [ ] Pair/onboard a phone without exposing credentials in logs.
-- [ ] Establish, use, disconnect, and reconnect a wireless Android Auto session.
+- [x] Provide independent `Auto`, `Onboard`, and named USB selections for both radios. `platform_api::ProviderPreference::{Auto, Onboard, StableId(String)}`, independently settable for Wi-Fi and Bluetooth via `usb wireless --wifi`/`--bluetooth` (`main.rs`'s `parse_preferences`/`resolve_and_persist_radio_preferences`) — built as part of M5's settings work but directly satisfies this item too.
+- [x] Persist radio selections across reboot. `HeadUnitSettings::wifi_preference`/`bluetooth_preference` (`settings.rs`), same load/save/round-trip pattern as every other persisted setting.
+- [x] Pair/onboard a phone without exposing credentials in logs. Confirmed on two fronts: a real phone actually paired and bootstrapped over Bluetooth+Wi-Fi in the 2026-08-16 real-hardware trial below, and a direct code review of `wireless_bootstrap.rs`/`transport-bluetooth` found only the SSID is ever logged (`ssid={ssid}` — not sensitive, an SSID is broadcast publicly over the air regardless) — the Wi-Fi password/PSK and any Bluetooth pairing PIN are never printed anywhere in that code path.
+- [ ] Establish, use, disconnect, and reconnect a wireless Android Auto session. **Partial**: establish+use is real-hardware-confirmed — a 2026-08-16 trial (`usb wireless-bootstrap-probe`, committed `801b07c`) ran a full session to a clean natural end over a genuinely wireless connection: 343 real video frames and 380 real media-audio chunks streamed and acknowledged, and the head unit's own physical screen visibly switched to the Android Auto UI (confirmed by the operator watching the screen, not inferred from logs). Disconnect/reconnect behavior specifically has never been exercised over wireless — stays unchecked until it is. A known, separate, not-yet-investigated gap from that same trial: touch input does not work over the wireless session (the exact same wire-format touch reports that work over USB wired sessions produce no response wirelessly) — root cause unknown, not yet chased.
 - [ ] Recover when a selected adapter is unplugged, disabled, blocked, or degraded.
-- [ ] Confirm wired Android Auto remains usable when wireless hardware is unavailable.
+- [x] Confirm wired Android Auto remains usable when wireless hardware is unavailable. True by construction, confirmed by code review rather than a real-hardware trial: `usb_kiosk`/`usb gtk-dev-ui`'s entire call chain has zero references to `discover_radios`, `wireless_bootstrap`, or any Bluetooth/radio code — the wired path is a fully separate code path with no dependency on wireless hardware being present, healthy, or even compiled in for a given board.
 - [ ] Complete 100 wireless reconnect cycles.
 - [ ] Complete a multi-hour wireless video/audio/touch/microphone soak.
 - [ ] Publish the initial tested USB radio compatibility list by chipset and USB ID.
@@ -164,6 +164,16 @@ Architecture and automated tests must remain portable throughout development, bu
 - [ ] Publish the Pi 5 phone, display, audio, microphone, and USB-radio compatibility matrix.
 - [ ] Publish a Pi 5 preview `.deb`, checksums, source, known limitations, and recovery steps.
 - [ ] Mark the Pi 5 implementation complete.
+
+## Extras and install-method delivery (after M8, before M9/M10)
+
+- [ ] Build the full-PiOS-image-with-desktop install method (speed-tweaked, keeps "return to desktop").
+- [ ] Build the full-PiOS-image-no-desktop install method (fastest boot, `labwc` stripped, no "return to desktop").
+- [ ] Restructure navigation so Android Auto is a menu entry, not the fixed backdrop (AA keeps running in the background regardless of which page is shown).
+- [ ] Implement the dashcam GPS/speed sensor overlay (`SensorType::Location`/`Speed` over the existing `SensorSourceService`).
+- [ ] Implement an accurate equalizer (`equalizer-10bands` in each audio pipeline; mic-based room correction is a stretch goal, not required).
+- [ ] Add Samsung DeX support, wired and wireless (optional/low-priority — generic HDMI-capture path shared with `RearCamera`/`ScreenMirroring` for wired; Miracast/WFD-or-proprietary research needed before any wireless implementation).
+- [ ] Rebuild all three install methods (package + both images) to include the extras above.
 
 ## M9 — Other supported devices (starts only after M8)
 

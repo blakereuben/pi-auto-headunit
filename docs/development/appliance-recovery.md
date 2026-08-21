@@ -124,6 +124,31 @@ every resize, which requires reaching into the video pipeline from a
 different thread than the one that owns it, exactly the class of bug
 that caused the thread-safety panic above; that part was deliberately
 not attempted without a way to verify it on real hardware first.
+**New lead, 2026-08-21 (reproduced, not fixed, not yet re-tested)**:
+Blake reported not having seen this hang since the white-screen fix
+session (`4d94f0b`) and agreed to a live retest, with the phone
+unplug/replug as his own physical step. `usb kiosk` hit the known
+reconnect-race (`docs/protocol/session-supervisor-reconnect-race.md`)
+repeatedly from a cold start — several consecutive failed cycles, not
+the usual "self-heals within one cycle" pattern — and produced a real
+black-screen hang requiring a physical reboot to recover, before the
+session ever reached a connected state (so this was not literally the
+"return to desktop" button being pressed). Candidate hypothesis, from
+reading `gtk_dev_ui.rs`, not yet tested: `usb kiosk`'s reconnect loop
+(`main.rs`'s `usb_kiosk`) builds a brand-new `gtk4::Application` and
+window from scratch every cycle, and ends a session with only
+`application.quit()` — nothing explicitly closes/destroys the window
+first, relying on Rust's Drop order once the function returns. Repeated
+rapid create/destroy cycles (every 2-4s, many in a row, far faster and
+more repetitive than any previously-tested long-lived-session scenario)
+could plausibly desync or exhaust the compositor if that teardown isn't
+fully synchronous. **Not attempted**: explicitly closing the window
+before quitting, or any other change — Blake's explicit instruction was
+not to try fixing this yet, since he can't be physically present to
+recover from another hang right now. Revisit only when he's physically
+at the machine and has explicitly agreed to accept the reboot risk
+again.
+
 **Consequently, `HeadUnitSettings::launch_on_boot` now defaults to
 `false`** (2026-08-19, deliberate operator decision, not an oversight):
 an unattended appliance that can silently hang on boot with no way to

@@ -1397,107 +1397,25 @@ fn usb_gtk_dev_ui(_: &str, _: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
-/// The well-known vendor ID `libusb` reports for a kernel root hub (not a
-/// real downstream peripheral) — excluded from AOA discovery below rather
-/// than probed like an ordinary device.
-#[cfg(target_os = "linux")]
-const LINUX_FOUNDATION_ROOT_HUB_VENDOR_ID: u16 = 0x1d6b;
-
-/// Finds one plausible phone to attempt an Android Auto session against,
-/// with no operator-supplied `--device` selector — the boot-time
-/// entry point (`usb kiosk`) has no human available to run `lsusb`
-/// first. Two passes: prefer a device already in AOA accessory mode
-/// (`transport_usb::is_accessory_id`, the common case right after a
-/// reconnect where the phone never fully re-enumerated back to its
-/// pre-accessory identity); otherwise, probe every other non-root-hub
-/// device with the documented AOA `GetProtocol` vendor request
-/// (`AoaBackend::query_protocol`). This is safe against arbitrary
-/// unrelated USB peripherals (the audio adapter, a hub) by design of the
-/// AOA spec itself: a device that doesn't implement this vendor request
-/// simply `STALL`s the control transfer, a fast, harmless, well-defined
-/// USB response, not a hang — this is the documented AOA discovery
-/// mechanism, not a heuristic. Returns `Ok(None)` (not an error) when no
-/// candidate is found, since "no phone plugged in yet" is the expected,
-/// unremarkable steady state for a head unit at boot.
-#[cfg(target_os = "linux")]
-fn find_candidate_device() -> Result<Option<transport_api::UsbDeviceId>, transport_api::AoaError> {
-    use transport_api::AoaBackend;
-
-    let mut backend = transport_usb::LibUsbAoaBackend::new()?;
-    let devices = backend.list_devices()?;
-    if let Some(device) = devices
-        .iter()
-        .find(|device| transport_usb::is_accessory_id(device.vendor_id, device.product_id))
-    {
-        return Ok(Some(device.clone()));
-    }
-    for device in &devices {
-        if device.vendor_id == LINUX_FOUNDATION_ROOT_HUB_VENDOR_ID {
-            continue;
-        }
-        if backend.query_protocol(device).is_ok() {
-            return Ok(Some(device.clone()));
-        }
-    }
-    Ok(None)
-}
-
 /// Entry point for `usb kiosk --allow-live-aap [--tls12-compat]` — the
 /// unattended, boot-time equivalent of `usb gtk-dev-ui`, with no
-/// operator-supplied `--device` and no fixed number of sessions.
-/// Installs the process's cancellation handler exactly once (`ctrlc`
-/// only allows one install per process — see
-/// `gtk_dev_ui::run_with_cancel`'s doc comment) and then loops: discover
-/// a candidate device (polling if none is plugged in yet), run one full
-/// GTK4 session against it via [`gtk_dev_ui::run_with_cancel`], and on
-/// that session ending for any reason (phone disconnected, a protocol
-/// error, the operator closed the window) — start over. A real operator
-/// `Ctrl-C`/`systemctl stop` (`SIGTERM`, which `ctrlc` also catches)
-/// breaks the loop cleanly at the next check point rather than being
-/// silently swallowed by the reconnect logic.
-///
-/// Deliberately simpler than `session_supervisor::run`'s reconnect model
-/// (which tracks a specific device by USB port topology across soft-
-/// reset/physical-replug escalation): this re-discovers fresh each
-/// cycle instead, the same discovery pass used for the very first
-/// session. A head unit only ever expects one phone connected at a
-/// time, so the practical difference is small; adopting
-/// `session_supervisor`'s more sophisticated tracking here is a
-/// reasonable future improvement, not a known correctness gap.
+/// operator-supplied `--device` and no fixed number of sessions. Installs
+/// the process's cancellation handler exactly once (`ctrlc` only allows
+/// one install per process) and hands off to
+/// [`gtk_dev_ui::run_kiosk`](crate::gtk_dev_ui::run_kiosk), which builds
+/// the fullscreen window once and keeps it alive for the whole process
+/// lifetime, reconnecting against it rather than rebuilding it — see that
+/// function's own doc comment for the real black-screen hang this fixes
+/// (2026-08-21). The device-discovery-then-run-one-session loop this
+/// function used to own directly now lives there instead, for the same
+/// reason.
 #[cfg(target_os = "linux")]
 fn usb_kiosk(tls12_compatibility: bool) -> Result<(), CliError> {
-    const DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-    const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-
     println!("probe_authorization=operator_confirmed");
     println!("probe_payload_logging=disabled");
     println!("probe_state=kiosk_started");
     let cancel = cancellation::install_ctrlc_handler()?;
-
-    while !cancel.is_set() {
-        let selector = loop {
-            if cancel.is_set() {
-                return Ok(());
-            }
-            match find_candidate_device() {
-                Ok(Some(device)) => break format!("{}:{}", device.bus, device.address),
-                Ok(None) => std::thread::sleep(DISCOVERY_POLL_INTERVAL),
-                Err(error) => {
-                    println!("probe_state=kiosk_discovery_failed error={error}");
-                    std::thread::sleep(DISCOVERY_POLL_INTERVAL);
-                }
-            }
-        };
-        println!("probe_state=kiosk_device_selected selector={selector}");
-        match gtk_dev_ui::run_with_cancel(&selector, tls12_compatibility, cancel.clone()) {
-            Ok(()) => println!("probe_state=kiosk_session_ended"),
-            Err(error) => println!("probe_state=kiosk_session_ended error={error}"),
-        }
-        if !cancel.is_set() {
-            std::thread::sleep(RECONNECT_DELAY);
-        }
-    }
-    Ok(())
+    gtk_dev_ui::run_kiosk(tls12_compatibility, &cancel)
 }
 
 #[cfg(not(target_os = "linux"))]

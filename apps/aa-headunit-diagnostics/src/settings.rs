@@ -61,6 +61,12 @@ pub const DEFAULT_DISPLAY_BRIGHTNESS_PERCENT: u8 = 100;
 /// control to fix it.
 pub const MIN_DISPLAY_BRIGHTNESS_PERCENT: u8 = 1;
 pub const MAX_DISPLAY_BRIGHTNESS_PERCENT: u8 = 100;
+/// `equalizer-10bands`' own documented per-band gain range in dB — not
+/// this project's choice, matched here so a saved value never gets
+/// clamped to something different than what the `GStreamer` element itself
+/// would accept.
+pub const MIN_EQ_BAND_GAIN_DB: f64 = -24.0;
+pub const MAX_EQ_BAND_GAIN_DB: f64 = 12.0;
 /// How long, after the four-finger arming swipe completes, a follow-up
 /// gesture has to arrive before the head unit silently disarms. Real-
 /// hardware feedback (2026-08-16): the operator asked for this to be
@@ -245,6 +251,17 @@ struct RawSettings {
     theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     launch_on_boot: Option<bool>,
+    /// `Vec<f64>` rather than `[f64; 10]` purely to sidestep any doubt
+    /// about this project's pinned `serde`/`toml` versions' fixed-size
+    /// array support — `HeadUnitSettings::eq_bands`/`set_eq_bands` are
+    /// the actual `[f64; 10]`-typed API; this field is a plain,
+    /// always-serializable transport shape between the two, validated to
+    /// exactly 10 entries on load (see `try_load`/`load`) and never
+    /// trusted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eq_bands: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    experimental_disclaimer_dismissed: Option<bool>,
 }
 
 /// `ProviderPreference` (`platform_api`) has no `Display`/serialization
@@ -318,7 +335,7 @@ impl RawSettings {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HeadUnitSettings {
     mappings: HashMap<GestureId, Action>,
     arm_window_seconds: u32,
@@ -332,7 +349,23 @@ pub struct HeadUnitSettings {
     bluetooth_preference: platform_api::ProviderPreference,
     theme: Option<String>,
     launch_on_boot: bool,
+    /// Gains in dB for `GStreamer`'s `equalizer-10bands` element's
+    /// `band0`..`band9` properties (ISO center frequencies, roughly
+    /// 29 Hz to 15 kHz). All-zero is flat/unmodified — the default, so a
+    /// fresh install sounds exactly like it did before this existed.
+    eq_bands: [f64; EQ_BAND_COUNT],
+    /// Whether the operator has already dismissed the dashcam/rear-camera
+    /// experimental-feature disclaimer with "don't show this again" —
+    /// `false` (the default) means it's shown again on every boot. See
+    /// `gtk_dev_ui.rs`'s `build_dashcam_disclaimer` doc comment for what
+    /// it actually says and why (`RISK_REGISTER.md` R-021).
+    experimental_disclaimer_dismissed: bool,
 }
+
+/// `equalizer-10bands`' own fixed band count (its name says so, and its
+/// `GStreamer` documentation confirms `band0..band9`) — not this project's
+/// choice, so not a `settings.rs`-local constant to second-guess later.
+pub const EQ_BAND_COUNT: usize = 10;
 
 impl HeadUnitSettings {
     /// Double-tap opens settings (the discoverable, always-safe default);
@@ -379,6 +412,8 @@ impl HeadUnitSettings {
             bluetooth_preference: platform_api::ProviderPreference::Auto,
             theme: None,
             launch_on_boot: false,
+            eq_bands: [0.0; EQ_BAND_COUNT],
+            experimental_disclaimer_dismissed: false,
         }
     }
 
@@ -463,6 +498,28 @@ impl HeadUnitSettings {
             MIN_DISPLAY_BRIGHTNESS_PERCENT,
             MAX_DISPLAY_BRIGHTNESS_PERCENT,
         );
+    }
+
+    /// Gains in dB for each of `equalizer-10bands`' 10 bands, applied at
+    /// the next audio pipeline build (`start_audio_playback_pipeline`,
+    /// `auth_discovery_probe.rs`) — like `audio_output_device` below,
+    /// this does not live-apply to an already-running session, matching
+    /// this project's existing precedent for audio-related settings.
+    #[must_use]
+    pub fn eq_bands(&self) -> [f64; EQ_BAND_COUNT] {
+        self.eq_bands
+    }
+
+    /// Clamped to [`MIN_EQ_BAND_GAIN_DB`]..=[`MAX_EQ_BAND_GAIN_DB`], matching
+    /// `equalizer-10bands`' own documented property range. `index` outside
+    /// `0..EQ_BAND_COUNT` is silently ignored rather than panicking — the
+    /// UI only ever calls this with a real slider's own fixed index, but a
+    /// hard panic here would be a disproportionate failure mode for what
+    /// is, worst case, a cosmetic settings-persistence no-op.
+    pub fn set_eq_band(&mut self, index: usize, gain_db: f64) {
+        if let Some(band) = self.eq_bands.get_mut(index) {
+            *band = gain_db.clamp(MIN_EQ_BAND_GAIN_DB, MAX_EQ_BAND_GAIN_DB);
+        }
     }
 
     /// `None` (the default) means the system default `PulseAudio` sink —
@@ -580,6 +637,15 @@ impl HeadUnitSettings {
         self.launch_on_boot = enabled;
     }
 
+    #[must_use]
+    pub fn experimental_disclaimer_dismissed(&self) -> bool {
+        self.experimental_disclaimer_dismissed
+    }
+
+    pub fn set_experimental_disclaimer_dismissed(&mut self, dismissed: bool) {
+        self.experimental_disclaimer_dismissed = dismissed;
+    }
+
     /// Loads from `path`; falls back to [`Self::defaults`] on any error
     /// (missing file, unreadable, malformed, or an unrecognized
     /// gesture/action key — forward/backward compatible with a future
@@ -632,6 +698,23 @@ impl HeadUnitSettings {
         if let Some(enabled) = raw.launch_on_boot {
             settings.set_launch_on_boot(enabled);
         }
+        if let Some(dismissed) = raw.experimental_disclaimer_dismissed {
+            settings.set_experimental_disclaimer_dismissed(dismissed);
+        }
+        // A wrong-length array (hand-edited file, or a future format
+        // change) is simply ignored rather than treated as corruption —
+        // matching this project's existing forward/backward-compat
+        // posture for settings (see `GestureSettings::load`'s doc
+        // comment) — so eq_bands quietly stays flat instead of the whole
+        // file failing to load.
+        if let Some(bands) = raw
+            .eq_bands
+            .and_then(|bands| <[f64; EQ_BAND_COUNT]>::try_from(bands).ok())
+        {
+            for (index, gain_db) in bands.into_iter().enumerate() {
+                settings.set_eq_band(index, gain_db);
+            }
+        }
         Some(settings)
     }
 
@@ -671,6 +754,7 @@ impl HeadUnitSettings {
         raw.suppress_phone_mtp_popups = Some(self.mtp_popup_suppression_enabled);
         raw.rotation_degrees = Some(rotation_to_degrees(self.rotation));
         raw.display_brightness_percent = Some(self.display_brightness_percent);
+        raw.eq_bands = Some(self.eq_bands.to_vec());
         raw.audio_output_device = self.audio_output_device.clone().or_else(|| {
             on_disk
                 .as_ref()
@@ -693,6 +777,7 @@ impl HeadUnitSettings {
             .clone()
             .or_else(|| on_disk.as_ref().and_then(|settings| settings.theme.clone()));
         raw.launch_on_boot = Some(self.launch_on_boot);
+        raw.experimental_disclaimer_dismissed = Some(self.experimental_disclaimer_dismissed);
         let text = toml::to_string_pretty(&raw)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         if let Some(parent) = path.parent() {
@@ -1118,6 +1203,27 @@ mod tests {
 
         let loaded = HeadUnitSettings::load(&path);
         assert!(loaded.launch_on_boot());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn experimental_disclaimer_dismissed_defaults_to_false_and_round_trips_true() {
+        let defaults = HeadUnitSettings::defaults();
+        assert!(!defaults.experimental_disclaimer_dismissed());
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-dashcam-disclaimer-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_experimental_disclaimer_dismissed(true);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert!(loaded.experimental_disclaimer_dismissed());
 
         let _ = fs::remove_dir_all(&dir);
     }

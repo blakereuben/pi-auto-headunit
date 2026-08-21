@@ -117,6 +117,66 @@ Deliverables:
 
 Exit gate: every required Pi 5 item in `MILESTONE_CHECKLIST.md` passes. Only after this gate may physical work begin on other supported boards.
 
+## Extras and install-method delivery (after M8, before M9/M10)
+
+Starts only once M8's Pi 5 completion gate passes (wired and wireless
+Android Auto both fully working). Runs before any cross-board (M9) or
+1.0 (M10) work, since none of it needs more than one board. Sequence,
+agreed 2026-08-21:
+
+1. **Build the install methods (first pass).** The `.deb` package
+   already exists (M5). Add the two new image variants: a full PiOS
+   image with desktop (same app, tweaked for boot speed, keeps "return
+   to desktop"), and a full PiOS image with no desktop at all (fastest
+   boot; reuses `labwc` with LightDM and the desktop chrome stripped out
+   rather than a new compositor; "return to desktop" is unavailable
+   since there is nothing to return to). Both images are built by a
+   one-off script that customizes an officially published PiOS base
+   image (mount, chroot, install the project's own `.deb`, apply a
+   couple of config drops) rather than a `pi-gen` build — rerun by hand
+   against a new PiOS release, expected every few years, not months.
+2. **Implement extras** — features layered on top of a fully working AA
+   session, not required for AA itself to work:
+   - Restructure navigation so Android Auto is one entry in the existing
+     settings menu (alongside Gestures/Display/Themes/Equalizer/etc.)
+     rather than the fixed backdrop everything else sits on top of. The
+     live AA video/audio keeps running in the background regardless of
+     which page is showing — this is a navigation change, not a
+     rendering change. Needed before/alongside the install-method work
+     above so all three install methods ship the same structure.
+   - Dashcam GPS/speed overlay: request `SENSOR_LOCATION`/`SENSOR_SPEED`
+     from the phone over the existing `SensorSourceService` (already
+     partially implemented for night-mode/driving-status), and render
+     them as an overlay on dashcam recordings.
+   - Accurate equalizer: GStreamer's own `equalizer-10bands` element
+     inserted into each of the three audio pipelines
+     (`crates/media-gstreamer/src/audio.rs`), adjustable live via the
+     same set-property-on-a-named-element pattern already used for the
+     video sink. Stretch goal, not required for a first pass: use the
+     project's existing microphone capture to play a calibration
+     sweep/pink noise and compute a real measured room-correction curve
+     instead of a flat starting point.
+   - Samsung DeX (wired and wireless) — genuinely optional, "cool to
+     include" rather than a real priority. Wired DeX cannot use either
+     of the Pi's onboard HDMI ports (both are output-only; receiving
+     video needs a capture chain: phone's DisplayPort-Alt-Mode over
+     USB-C → a USB-C-to-HDMI adapter → a USB HDMI-capture device →
+     the Pi). That capture capability is the same underlying feature as
+     the existing empty `RearCamera`/`ScreenMirroring` stub pages and
+     should be built once, generically, not DeX-specific. Wireless DeX
+     needs the same research-before-code step as wireless AA (confirm
+     whether it negotiates as standard Miracast/WFD or a proprietary
+     Samsung layer) before any implementation is attempted. Selecting
+     DeX tears down any active AA session first — not a Pi-side
+     limitation, a real phone can't be in AA accessory mode and DeX
+     desktop mode at the same time.
+3. **Rebuild the install methods (second pass)** so the published
+   package and both images include every extra from step 2, not just
+   the core AA functionality from step 1.
+
+Exit gate: all three install artifacts are published on GitHub and each
+includes every extra implemented in step 2.
+
 ## M9 — Pi 4, CM4, and CM5 validation
 
 Deliverables:

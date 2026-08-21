@@ -75,10 +75,24 @@ impl AudioPlaybackPipeline {
     /// an invalid name simply fails at `start()` like any other
     /// unreachable sink (`AudioPlaybackState`'s existing "never aborts
     /// the probe" discipline already covers that).
+    /// `eq_bands`, when given, are per-band gains in dB
+    /// (`equalizer-10bands`' own `band0..band9` properties — see
+    /// `crate::settings::EQ_BAND_COUNT`'s doc comment for why the count
+    /// itself isn't this project's choice) applied once, right after
+    /// construction — this project's existing precedent for
+    /// audio-related settings (`audio_output_device`, same as this
+    /// function's own `device` parameter) is "picked up at the next
+    /// pipeline build," not live-applied mid-session, so a fixed
+    /// snapshot here is deliberate, not a shortcut. `None`/an
+    /// all-flat/empty slice is a no-op — `equalizer-10bands` itself
+    /// already defaults every band to `0.0` (unmodified) — so this
+    /// argument costs nothing for the (currently only) `Fake`-sink test
+    /// callers that pass `None`.
     pub(crate) fn new(
         format: AudioFormat,
         sink: AudioSink,
         device: Option<&str>,
+        eq_bands: Option<&[f64]>,
     ) -> Result<Self, GstreamerError> {
         let sink_element = match sink {
             AudioSink::Pulse => "pulsesink",
@@ -91,7 +105,8 @@ impl AudioPlaybackPipeline {
         let description = format!(
             "appsrc name=src is-live=true format=time \
              caps=\"audio/x-raw,format=S16LE,rate={},channels={},layout=interleaved\" \
-             ! audioconvert ! audioresample ! {sink_element}{device_property} sync=false",
+             ! audioconvert ! equalizer-10bands name=eq ! audioconvert ! audioresample \
+             ! {sink_element}{device_property} sync=false",
             format.sampling_rate, format.channels,
         );
         let element = gst::parse::launch(&description)
@@ -112,6 +127,13 @@ impl AudioPlaybackPipeline {
             .map_err(|_| {
                 GstreamerError::PipelineConstruction("\"src\" was not an AppSrc".into())
             })?;
+        if let Some(bands) = eq_bands {
+            if let Some(equalizer) = pipeline.by_name("eq") {
+                for (index, gain_db) in bands.iter().enumerate() {
+                    equalizer.set_property(&format!("band{index}"), gain_db);
+                }
+            }
+        }
         Ok(Self { pipeline, appsrc })
     }
 
@@ -242,11 +264,34 @@ mod tests {
         let backend = GstreamerBackend::new().expect("gstreamer available on this host");
         let format = media_audio_format();
         let pipeline = backend
-            .build_audio_playback_pipeline(format, AudioSink::Fake, None)
+            .build_audio_playback_pipeline(format, AudioSink::Fake, None, None)
             .expect("pipeline builds");
         pipeline.start().expect("pipeline starts");
 
         let frames = synthetic_pcm_frames(format, 10);
+        for (index, frame) in frames.iter().enumerate() {
+            pipeline
+                .push_frame(frame, (index as u64) * 10_000)
+                .expect("frame pushes");
+            assert!(pipeline.poll_bus_error().is_none(), "no pipeline errors");
+        }
+        pipeline.shutdown().expect("clean EOS shutdown");
+    }
+
+    /// Proves `eq_bands` actually reaches the real `equalizer-10bands`
+    /// element (not just that the parameter compiles) — non-flat gains,
+    /// real PCM pushed through it end to end, no pipeline error.
+    #[test]
+    fn applies_non_flat_eq_bands_without_pipeline_error() {
+        let backend = GstreamerBackend::new().expect("gstreamer available on this host");
+        let format = media_audio_format();
+        let bands = [6.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -6.0, 9.0];
+        let pipeline = backend
+            .build_audio_playback_pipeline(format, AudioSink::Fake, None, Some(&bands))
+            .expect("pipeline builds");
+        pipeline.start().expect("pipeline starts");
+
+        let frames = synthetic_pcm_frames(format, 5);
         for (index, frame) in frames.iter().enumerate() {
             pipeline
                 .push_frame(frame, (index as u64) * 10_000)

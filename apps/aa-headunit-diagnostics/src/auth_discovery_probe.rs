@@ -3455,10 +3455,12 @@ fn start_audio_playback_pipeline(
     let settings = crate::settings::HeadUnitSettings::load(std::path::Path::new(
         crate::settings::DEFAULT_SETTINGS_PATH,
     ));
+    let eq_bands = settings.eq_bands();
     match backend.build_audio_playback_pipeline(
         format,
         AudioSink::Pulse,
         settings.audio_output_device(),
+        Some(&eq_bands),
     ) {
         Ok(pipeline) => match pipeline.start() {
             Ok(()) => {
