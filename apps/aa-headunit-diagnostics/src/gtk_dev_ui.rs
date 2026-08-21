@@ -308,6 +308,44 @@ fn install_default_video_background_css() {
     );
 }
 
+/// M6 accessibility/touch-target review, 2026-08-21: every `Button`/
+/// `CheckButton` in this file (settings navigation, action picker, theme
+/// picker, gesture remap) relied entirely on the stock Adwaita theme's own
+/// padding for its tap area — no minimum size was ever set anywhere. On
+/// the 800x480 physical panel this project targets (`ARCHITECTURE.md`'s
+/// display profile), that padding-only sizing is well under the ~44-48px
+/// touch-target minimum widely used for touchscreens (WCAG 2.5.5,
+/// Material Design), and this is a head unit meant to be used while
+/// driving, not a mouse-driven desktop app. Fixed at the CSS-node-name
+/// level (`button`, `checkbutton`) rather than per-callsite so every
+/// current and future button/check button in this file is covered
+/// automatically, including the ones built in a loop (`build_themes_page`,
+/// `build_action_picker`) where a per-callsite class is easy to forget.
+/// `spinbutton`'s own internal up/down steppers are plain `button` nodes
+/// too (GTK4's own `GtkSpinButton` implementation) and would otherwise
+/// balloon to the same 56px alongside a single-line numeric entry, which
+/// looks broken rather than accessible — reset back to intrinsic sizing
+/// with a more specific `spinbutton button` rule immediately after, which
+/// wins the cascade over the general rule regardless of add-order (CSS
+/// specificity, not `STYLE_PROVIDER_PRIORITY_APPLICATION`'s add-order tie
+/// break, decides between two rules at the same priority once one
+/// selector is more specific than the other).
+fn install_minimum_touch_target_css() {
+    let Some(display) = gtk4::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_data(
+        "button, checkbutton { min-height: 56px; min-width: 56px; } \
+         spinbutton button { min-height: 0; min-width: 0; }",
+    );
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 /// Directory an operator drops custom GTK4 CSS theme files into — one
 /// `.css` file per theme, discovered and offered on the Themes settings
 /// page (`build_themes_page`). Same parent as `DEFAULT_SETTINGS_PATH`
@@ -404,6 +442,7 @@ fn activate_window(
 
     install_flipped_panel_css();
     install_default_video_background_css();
+    install_minimum_touch_target_css();
     let picture = Picture::new();
     picture.add_css_class("video-picture");
     let overlay = Overlay::new();

@@ -166,11 +166,18 @@ with:
 grep -i autologin-user /etc/lightdm/lightdm.conf
 ```
 
-Reboot to actually exercise the new autostart file — not yet done as of
-this writing. If it doesn't reach the fullscreen app as expected, log in
-normally (SSH or the greeter) and check `~/.config/labwc/autostart` was
-written as expected and that `aa-headunit-diagnostics preflight`
-succeeds when run by hand.
+**Real reboot confirmed, 2026-08-20**: with `launch_on_boot` temporarily
+enabled for the boot-to-ready measurement (see `MILESTONE_CHECKLIST.md`
+M5), a full reboot picked up the autostart file cleanly and reached the
+fullscreen app in well under 10 seconds, no manual step, no hang — the
+autostart/preflight/launch chain itself is real-hardware-proven working
+end to end. `launch_on_boot` was set back to `false` afterward and stays
+off by default (see above — the separate "return to desktop" compositor
+hang is still unresolved and unrelated to this launch path). If a future
+boot doesn't reach the fullscreen app as expected, log in normally (SSH
+or the greeter) and check `~/.config/labwc/autostart` was written as
+expected and that `aa-headunit-diagnostics preflight` succeeds when run
+by hand.
 
 ## Investigating a crash after the fact
 
