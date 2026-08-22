@@ -276,6 +276,18 @@ struct RawSettings {
     /// trusted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     eq_bands: Option<Vec<f64>>,
+    /// `EQ_PRESET_COUNT` slots, each a 10-entry `Vec<f64>` — same
+    /// plain-`Vec` transport shape as `eq_bands` and for the same reason
+    /// (see that field's doc comment); validated to exactly
+    /// `EQ_PRESET_COUNT` outer entries of exactly `EQ_BAND_COUNT` inner
+    /// entries on load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eq_presets: Option<Vec<Vec<f64>>>,
+    /// `EQ_PRESET_COUNT` display names, in the same slot order as
+    /// `eq_presets`; validated to exactly `EQ_PRESET_COUNT` entries on
+    /// load, same posture as `eq_presets` itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eq_preset_names: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     experimental_disclaimer_dismissed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -378,6 +390,14 @@ pub struct HeadUnitSettings {
     /// 29 Hz to 15 kHz). All-zero is flat/unmodified — the default, so a
     /// fresh install sounds exactly like it did before this existed.
     eq_bands: [f64; EQ_BAND_COUNT],
+    /// `EQ_PRESET_COUNT` saveable/recallable equalizer snapshots,
+    /// independent of the live `eq_bands` above — see
+    /// [`Self::eq_preset`]/[`Self::set_eq_preset`]'s doc comments.
+    eq_presets: [[f64; EQ_BAND_COUNT]; EQ_PRESET_COUNT],
+    /// Display name for each `eq_presets` slot (2026-08-22, Blake's
+    /// request: a renamable preset editor) — defaults to `"Preset 1"`..
+    /// `"Preset 4"`. See [`Self::eq_preset_name`]/[`Self::set_eq_preset_name`].
+    eq_preset_names: [String; EQ_PRESET_COUNT],
     /// Whether the operator has already agreed to the head-unit-wide
     /// experimental-software disclaimer — either via the boot popup's
     /// "don't show this again" checkbox, or the Legal settings page's
@@ -403,6 +423,21 @@ pub struct HeadUnitSettings {
 /// `GStreamer` documentation confirms `band0..band9`) — not this project's
 /// choice, so not a `settings.rs`-local constant to second-guess later.
 pub const EQ_BAND_COUNT: usize = 10;
+
+/// Number of saveable equalizer presets (extras roadmap, 2026-08-22:
+/// Blake asked for a fixed set of slots he can dial in and recall, rather
+/// than only ever having the one live `eq_bands` snapshot). A fixed count
+/// rather than an open-ended list, matching this project's existing
+/// "small, closed set" precedent (see e.g. `Action`'s own doc comment) —
+/// four is enough to be useful without needing a scrollable list on an
+/// 800x480 panel.
+pub const EQ_PRESET_COUNT: usize = 4;
+
+/// A preset name longer than this is truncated on save — the button that
+/// shows it sits in a narrow column next to the full-length band sliders
+/// (`gtk_dev_ui.rs`'s equalizer page), so an unbounded name would either
+/// overflow or force that column wider than the sliders can spare.
+pub const MAX_EQ_PRESET_NAME_CHARS: usize = 20;
 
 impl HeadUnitSettings {
     /// Double-tap opens settings (the discoverable, always-safe default);
@@ -453,6 +488,8 @@ impl HeadUnitSettings {
             theme: None,
             launch_on_boot: false,
             eq_bands: [0.0; EQ_BAND_COUNT],
+            eq_presets: [[0.0; EQ_BAND_COUNT]; EQ_PRESET_COUNT],
+            eq_preset_names: std::array::from_fn(|index| format!("Preset {}", index + 1)),
             experimental_disclaimer_dismissed: false,
             legal_page_hidden: false,
             volume_percent: DEFAULT_VOLUME_PERCENT,
@@ -561,6 +598,61 @@ impl HeadUnitSettings {
     pub fn set_eq_band(&mut self, index: usize, gain_db: f64) {
         if let Some(band) = self.eq_bands.get_mut(index) {
             *band = gain_db.clamp(MIN_EQ_BAND_GAIN_DB, MAX_EQ_BAND_GAIN_DB);
+        }
+    }
+
+    /// One saved equalizer snapshot, `index` in `0..EQ_PRESET_COUNT`. All
+    /// four presets default to flat (all-zero) — this project has no
+    /// basis for guessing at "good" EQ curves nobody asked for, so every
+    /// slot starts as a blank the operator dials in and saves themselves
+    /// (see [`Self::set_eq_preset`]). `index` outside range returns flat
+    /// rather than panicking, matching [`Self::set_eq_band`]'s own
+    /// out-of-range handling.
+    #[must_use]
+    pub fn eq_preset(&self, index: usize) -> [f64; EQ_BAND_COUNT] {
+        self.eq_presets
+            .get(index)
+            .copied()
+            .unwrap_or([0.0; EQ_BAND_COUNT])
+    }
+
+    /// Overwrites preset `index` with `gains`, clamped per-band to the
+    /// same [`MIN_EQ_BAND_GAIN_DB`]..=[`MAX_EQ_BAND_GAIN_DB`] range as
+    /// [`Self::set_eq_band`]. `index` outside `0..EQ_PRESET_COUNT` is
+    /// silently ignored, matching [`Self::set_eq_band`]'s reasoning: the
+    /// UI only ever calls this with one of the four fixed preset slots.
+    pub fn set_eq_preset(&mut self, index: usize, gains: [f64; EQ_BAND_COUNT]) {
+        if let Some(preset) = self.eq_presets.get_mut(index) {
+            for (slot, gain_db) in preset.iter_mut().zip(gains) {
+                *slot = gain_db.clamp(MIN_EQ_BAND_GAIN_DB, MAX_EQ_BAND_GAIN_DB);
+            }
+        }
+    }
+
+    /// Display name for preset `index`, `index` in `0..EQ_PRESET_COUNT`.
+    /// Out-of-range returns `"Preset"` rather than panicking, matching
+    /// [`Self::eq_preset`]'s own out-of-range handling.
+    #[must_use]
+    pub fn eq_preset_name(&self, index: usize) -> &str {
+        self.eq_preset_names
+            .get(index)
+            .map_or("Preset", String::as_str)
+    }
+
+    /// Renames preset `index`. Truncated to [`MAX_EQ_PRESET_NAME_CHARS`]
+    /// and trimmed of leading/trailing whitespace; a blank result (empty
+    /// input, or input that's only whitespace) resets to that slot's
+    /// default `"Preset N"` name rather than leaving an empty button
+    /// label. `index` outside `0..EQ_PRESET_COUNT` is silently ignored,
+    /// matching [`Self::set_eq_preset`]'s own out-of-range handling.
+    pub fn set_eq_preset_name(&mut self, index: usize, name: &str) {
+        if let Some(slot) = self.eq_preset_names.get_mut(index) {
+            let trimmed = name.trim();
+            *slot = if trimmed.is_empty() {
+                format!("Preset {}", index + 1)
+            } else {
+                trimmed.chars().take(MAX_EQ_PRESET_NAME_CHARS).collect()
+            };
         }
     }
 
@@ -791,6 +883,28 @@ impl HeadUnitSettings {
                 settings.set_eq_band(index, gain_db);
             }
         }
+        // Same wrong-shape-is-ignored posture as eq_bands above, applied
+        // one level deeper: a wrong outer length leaves every preset at
+        // its flat default; a right outer length with one malformed
+        // inner entry leaves just that one preset flat, loading the rest
+        // normally.
+        if let Some(presets) = raw.eq_presets {
+            if let Ok(presets) = <[Vec<f64>; EQ_PRESET_COUNT]>::try_from(presets) {
+                for (index, bands) in presets.into_iter().enumerate() {
+                    if let Ok(bands) = <[f64; EQ_BAND_COUNT]>::try_from(bands) {
+                        settings.set_eq_preset(index, bands);
+                    }
+                }
+            }
+        }
+        if let Some(names) = raw
+            .eq_preset_names
+            .and_then(|names| <[String; EQ_PRESET_COUNT]>::try_from(names).ok())
+        {
+            for (index, name) in names.into_iter().enumerate() {
+                settings.set_eq_preset_name(index, &name);
+            }
+        }
         Some(settings)
     }
 
@@ -831,6 +945,8 @@ impl HeadUnitSettings {
         raw.rotation_degrees = Some(rotation_to_degrees(self.rotation));
         raw.display_brightness_percent = Some(self.display_brightness_percent);
         raw.eq_bands = Some(self.eq_bands.to_vec());
+        raw.eq_presets = Some(self.eq_presets.iter().map(|bands| bands.to_vec()).collect());
+        raw.eq_preset_names = Some(self.eq_preset_names.to_vec());
         raw.audio_output_device = self.audio_output_device.clone().or_else(|| {
             on_disk
                 .as_ref()
@@ -1363,6 +1479,101 @@ mod tests {
 
         let loaded = HeadUnitSettings::load(&path);
         assert_eq!(loaded.volume_percent(), 42);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eq_presets_default_flat_clamp_and_are_independent_of_each_other() {
+        let defaults = HeadUnitSettings::defaults();
+        for index in 0..EQ_PRESET_COUNT {
+            assert_eq!(defaults.eq_preset(index), [0.0; EQ_BAND_COUNT]);
+        }
+
+        let mut settings = HeadUnitSettings::defaults();
+        let mut loud = [0.0; EQ_BAND_COUNT];
+        loud[0] = 999.0;
+        loud[1] = -999.0;
+        settings.set_eq_preset(0, loud);
+        let clamped = settings.eq_preset(0);
+        assert_eq!(clamped[0], MAX_EQ_BAND_GAIN_DB);
+        assert_eq!(clamped[1], MIN_EQ_BAND_GAIN_DB);
+
+        // Untouched slots stay flat — presets don't bleed into each other.
+        assert_eq!(settings.eq_preset(1), [0.0; EQ_BAND_COUNT]);
+
+        // Out-of-range index is a harmless no-op/flat-read, matching
+        // set_eq_band/eq_bands's own out-of-range handling.
+        settings.set_eq_preset(EQ_PRESET_COUNT, [5.0; EQ_BAND_COUNT]);
+        assert_eq!(settings.eq_preset(EQ_PRESET_COUNT), [0.0; EQ_BAND_COUNT]);
+    }
+
+    #[test]
+    fn eq_presets_round_trip_through_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-eq-presets-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        let mut bass_boost = [0.0; EQ_BAND_COUNT];
+        bass_boost[0] = 6.0;
+        bass_boost[1] = 4.0;
+        settings.set_eq_preset(0, bass_boost);
+        let mut treble_boost = [0.0; EQ_BAND_COUNT];
+        treble_boost[8] = 5.0;
+        treble_boost[9] = 5.0;
+        settings.set_eq_preset(3, treble_boost);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.eq_preset(0), bass_boost);
+        assert_eq!(loaded.eq_preset(1), [0.0; EQ_BAND_COUNT]);
+        assert_eq!(loaded.eq_preset(2), [0.0; EQ_BAND_COUNT]);
+        assert_eq!(loaded.eq_preset(3), treble_boost);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eq_preset_names_default_trim_truncate_blank_reset_and_round_trip() {
+        let defaults = HeadUnitSettings::defaults();
+        assert_eq!(defaults.eq_preset_name(0), "Preset 1");
+        assert_eq!(defaults.eq_preset_name(3), "Preset 4");
+        // Out-of-range is a harmless flat read, matching eq_preset's own
+        // out-of-range handling.
+        assert_eq!(defaults.eq_preset_name(EQ_PRESET_COUNT), "Preset");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_eq_preset_name(0, "  Bass Boost  ");
+        assert_eq!(settings.eq_preset_name(0), "Bass Boost");
+
+        settings.set_eq_preset_name(1, "This name is absolutely way too long for a button");
+        assert_eq!(
+            settings.eq_preset_name(1).chars().count(),
+            MAX_EQ_PRESET_NAME_CHARS
+        );
+
+        // Blank (or whitespace-only) input resets to that slot's own
+        // default name, not an empty button label.
+        settings.set_eq_preset_name(0, "   ");
+        assert_eq!(settings.eq_preset_name(0), "Preset 1");
+
+        // Out-of-range index is a no-op.
+        settings.set_eq_preset_name(EQ_PRESET_COUNT, "ignored");
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-eq-preset-names-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+        settings.set_eq_preset_name(2, "Road Trip");
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.eq_preset_name(0), "Preset 1");
+        assert_eq!(loaded.eq_preset_name(2), "Road Trip");
 
         let _ = fs::remove_dir_all(&dir);
     }

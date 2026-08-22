@@ -1413,7 +1413,10 @@ fn usb_gtk_dev_ui(_: &str, _: bool) -> Result<(), CliError> {
 fn usb_kiosk(tls12_compatibility: bool) -> Result<(), CliError> {
     println!("probe_authorization=operator_confirmed");
     println!("probe_payload_logging=disabled");
-    println!("probe_state=kiosk_started");
+    println!(
+        "probe_state=kiosk_started elapsed_ms={}",
+        auth_discovery_probe::elapsed_ms_since_process_start()
+    );
     let cancel = cancellation::install_ctrlc_handler()?;
     gtk_dev_ui::run_kiosk(tls12_compatibility, &cancel)
 }

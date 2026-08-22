@@ -48,12 +48,12 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DropDown, Grid, Label,
-    Orientation, Overlay, Picture, PolicyType, Scale, ScrolledWindow, SpinButton, glib,
+    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DropDown, Entry, Grid,
+    Label, Orientation, Overlay, Picture, PolicyType, Scale, ScrolledWindow, SpinButton, glib,
 };
 use media_api::DecoderCapability;
 use media_gstreamer::{
@@ -980,10 +980,13 @@ fn find_kiosk_candidate_device()
 /// Best-effort software USB port reset
 /// (`transport_usb::LibUsbAoaBackend::soft_reset`, real-hardware-confirmed
 /// effective elsewhere in this project — `session_supervisor.rs`'s own
-/// `resolve_device`) on `device` — called only for the very first
-/// connection attempt of a freshly (re)started `usb kiosk` process, never
-/// on an ordinary reconnect within an already-running process's own loop
-/// (`discover_and_run_kiosk_session`'s `reset_before_attempt` parameter).
+/// `resolve_device`) on `device` — called only immediately before the
+/// *second* connection attempt of a freshly (re)started `usb kiosk`
+/// process, and only when the first attempt actually failed (see
+/// [`end_kiosk_attempt`]'s `reset_next_attempt` computation); never
+/// before that unconditionally-clean first attempt itself, and never on
+/// any ordinary reconnect thereafter.
+///
 /// Real-hardware finding, 2026-08-22: closing the app window and
 /// relaunching left the phone in its prior session's protocol state
 /// (still expecting encrypted post-handshake traffic), which made the
@@ -995,13 +998,39 @@ fn find_kiosk_candidate_device()
 /// delay, and indistinguishable from a genuine hang to an operator
 /// watching a black screen. A software reset here forces the same kind of
 /// fresh USB re-enumeration a physical unplug/replug already reliably
-/// fixes, without needing one. Failure is logged, not propagated —
-/// `discover_and_run_kiosk_session`'s own retry loop already covers a
-/// reset that didn't help.
+/// fixes, without needing one.
+///
+/// **Second real-hardware finding, same day, that moved this from
+/// "before the first attempt" to "only after it fails"**: resetting
+/// unconditionally before every fresh process's first attempt — even a
+/// perfectly healthy one, e.g. a normal launch with the phone already
+/// enumerated and working — was observed to *cause* the exact same
+/// symptom it was meant to fix: repeated `USB error: Pipe error` on
+/// `preparing_accessory_transport` for roughly ten retry cycles (~20s)
+/// before the device settled, sometimes on a different `bus:address`
+/// than the one just reset. A device that's actually fine doesn't need
+/// forcing through a fresh re-enumeration, and doing so anyway visibly
+/// cost more than it saved. Failure here is logged, not propagated — the
+/// ordinary reconnect loop already covers a reset that didn't help.
+///
+/// **Third real-hardware finding, same day**: "only after it fails" still
+/// meant every close/reopen burned a real ~10s USB transfer timeout on a
+/// doomed first attempt before this function ever got a chance, since a
+/// freshly started process has no way to tell a stale device from a
+/// healthy one just by looking at it. `auth_discovery_probe::mark_kiosk_session_live`/
+/// `consume_stale_kiosk_marker` closes that gap with a tiny persisted
+/// marker: `run_kiosk`'s very first attempt now resets *before* trying
+/// whenever that marker says the previous process never confirmed a
+/// clean end (so the phone is very likely still stale) — same effect as
+/// this function's `Reenumerated`/`Completed` reset, just triggered
+/// pre-emptively instead of reactively for that one specific case.
 fn reset_stale_kiosk_device(device: &transport_api::UsbDeviceId) {
     match transport_usb::LibUsbAoaBackend::new() {
         Ok(backend) => match backend.soft_reset(device) {
-            Ok(outcome) => println!("probe_state=kiosk_startup_soft_reset outcome={outcome:?}"),
+            Ok(outcome) => println!(
+                "probe_state=kiosk_startup_soft_reset outcome={outcome:?} elapsed_ms={}",
+                crate::auth_discovery_probe::elapsed_ms_since_process_start()
+            ),
             Err(error) => println!("probe_state=kiosk_startup_soft_reset_failed error={error}"),
         },
         Err(error) => {
@@ -1038,14 +1067,16 @@ fn discover_kiosk_candidate(cancel: &CancellationFlag) -> Option<transport_api::
 /// `run_session` — moved here so the whole reconnect loop lives on one
 /// background thread per attempt instead of a synchronous loop in
 /// `main.rs` that used to rebuild the GTK window every cycle.
-/// `reset_before_attempt` gates [`reset_stale_kiosk_device`] — `true` only
-/// for the first attempt of a freshly (re)started process (see
-/// [`start_kiosk_session`]'s `is_first_attempt`), `false` for every
-/// ordinary reconnect thereafter, which needs no reset since it isn't
-/// recovering from an operator-driven restart. When it does reset,
-/// re-discovers the device afterward rather than reusing the pre-reset
-/// `bus:address` — a reset that re-enumerates the device changes its
-/// address, and dialing the stale one would just fail again.
+/// `reset_before_attempt` gates [`reset_stale_kiosk_device`] — `true`
+/// only for the attempt immediately following a *failed* first attempt
+/// of a freshly (re)started process (see [`end_kiosk_attempt`]'s
+/// `reset_next_attempt`), `false` for the first attempt itself and for
+/// every ordinary reconnect thereafter — see [`reset_stale_kiosk_device`]'s
+/// own doc comment for why resetting unconditionally up front was tried
+/// and reverted. When it does reset, re-discovers the device afterward
+/// rather than reusing the pre-reset `bus:address` — a reset that
+/// re-enumerates the device changes its address, and dialing the stale
+/// one would just fail again.
 fn discover_and_run_kiosk_session(
     tls12_compatibility: bool,
     handoff: Gtk4WindowHandoff,
@@ -1064,7 +1095,10 @@ fn discover_and_run_kiosk_session(
         device = post_reset_device;
     }
     let selector = format!("{}:{}", device.bus, device.address);
-    println!("probe_state=kiosk_device_selected selector={selector}");
+    println!(
+        "probe_state=kiosk_device_selected selector={selector} elapsed_ms={}",
+        crate::auth_discovery_probe::elapsed_ms_since_process_start()
+    );
     run_session(
         &selector,
         tls12_compatibility,
@@ -1087,6 +1121,8 @@ fn install_kiosk_hang_safety_net(
     cancel: CancellationFlag,
     final_result: Rc<RefCell<Option<Result<(), CliError>>>>,
     attempt_ended: Rc<Cell<bool>>,
+    is_first_attempt: bool,
+    reset_before_attempt: bool,
 ) -> Rc<RefCell<Option<glib::SourceId>>> {
     let safety_net_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let safety_net_id_for_install = Rc::clone(&safety_net_id);
@@ -1102,6 +1138,8 @@ fn install_kiosk_hang_safety_net(
                 Rc::clone(&final_result),
                 &attempt_ended,
                 &safety_net_id_for_end,
+                is_first_attempt,
+                reset_before_attempt,
                 Err(CliError::Protocol(
                     "kiosk session attempt hit the hang safety net with no result".into(),
                 )),
@@ -1126,7 +1164,31 @@ fn install_kiosk_hang_safety_net(
 /// [`KIOSK_RECONNECT_DELAY_SECONDS`] via [`start_kiosk_session`] — the
 /// core of what this whole redesign is for: reconnecting never rebuilds
 /// the window.
-#[allow(clippy::too_many_arguments)]
+///
+/// `is_first_attempt` (true only when the attempt that just ended was
+/// itself the process's very first) drives `reset_next_attempt`: the
+/// *next* attempt resets the device first only if this one was both the
+/// first attempt and a failure — see [`reset_stale_kiosk_device`]'s doc
+/// comment for why that's deliberately narrower than "reset before every
+/// fresh process's first attempt," which is what this project tried
+/// first and reverted the same day.
+///
+/// `reset_before_attempt` (whether *this* ending attempt already reset
+/// the device up front, via `auth_discovery_probe::consume_stale_kiosk_marker`)
+/// is checked too, added 2026-08-22 after a real-hardware regression: the
+/// marker-driven pre-emptive reset and this function's own
+/// reset-after-first-failure logic didn't know about each other, so a
+/// first attempt that reset via the marker and *still* failed (a device
+/// briefly unsettled right after its own reset — `USB error: Entity not
+/// found`, already an expected transient per `reset_stale_kiosk_device`'s
+/// own doc comment) got reset *again* for attempt two, needlessly. A
+/// device only gets one reset per process-restart cycle now: if this
+/// attempt already reset, `reset_next_attempt` stays `false` regardless
+/// of `is_first_attempt`, and the ordinary no-reset retry loop handles
+/// it from there — exactly like today's `reset_stale_kiosk_device`
+/// already assumes a *fresh* attempt without one, not a second reset
+/// hot on the heels of the first.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn end_kiosk_attempt(
     window: Rc<KioskWindow>,
     tls12_compatibility: bool,
@@ -1135,6 +1197,8 @@ fn end_kiosk_attempt(
     final_result: Rc<RefCell<Option<Result<(), CliError>>>>,
     attempt_ended: &Rc<Cell<bool>>,
     safety_net_id: &Rc<RefCell<Option<glib::SourceId>>>,
+    is_first_attempt: bool,
+    reset_before_attempt: bool,
     result: Result<(), CliError>,
 ) {
     if attempt_ended.replace(true) {
@@ -1143,10 +1207,14 @@ fn end_kiosk_attempt(
     if let Some(id) = safety_net_id.borrow_mut().take() {
         id.remove();
     }
+    let ended_at_ms = crate::auth_discovery_probe::elapsed_ms_since_process_start();
     match &result {
-        Ok(()) => println!("probe_state=kiosk_session_ended"),
-        Err(error) => println!("probe_state=kiosk_session_ended error={error}"),
+        Ok(()) => println!("probe_state=kiosk_session_ended elapsed_ms={ended_at_ms}"),
+        Err(error) => {
+            println!("probe_state=kiosk_session_ended error={error} elapsed_ms={ended_at_ms}");
+        }
     }
+    let reset_next_attempt = is_first_attempt && !reset_before_attempt && result.is_err();
 
     window
         .picture
@@ -1169,6 +1237,7 @@ fn end_kiosk_attempt(
             &cancel,
             &final_result,
             false,
+            reset_next_attempt,
         );
         glib::ControlFlow::Break
     });
@@ -1225,9 +1294,14 @@ fn wire_kiosk_handle_polls(
 
 /// `is_first_attempt` is `true` only when called from [`run_kiosk`]'s own
 /// `connect_activate` (the very first attempt of a freshly (re)started
-/// process) — see [`reset_stale_kiosk_device`]'s doc comment for why that
-/// specific transition, and only that one, resets the device first.
-/// [`end_kiosk_attempt`]'s own reconnect call always passes `false`.
+/// process) — threaded through to [`end_kiosk_attempt`] so it can decide
+/// whether *the next* attempt should reset the device first
+/// (`reset_before_attempt`, see [`reset_stale_kiosk_device`]'s doc
+/// comment for why resetting *this* attempt unconditionally was tried
+/// and reverted). `run_kiosk` always passes `(true, false)`;
+/// [`end_kiosk_attempt`]'s own reconnect call always passes `false` for
+/// `is_first_attempt`.
+#[allow(clippy::fn_params_excessive_bools)]
 fn start_kiosk_session(
     window: &Rc<KioskWindow>,
     tls12_compatibility: bool,
@@ -1235,6 +1309,7 @@ fn start_kiosk_session(
     cancel: &CancellationFlag,
     final_result: &Rc<RefCell<Option<Result<(), CliError>>>>,
     is_first_attempt: bool,
+    reset_before_attempt: bool,
 ) {
     let (capability_sender, capability_receiver) = mpsc::channel::<DecoderCapability>();
     let (pipeline_sender, pipeline_receiver) = mpsc::channel();
@@ -1266,6 +1341,8 @@ fn start_kiosk_session(
         cancel.clone(),
         Rc::clone(final_result),
         Rc::clone(&attempt_ended),
+        is_first_attempt,
+        reset_before_attempt,
     );
 
     let safety_net_id_for_capability = Rc::clone(&safety_net_id);
@@ -1306,7 +1383,7 @@ fn start_kiosk_session(
             handoff,
             touch_settings,
             &cancel_for_thread,
-            is_first_attempt,
+            reset_before_attempt,
         );
         let _ = session_result_sender.send(result);
     });
@@ -1327,6 +1404,8 @@ fn start_kiosk_session(
                     Rc::clone(&final_result_for_result),
                     &attempt_ended_for_result,
                     &safety_net_id_for_result,
+                    is_first_attempt,
+                    reset_before_attempt,
                     result,
                 );
                 glib::ControlFlow::Break
@@ -1395,6 +1474,12 @@ pub(crate) fn run_kiosk(
             return;
         }
         let window = Rc::new(build_kiosk_window(application, &cancel_for_activate));
+        // See `auth_discovery_probe::mark_kiosk_session_live`'s doc
+        // comment: a marker left over from a previous process that never
+        // confirmed a clean end means the phone is very likely still
+        // stale, so this very first attempt resets before trying instead
+        // of always trying clean first and eating a doomed ~10s timeout.
+        let reset_before_first_attempt = crate::auth_discovery_probe::consume_stale_kiosk_marker();
         start_kiosk_session(
             &window,
             tls12_compatibility,
@@ -1402,6 +1487,7 @@ pub(crate) fn run_kiosk(
             &cancel_for_activate,
             &final_result_for_activate,
             true,
+            reset_before_first_attempt,
         );
     });
 
@@ -1452,6 +1538,31 @@ struct ActionPicker {
     action_buttons: Rc<Vec<(Action, Button)>>,
     back_button: Button,
     editing_gesture: Rc<Cell<Option<GestureId>>>,
+}
+
+/// A full-panel equalizer preset editor, mirroring [`ActionPicker`]'s own
+/// "hides the page it was opened from, shown/hidden independently of
+/// [`show_settings_page`]" shape: long-pressing one of the equalizer
+/// page's preset buttons hides [`SettingsPanel::equalizer_page`] and
+/// shows this instead — see [`build_preset_editor_page`]'s doc comment
+/// for what it actually does.
+#[derive(Clone)]
+struct PresetEditor {
+    root: GtkBox,
+    name_entry: Entry,
+    /// This editor's own 10 sliders — independent of
+    /// [`SettingsPanel::eq_scales`], see [`build_preset_editor_page`]'s
+    /// doc comment for why.
+    band_scales: Rc<Vec<Scale>>,
+    save_button: Button,
+    back_button: Button,
+    /// Which preset slot is currently open for editing, set the moment
+    /// the editor opens (mirrors [`ActionPicker::editing_gesture`]).
+    editing_index: Rc<Cell<Option<usize>>>,
+    /// "Saved" confirmation, shown briefly after a real save — see
+    /// [`show_preset_saved_confirmation`]'s doc comment.
+    saved_label: Label,
+    saved_label_hide_timer: Rc<Cell<Option<glib::SourceId>>>,
 }
 
 /// Every page the settings panel can show. At the operator's explicit
@@ -1515,6 +1626,10 @@ struct SettingsPanel {
     /// One `Scale` per `equalizer-10bands` band, in `band0..band9` order —
     /// see `build_equalizer_page`'s doc comment.
     eq_scales: Rc<Vec<Scale>>,
+    /// One `Button` per `crate::settings::EQ_PRESET_COUNT` preset slot —
+    /// see `build_equalizer_page`'s doc comment.
+    eq_preset_buttons: Rc<Vec<Button>>,
+    preset_editor: PresetEditor,
     legal_page: GtkBox,
     legal_button: Button,
     legal_back_button: Button,
@@ -1723,6 +1838,46 @@ fn build_and_add_quick_controls_popup(
     );
     overlay.add_overlay(&quick_controls.root);
     quick_controls
+}
+
+/// How long [`show_preset_saved_confirmation`]'s "Saved" label stays
+/// visible — long enough to register as a deliberate confirmation, short
+/// enough not to still be showing (and look stale) if the operator
+/// immediately starts editing again.
+const PRESET_SAVED_CONFIRMATION_DURATION: Duration = Duration::from_secs(2);
+
+/// Shows [`PresetEditor::saved_label`] and hides it again after
+/// [`PRESET_SAVED_CONFIRMATION_DURATION`] — the same
+/// cancel-any-pending-timer-then-start-a-fresh-one shape as
+/// [`reset_quick_controls_auto_hide`], so a rapid second save restarts
+/// the countdown instead of the label flickering off mid-way through.
+/// Called only after [`crate::settings::HeadUnitSettings::save`] actually
+/// ran, not merely on every tap of the Save button.
+fn show_preset_saved_confirmation(preset_editor: &PresetEditor) {
+    if let Some(source_id) = preset_editor.saved_label_hide_timer.take() {
+        source_id.remove();
+    }
+    preset_editor.saved_label.set_visible(true);
+    let saved_label = preset_editor.saved_label.clone();
+    let timer = Rc::clone(&preset_editor.saved_label_hide_timer);
+    let source_id = glib::timeout_add_local(PRESET_SAVED_CONFIRMATION_DURATION, move || {
+        saved_label.set_visible(false);
+        timer.set(None);
+        glib::ControlFlow::Break
+    });
+    preset_editor.saved_label_hide_timer.set(Some(source_id));
+}
+
+/// Cancels any pending [`show_preset_saved_confirmation`] timer and hides
+/// the "Saved" label immediately — called both on "Back" (so a stale
+/// confirmation from a previous save never lingers into the next visit)
+/// and when the editor opens for a (possibly different) preset, as a
+/// defensive reset in case it was ever skipped.
+fn hide_preset_saved_confirmation(preset_editor: &PresetEditor) {
+    if let Some(source_id) = preset_editor.saved_label_hide_timer.take() {
+        source_id.remove();
+    }
+    preset_editor.saved_label.set_visible(false);
 }
 
 /// Cancels any pending auto-hide and starts a fresh [`QUICK_CONTROLS_AUTO_HIDE`]
@@ -1998,10 +2153,29 @@ const SCROLL_DRAG_MIN_TOTAL_PIXELS: f64 = 24.0;
 /// slider indistinguishable from a scroll). Checked once, at
 /// `drag_begin`, via `Widget::pick`/`ancestor` — a real widget-identity
 /// check, not another direction heuristic to out-guess.
-fn drag_started_on_a_scale(scroller: &ScrolledWindow, x: f64, y: f64) -> bool {
+///
+/// **Also exempts `Button`, added 2026-08-22** — real-hardware feedback:
+/// the equalizer preset buttons' long-press ([`wire_equalizer_presets`])
+/// didn't fire. Since this gesture runs in `Capture` phase (see above),
+/// it sees a held finger's own small natural drift *before* a `Button`'s
+/// own (`Bubble`-phase) long-press controller gets a chance to recognize
+/// the hold at all — [`SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS`] is only 10px,
+/// comfortably within normal finger wobble over the ~500ms+ a long press
+/// has to sit still, so this gesture was very likely claiming the
+/// sequence out from under the button partway through nearly every real
+/// hold attempt, well before either the long-press threshold or a
+/// deliberate scroll could complete. A held button press should always
+/// resolve to that button's own gesture handling, never a background
+/// page scroll, exactly like a `Scale` drag already does.
+fn drag_started_on_an_exempt_widget(scroller: &ScrolledWindow, x: f64, y: f64) -> bool {
     scroller
         .pick(x, y, gtk4::PickFlags::DEFAULT)
-        .is_some_and(|hit| hit.is::<Scale>() || hit.ancestor(Scale::static_type()).is_some())
+        .is_some_and(|hit| {
+            hit.is::<Scale>()
+                || hit.ancestor(Scale::static_type()).is_some()
+                || hit.is::<Button>()
+                || hit.ancestor(Button::static_type()).is_some()
+        })
 }
 
 fn enable_touch_drag_scroll(scroller: &ScrolledWindow) {
@@ -2009,24 +2183,30 @@ fn enable_touch_drag_scroll(scroller: &ScrolledWindow) {
     drag.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let vadjustment = scroller.vadjustment();
     let start_value = Rc::new(Cell::new(0.0_f64));
-    let started_on_scale = Rc::new(Cell::new(false));
+    let started_on_exempt_widget = Rc::new(Cell::new(false));
 
     let vadjustment_for_begin = vadjustment.clone();
     let start_value_for_begin = Rc::clone(&start_value);
-    let started_on_scale_for_begin = Rc::clone(&started_on_scale);
+    let started_on_exempt_widget_for_begin = Rc::clone(&started_on_exempt_widget);
     let scroller_for_begin = scroller.clone();
     drag.connect_drag_begin(move |_, x, y| {
         start_value_for_begin.set(vadjustment_for_begin.value());
-        started_on_scale_for_begin.set(drag_started_on_a_scale(&scroller_for_begin, x, y));
+        started_on_exempt_widget_for_begin.set(drag_started_on_an_exempt_widget(
+            &scroller_for_begin,
+            x,
+            y,
+        ));
     });
 
     let start_value_for_update = Rc::clone(&start_value);
     drag.connect_drag_update(move |gesture, offset_x, offset_y| {
-        // A drag that started on a slider is never scroll-claimed and
-        // never adjusts `vadjustment` either — otherwise the page would
-        // visibly scroll out from under a legitimate vertical slider
-        // drag even while the drag itself correctly reaches the `Scale`.
-        if started_on_scale.get() {
+        // A drag that started on a slider or a button is never
+        // scroll-claimed and never adjusts `vadjustment` either —
+        // otherwise the page would visibly scroll out from under a
+        // legitimate vertical slider drag, or steal a button's own held
+        // press before its long-press can recognize, even while the drag
+        // itself correctly reaches the widget underneath.
+        if started_on_exempt_widget.get() {
             return;
         }
         let total = offset_x.hypot(offset_y);
@@ -2578,7 +2758,28 @@ struct EqualizerPageBuild {
     /// naming and `crate::settings::HeadUnitSettings::eq_bands`'s array
     /// order — see that method's doc comment.
     band_scales: Vec<Scale>,
+    /// One button per `crate::settings::EQ_PRESET_COUNT` preset slot, in
+    /// index order, labeled with that slot's saved name — see
+    /// [`wire_equalizer_presets`]'s doc comment for what a short tap vs.
+    /// a long press on each one does.
+    preset_buttons: Vec<Button>,
 }
+
+/// A real minimum height for each vertical band `Scale`, in pixels.
+/// Real-hardware feedback (2026-08-22): plain `vexpand` alone doesn't
+/// make these sliders "full length" — both the equalizer page and the
+/// preset editor live inside this panel's single shared `ScrolledWindow`
+/// (`build_settings_scroller`), and a `GtkViewport`'s scrolling axis
+/// sizes its child to that child's own natural/minimum request, not the
+/// leftover viewport space, so `vexpand` on a descendant has no effect in
+/// that axis. A real minimum height is the only way to make the fader
+/// actually read as full-length, matching this project's existing
+/// precedent of a real pixel minimum where GTK's automatic layout
+/// doesn't do what's wanted (`install_minimum_touch_target_css`'s 56px).
+/// 320px leaves enough of the panel's ~480px physical height
+/// (`ARCHITECTURE.md`'s display profile) for the title, back button, and
+/// (on the equalizer page) the preset column beside it.
+const EQ_SLIDER_MIN_HEIGHT_PX: i32 = 320;
 
 /// Formats one `equalizer-10bands` band's center frequency for its
 /// slider's label — e.g. `29 Hz`, `947 Hz`, `1.9 kHz`. Replaced the
@@ -2595,14 +2796,52 @@ fn eq_band_frequency_label(hz: u32) -> String {
     }
 }
 
-/// Builds the Equalizer page: one vertical fader-style `Scale` per
-/// `equalizer-10bands` band (extras roadmap, 2026-08-21 — see
-/// `crates/media-gstreamer/src/audio.rs`'s matching pipeline change),
-/// labeled with that band's real center frequency
-/// ([`eq_band_frequency_label`]). Settings persist immediately
-/// (debounced, matching the brightness slider) and, since 2026-08-21,
-/// also live-apply to every currently-registered audio pipeline — see
-/// [`wire_equalizer_sliders`]'s doc comment.
+/// Builds one full grid of 10 vertical, full-length equalizer band
+/// sliders, each labeled with its real center frequency
+/// ([`eq_band_frequency_label`]) — shared by [`build_equalizer_page`]'s
+/// live sliders and [`build_preset_editor_page`]'s independent editing
+/// sliders, so the two can never drift apart in layout or labeling.
+/// Every `Scale` starts at `0.0` (flat) regardless of caller — the two
+/// call sites set real initial values themselves (the equalizer page at
+/// build time from the live settings, the preset editor at open time
+/// from whichever preset was long-pressed), since only the latter's
+/// initial values can even be known before the page is shown.
+fn build_eq_band_grid() -> (Grid, Vec<Scale>) {
+    let band_grid = Grid::new();
+    band_grid.set_row_spacing(8);
+    band_grid.set_column_spacing(8);
+    band_grid.set_hexpand(true);
+    band_grid.set_vexpand(true);
+
+    let mut band_scales = Vec::with_capacity(crate::settings::EQ_BAND_COUNT);
+    for (index, hz) in EQ_BAND_CENTER_FREQUENCIES_HZ.iter().enumerate() {
+        let column = i32::try_from(index).unwrap_or(0);
+        let label = Label::new(Some(&eq_band_frequency_label(*hz)));
+        band_grid.attach(&label, column, 0, 1, 1);
+
+        let scale = Scale::with_range(
+            Orientation::Vertical,
+            crate::settings::MIN_EQ_BAND_GAIN_DB,
+            crate::settings::MAX_EQ_BAND_GAIN_DB,
+            1.0,
+        );
+        scale.set_vexpand(true);
+        scale.set_inverted(true);
+        scale.set_size_request(-1, EQ_SLIDER_MIN_HEIGHT_PX);
+        band_grid.attach(&scale, column, 1, 1, 1);
+        band_scales.push(scale);
+    }
+
+    (band_grid, band_scales)
+}
+
+/// Builds the Equalizer page: full-length vertical fader `Scale`s (one
+/// per `equalizer-10bands` band, [`build_eq_band_grid`]) filling most of
+/// the page's width, with a column of `EQ_PRESET_COUNT` preset buttons
+/// to their right (2026-08-22, Blake's explicit layout request). Settings
+/// persist immediately (debounced, matching the brightness slider) and,
+/// since 2026-08-21, also live-apply to every currently-registered audio
+/// pipeline — see [`wire_equalizer_sliders`]'s doc comment.
 ///
 /// **Vertical, real-hardware feedback (2026-08-21) both ways**: an
 /// earlier version of this page used horizontal sliders specifically to
@@ -2614,8 +2853,17 @@ fn eq_band_frequency_label(hz: u32) -> String {
 /// entirely (by widget identity via `Widget::pick`/`ancestor`, not
 /// direction), so orientation is a free styling choice again rather than
 /// something that has to dodge the panel's own gesture handling.
+///
+/// **Each preset button is two gestures in one** (2026-08-22, replacing
+/// the earlier separate Apply/Save button pair): a short tap loads that
+/// slot's saved gains into the live sliders (live-applies and persists,
+/// same as dragging a slider by hand); a long press instead opens
+/// [`build_preset_editor_page`] to rename/re-tune that slot on its own,
+/// independent sliders. See [`wire_equalizer_presets`] for how the two
+/// gestures are actually told apart on one `Button`.
 fn build_equalizer_page(
     initial_eq_bands: [f64; crate::settings::EQ_BAND_COUNT],
+    initial_preset_names: &[String; crate::settings::EQ_PRESET_COUNT],
 ) -> EqualizerPageBuild {
     let page = GtkBox::new(Orientation::Vertical, 8);
     page.set_visible(false);
@@ -2623,31 +2871,26 @@ fn build_equalizer_page(
     let title = Label::new(Some(SettingsPage::Equalizer.label()));
     page.append(&title);
 
-    let band_grid = Grid::new();
-    band_grid.set_row_spacing(8);
-    band_grid.set_column_spacing(8);
-    band_grid.set_hexpand(true);
-    page.append(&band_grid);
+    let content_row = GtkBox::new(Orientation::Horizontal, 16);
+    content_row.set_hexpand(true);
+    content_row.set_vexpand(true);
+    page.append(&content_row);
 
-    let mut band_scales = Vec::with_capacity(crate::settings::EQ_BAND_COUNT);
-    for (index, initial_gain_db) in initial_eq_bands.into_iter().enumerate() {
-        let column = i32::try_from(index).unwrap_or(0);
-        let hz = EQ_BAND_CENTER_FREQUENCIES_HZ[index];
-        let label = Label::new(Some(&eq_band_frequency_label(hz)));
-        band_grid.attach(&label, column, 0, 1, 1);
-
-        let scale = Scale::with_range(
-            Orientation::Vertical,
-            crate::settings::MIN_EQ_BAND_GAIN_DB,
-            crate::settings::MAX_EQ_BAND_GAIN_DB,
-            1.0,
-        );
-        scale.set_value(initial_gain_db);
-        scale.set_vexpand(true);
-        scale.set_inverted(true);
-        band_grid.attach(&scale, column, 1, 1, 1);
-        band_scales.push(scale);
+    let (band_grid, band_scales) = build_eq_band_grid();
+    for (scale, gain_db) in band_scales.iter().zip(initial_eq_bands) {
+        scale.set_value(gain_db);
     }
+    content_row.append(&band_grid);
+
+    let preset_column = GtkBox::new(Orientation::Vertical, 8);
+    preset_column.set_valign(gtk4::Align::Center);
+    let mut preset_buttons = Vec::with_capacity(crate::settings::EQ_PRESET_COUNT);
+    for name in initial_preset_names {
+        let button = Button::with_label(name);
+        preset_column.append(&button);
+        preset_buttons.push(button);
+    }
+    content_row.append(&preset_column);
 
     let back_button = Button::with_label("Back");
     page.append(&back_button);
@@ -2660,6 +2903,83 @@ fn build_equalizer_page(
         open_button,
         back_button,
         band_scales,
+        preset_buttons,
+    }
+}
+
+/// Everything [`build_preset_editor_page`] builds.
+struct PresetEditorPageBuild {
+    page: GtkBox,
+    name_entry: Entry,
+    band_scales: Vec<Scale>,
+    save_button: Button,
+    back_button: Button,
+    saved_label: Label,
+}
+
+impl From<PresetEditorPageBuild> for PresetEditor {
+    fn from(build: PresetEditorPageBuild) -> Self {
+        Self {
+            root: build.page,
+            name_entry: build.name_entry,
+            band_scales: Rc::new(build.band_scales),
+            save_button: build.save_button,
+            back_button: build.back_button,
+            editing_index: Rc::new(Cell::new(None)),
+            saved_label: build.saved_label,
+            saved_label_hide_timer: Rc::new(Cell::new(None)),
+        }
+    }
+}
+
+/// Builds the preset editor: reached only by long-pressing one of the
+/// equalizer page's preset buttons ([`wire_equalizer_presets`], Blake's
+/// explicit request 2026-08-22 — "long press into the preset and you
+/// have the 10 sliders and the ability to change the name of the preset
+/// then save and back"). Its own independent set of 10 full-length
+/// vertical sliders ([`build_eq_band_grid`], not shared with the
+/// equalizer page's `eq_scales`) means browsing or adjusting a preset
+/// here never touches whatever is actually playing right now — only
+/// tapping "Save" writes anything back, and only a short tap on the
+/// equalizer page's preset button afterward makes an edited preset
+/// become the live sound. An `Entry` above the sliders renames the slot.
+/// "Back" always returns to the equalizer page, discarding any
+/// unsaved edits — matching "then save and back" as two distinct,
+/// deliberate actions rather than an auto-save-on-navigate. A "Saved"
+/// label (2026-08-22, Blake's request — "i want a saved popup so i know
+/// it has saved") appears briefly on a real save; see
+/// [`show_preset_saved_confirmation`].
+fn build_preset_editor_page() -> PresetEditorPageBuild {
+    let page = GtkBox::new(Orientation::Vertical, 8);
+    page.set_visible(false);
+
+    let name_entry = Entry::new();
+    page.append(&name_entry);
+
+    let (band_grid, band_scales) = build_eq_band_grid();
+    page.append(&band_grid);
+
+    let saved_label = Label::new(Some("Saved"));
+    saved_label.set_visible(false);
+    page.append(&saved_label);
+
+    let footer = GtkBox::new(Orientation::Horizontal, 8);
+    footer.set_hexpand(true);
+    let save_button = Button::with_label("Save");
+    save_button.set_hexpand(true);
+    footer.append(&save_button);
+    let back_button = Button::with_label("Back");
+    back_button.set_hexpand(true);
+    footer.append(&back_button);
+    page.append(&footer);
+
+    PresetEditorPageBuild {
+        page,
+        name_entry,
+        band_scales,
+        save_button,
+        back_button,
+        saved_label,
     }
 }
 
@@ -2722,6 +3042,8 @@ fn build_themes_page() -> ThemesPageBuild {
 /// `clippy::too_many_lines`, not because this borrowing sequence does
 /// anything `activate_window` itself couldn't.
 fn build_settings_panel_from(gesture_settings: &Rc<RefCell<HeadUnitSettings>>) -> SettingsPanel {
+    let initial_preset_names: [String; crate::settings::EQ_PRESET_COUNT] =
+        std::array::from_fn(|index| gesture_settings.borrow().eq_preset_name(index).to_string());
     build_settings_panel(
         gesture_settings.borrow().arm_window_seconds(),
         gesture_settings.borrow().mtp_popup_suppression_enabled(),
@@ -2732,6 +3054,7 @@ fn build_settings_panel_from(gesture_settings: &Rc<RefCell<HeadUnitSettings>>) -
         gesture_settings.borrow().microphone_input_device(),
         gesture_settings.borrow().night_mode_gpio_line(),
         gesture_settings.borrow().eq_bands(),
+        &initial_preset_names,
         gesture_settings
             .borrow()
             .experimental_disclaimer_dismissed(),
@@ -2787,6 +3110,11 @@ fn build_menu_page(buttons: &[&Button]) -> GtkBox {
 /// ever matters once Legal has actually been hidden
 /// ([`wire_legal_page`]). Split out of `build_settings_panel` purely to
 /// keep it under `clippy::too_many_lines`.
+///
+/// `legal_open` is placed last, after every stub page (2026-08-22, Blake's
+/// request) — Legal is the one entry that can be hidden entirely, so it
+/// doesn't belong up front alongside the pages an operator actually uses
+/// day to day.
 #[allow(clippy::too_many_arguments)]
 fn build_menu_page_and_unhide(
     android_auto_button: &Button,
@@ -2805,9 +3133,9 @@ fn build_menu_page_and_unhide(
         display_open,
         themes_open,
         equalizer_open,
-        legal_open,
     ];
     menu_buttons.extend(stub_pages.iter().map(|stub| &stub.open_button));
+    menu_buttons.push(legal_open);
     let menu_page = build_menu_page(&menu_buttons);
 
     let legal_unhide_button = Button::with_label("⋮");
@@ -2867,6 +3195,7 @@ fn build_settings_panel(
     initial_microphone_input_device: Option<&str>,
     initial_night_mode_gpio_line: Option<u32>,
     initial_eq_bands: [f64; crate::settings::EQ_BAND_COUNT],
+    initial_preset_names: &[String; crate::settings::EQ_PRESET_COUNT],
     initial_legal_read_accepted: bool,
     initial_legal_hidden: bool,
 ) -> SettingsPanel {
@@ -2883,7 +3212,8 @@ fn build_settings_panel(
     );
 
     let themes = build_themes_page();
-    let equalizer = build_equalizer_page(initial_eq_bands);
+    let equalizer = build_equalizer_page(initial_eq_bands, initial_preset_names);
+    let preset_editor_build = build_preset_editor_page();
     let legal = build_legal_page(initial_legal_read_accepted, initial_legal_hidden);
 
     // --- The three still-not-yet-implemented sibling pages ---
@@ -2920,6 +3250,7 @@ fn build_settings_panel(
     content.append(&display.page);
     content.append(&themes.page);
     content.append(&equalizer.page);
+    content.append(&preset_editor_build.page);
     content.append(&legal.page);
     for stub in &stub_pages {
         content.append(&stub.root);
@@ -2946,6 +3277,8 @@ fn build_settings_panel(
         equalizer_button: equalizer.open_button,
         equalizer_back_button: equalizer.back_button,
         eq_scales: Rc::new(equalizer.band_scales),
+        eq_preset_buttons: Rc::new(equalizer.preset_buttons),
+        preset_editor: preset_editor_build.into(),
         legal_page: legal.page,
         legal_button: legal.open_button,
         legal_back_button: legal.back_button,
@@ -3349,6 +3682,175 @@ fn wire_equalizer_sliders(
     }
 }
 
+/// How long a press has to hold before it counts as a long press rather
+/// than a tap — see [`wire_equalizer_presets`]'s doc comment for why this
+/// is measured by hand instead of using `GestureLongPress`.
+const PRESET_LONG_PRESS_THRESHOLD: Duration = Duration::from_millis(500);
+
+/// Wires each of the `EQ_PRESET_COUNT` preset buttons
+/// ([`build_equalizer_page`]'s `preset_buttons`) as two gestures in one
+/// (2026-08-22, Blake's explicit request):
+///
+/// - **Short tap**: loads that slot's 10 saved gains into the live band
+///   sliders. Works by simply calling `Scale::set_value` on each one,
+///   which relies on [`wire_equalizer_sliders`]'s own `value_changed`
+///   handler already being connected to do the actual live-apply/persist
+///   for each band — so this function must be wired *after* that one,
+///   and doesn't duplicate any of that logic itself.
+/// - **Long press**: opens [`SettingsPanel::preset_editor`] for that
+///   slot instead — see [`build_preset_editor_page`]'s doc comment.
+///
+/// **Second real-hardware iteration, 2026-08-22.** The first version put
+/// a `GestureLongPress` controller alongside the `Button`'s own built-in
+/// click handling, telling the two apart by having the long-press claim
+/// the touch sequence once its hold timer fired. That approach picked up
+/// a real bug along the way — the settings panel's `Capture`-phase
+/// scroll-drag gesture was stealing the sequence out from under a held
+/// button before the long-press timer ever got a chance (fixed by
+/// exempting `Button` the same way `Scale` already was, see
+/// `drag_started_on_an_exempt_widget`) — but after that fix, an ordinary
+/// short tap started needing two taps to register instead of one.
+/// Rather than keep guessing at the exact interaction between two
+/// separate gesture controllers competing for the same widget, this
+/// version removes the ambiguity entirely: a single, self-owned
+/// `GestureClick` per button, with `Button::connect_clicked` no longer
+/// used at all. `connect_pressed` records the touch-down time;
+/// `connect_released` compares it against
+/// [`PRESET_LONG_PRESS_THRESHOLD`] and picks apply-vs-edit itself,
+/// mirroring the *decide-once-at-release-from-elapsed-time* approach
+/// `platform_api::gesture`'s own `LongPress` already uses reliably
+/// elsewhere in this project (a different input path — the AA video
+/// surface, not a GTK widget — but the same principle: deciding from
+/// measured duration, not from whether the finger stayed still,
+/// sidesteps needing any hold-tracking/movement-tolerance behavior
+/// neither of us can fully verify without hardware in hand).
+///
+/// **Third real-hardware iteration, same day**: the self-owned
+/// `GestureClick` above stopped registering *any* press or release at
+/// all — neither apply nor edit fired. Set to `Capture` phase (the same
+/// technique `enable_touch_drag_scroll`'s `GestureDrag` already uses,
+/// successfully, in this exact file) so this controller sees the touch
+/// sequence before the `Button`'s own internal click handling — which
+/// normally runs in `Bubble` phase and, being added to the widget first
+/// (during `Button` construction, before this function ever runs), would
+/// otherwise get first claim on any sequence in the default phase
+/// ordering. Diagnostic prints on both `pressed` and `released` (not
+/// just inside the tap-vs-hold branches) stay in place either way, so a
+/// future real-hardware trial can confirm from the log whether events
+/// are reaching this controller at all, independent of what they decide
+/// to do once they arrive.
+fn wire_equalizer_presets(
+    settings_panel: &SettingsPanel,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    for (index, button) in settings_panel.eq_preset_buttons.iter().enumerate() {
+        let click = gtk4::GestureClick::new();
+        // Capture phase, same technique as `enable_touch_drag_scroll`'s
+        // own `GestureDrag` — guarantees this controller sees the touch
+        // sequence before the `Button`'s own internal (default `Bubble`
+        // phase) click handling gets a chance to react to it first.
+        click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let press_started: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+
+        let press_started_for_press = Rc::clone(&press_started);
+        click.connect_pressed(move |_, _, _, _| {
+            println!("probe_state=eq_preset_click_pressed index={index}");
+            press_started_for_press.set(Some(Instant::now()));
+        });
+
+        let eq_scales = Rc::clone(&settings_panel.eq_scales);
+        let gesture_settings_for_apply = Rc::clone(gesture_settings);
+        let equalizer_page = settings_panel.equalizer_page.clone();
+        let preset_editor = settings_panel.preset_editor.clone();
+        let gesture_settings_for_edit = Rc::clone(gesture_settings);
+        click.connect_released(move |_, _, _, _| {
+            println!("probe_state=eq_preset_click_released index={index}");
+            let was_long_press = press_started
+                .take()
+                .is_some_and(|started| started.elapsed() >= PRESET_LONG_PRESS_THRESHOLD);
+            if was_long_press {
+                println!("probe_state=eq_preset_long_press_fired index={index}");
+                preset_editor.editing_index.set(Some(index));
+                hide_preset_saved_confirmation(&preset_editor);
+                let settings = gesture_settings_for_edit.borrow();
+                preset_editor
+                    .name_entry
+                    .set_text(settings.eq_preset_name(index));
+                let gains = settings.eq_preset(index);
+                for (scale, gain_db) in preset_editor.band_scales.iter().zip(gains) {
+                    scale.set_value(gain_db);
+                }
+                drop(settings);
+                equalizer_page.set_visible(false);
+                preset_editor.root.set_visible(true);
+            } else {
+                println!("probe_state=eq_preset_apply_clicked index={index}");
+                let gains = gesture_settings_for_apply.borrow().eq_preset(index);
+                for (scale, gain_db) in eq_scales.iter().zip(gains) {
+                    scale.set_value(gain_db);
+                }
+            }
+        });
+
+        button.add_controller(click);
+    }
+}
+
+/// Wires [`SettingsPanel::preset_editor`]'s own Save/Back footer — split
+/// out of [`wire_equalizer_presets`] purely for readability, since it
+/// covers the editor page rather than the preset buttons that open it.
+///
+/// - **Save**: reads the editor's 10 sliders and name `Entry`, writes
+///   both into whichever slot [`PresetEditor::editing_index`] currently
+///   holds, persists immediately (no debounce — an explicit, infrequent
+///   action, not a drag gesture needing coalescing), and refreshes that
+///   slot's button label on the equalizer page so a rename is visible
+///   without having to reopen it. Does **not** navigate away — matching
+///   "save and back" as two distinct actions (Blake's own wording).
+/// - **Back**: always returns to the equalizer page, discarding any
+///   edits that were never saved.
+fn wire_preset_editor(
+    settings_panel: &SettingsPanel,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    let preset_editor = settings_panel.preset_editor.clone();
+    let eq_preset_buttons = Rc::clone(&settings_panel.eq_preset_buttons);
+    let gesture_settings_for_save = Rc::clone(gesture_settings);
+    let preset_editor_for_save = preset_editor.clone();
+    preset_editor.save_button.connect_clicked(move |_| {
+        println!("probe_state=eq_preset_editor_save_clicked");
+        let Some(index) = preset_editor_for_save.editing_index.get() else {
+            return;
+        };
+        let mut gains = [0.0; crate::settings::EQ_BAND_COUNT];
+        for (gain_db, scale) in gains
+            .iter_mut()
+            .zip(preset_editor_for_save.band_scales.iter())
+        {
+            *gain_db = scale.value();
+        }
+        let name = preset_editor_for_save.name_entry.text();
+        let mut settings = gesture_settings_for_save.borrow_mut();
+        settings.set_eq_preset(index, gains);
+        settings.set_eq_preset_name(index, name.as_str());
+        let _ = settings.save(Path::new(DEFAULT_SETTINGS_PATH));
+        if let Some(button) = eq_preset_buttons.get(index) {
+            button.set_label(settings.eq_preset_name(index));
+        }
+        show_preset_saved_confirmation(&preset_editor_for_save);
+    });
+
+    let equalizer_page = settings_panel.equalizer_page.clone();
+    let preset_editor_for_back = preset_editor.clone();
+    preset_editor.back_button.connect_clicked(move |_| {
+        println!("probe_state=eq_preset_editor_back_clicked");
+        preset_editor_for_back.editing_index.set(None);
+        hide_preset_saved_confirmation(&preset_editor_for_back);
+        preset_editor_for_back.root.set_visible(false);
+        equalizer_page.set_visible(true);
+    });
+}
+
 /// Wires the gesture-assignment flow: tapping a gesture's selector opens
 /// [`ActionPicker`] over the Gestures page, tapping an action applies it
 /// and returns, and the picker's own Back button returns unchanged —
@@ -3603,6 +4105,8 @@ fn wire_settings_panel(
     wire_launch_on_boot_toggle(settings_panel, gesture_settings);
     wire_brightness_and_device_settings(settings_panel, gesture_settings, audio_settings);
     wire_equalizer_sliders(settings_panel, gesture_settings, audio_settings);
+    wire_equalizer_presets(settings_panel, gesture_settings);
+    wire_preset_editor(settings_panel, gesture_settings);
 
     let settings_panel_for_cycle = settings_panel.clone();
     let armed_mask_for_cycle = armed_mask.clone();

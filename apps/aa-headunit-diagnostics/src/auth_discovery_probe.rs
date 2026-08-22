@@ -1671,6 +1671,93 @@ fn wait_for_byebye_response<T: SessionTransport>(
     println!("probe_state=byebye_response_wait_timed_out");
 }
 
+/// Path to a small persisted marker whose mere *existence* means "the
+/// last `usb kiosk` process to go live never confirmed a clean end" — see
+/// [`mark_kiosk_session_live`]/[`consume_stale_kiosk_marker`] for the
+/// write/read sides of the mechanism this exists for
+/// (`gtk_dev_ui::run_kiosk`'s reconnect-delay real-hardware finding,
+/// 2026-08-22). Same `/var/lib/aa-headunit/` location and unprivileged
+/// group permissions as [`crate::settings::DEFAULT_SETTINGS_PATH`] — pure
+/// convenience state, never required for correctness (a missing or
+/// unwritable marker just means the next launch tries a clean connection
+/// first, exactly like before this existed).
+const KIOSK_LIVE_SESSION_MARKER_PATH: &str = "/var/lib/aa-headunit/kiosk_live_session";
+
+static KIOSK_PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Milliseconds since the first call to this function anywhere in the
+/// process (lazily anchored — no explicit "process started" call needed,
+/// and no state to thread between `gtk_dev_ui.rs` and this file). Added
+/// 2026-08-22 real-hardware finding: repeated subjective "is this faster
+/// or slower than before" reports about `usb kiosk` reconnect timing
+/// couldn't be resolved from the existing `probe_state=...` log lines
+/// alone, since none of them carry a timestamp — only relative line
+/// position, which is dominated by unrelated video/audio log volume, not
+/// actual elapsed time. Appended as `elapsed_ms=N` to the handful of
+/// existing lines that bound a reconnect (`kiosk_started`,
+/// `kiosk_startup_soft_reset`, `kiosk_device_selected`,
+/// `kiosk_session_ended`, `channel_setup_complete`) so real wall-clock
+/// deltas can finally be read directly out of the log instead of guessed
+/// at from either side.
+pub(crate) fn elapsed_ms_since_process_start() -> u128 {
+    KIOSK_PROCESS_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+}
+
+/// Writes [`KIOSK_LIVE_SESSION_MARKER_PATH`] the moment a session goes
+/// live — called every time [`report_probe_outcome`] sees a *fresh*
+/// `ChannelSetupComplete`, including an ordinary mid-process reconnect,
+/// so the marker always reflects the most recent live connection's own
+/// status by the time this process eventually exits, however it exits.
+///
+/// **What this is for**: real-hardware finding, 2026-08-22 — after
+/// [`reset_stale_kiosk_device`](crate::gtk_dev_ui)'s "only reset after a
+/// failed first attempt" fix (itself a fix for an earlier "reset
+/// unconditionally" regression, see that function's own doc comment),
+/// closing and relaunching `usb kiosk` while a phone was left in its
+/// prior session's stale post-handshake state now always burns a real
+/// ~10s USB transfer timeout on a doomed first attempt before the reset
+/// even gets a chance — because a freshly started process has no way to
+/// know, from the USB device alone, whether it's actually stale. This
+/// marker gives it exactly that: written here whenever a session goes
+/// live, read and deleted (`consume_stale_kiosk_marker`) at the very
+/// start of the *next* process's first attempt. If it's still present,
+/// the previous process never got to clean up after itself (operator
+/// close, crash, `kill`) and the phone is very likely still stale, so
+/// that next process resets *before* trying instead of after failing —
+/// while a case where the marker is absent (first-ever launch after
+/// boot, or a previous session that unplugged/ended cleanly) still tries
+/// clean first, unaffected, so a genuinely healthy device is never
+/// disturbed by a reset it doesn't need.
+fn mark_kiosk_session_live() {
+    let _ = std::fs::write(
+        KIOSK_LIVE_SESSION_MARKER_PATH,
+        "A live AAP session was active. If this file is still present \
+         when usb kiosk next starts, its previous process never \
+         confirmed a clean end (operator close, crash, or kill), so the \
+         phone may still be in stale post-handshake protocol state. See \
+         auth_discovery_probe::mark_kiosk_session_live and \
+         gtk_dev_ui::consume_stale_kiosk_marker.\n",
+    );
+}
+
+/// Reads and deletes [`KIOSK_LIVE_SESSION_MARKER_PATH`], returning
+/// whether it existed — see [`mark_kiosk_session_live`]'s doc comment for
+/// the full mechanism. Called exactly once, by `gtk_dev_ui::run_kiosk`,
+/// for the very first connection attempt of a freshly (re)started
+/// process only; every later attempt within that same process (ordinary
+/// reconnects) never touches this again. Consumed on read (not just
+/// peeked) so a later launch, after this process's own session goes live
+/// and this file gets rewritten fresh, doesn't see a leftover `true` from
+/// a completely unrelated earlier close.
+pub(crate) fn consume_stale_kiosk_marker() -> bool {
+    let existed = std::path::Path::new(KIOSK_LIVE_SESSION_MARKER_PATH).exists();
+    let _ = std::fs::remove_file(KIOSK_LIVE_SESSION_MARKER_PATH);
+    existed
+}
+
 /// Prints diagnostic lines for a [`ProbeOutcome`] and reports whether
 /// `run()` should stop immediately. `ChannelSetupComplete` no longer stops
 /// the probe — video `Start` is now a milestone to keep observing past
@@ -1682,11 +1769,15 @@ fn report_probe_outcome(outcome: &ProbeOutcome, channel_setup_complete: &mut boo
         ProbeOutcome::Continue => false,
         ProbeOutcome::ChannelSetupComplete => {
             if !*channel_setup_complete {
-                println!("probe_state=channel_setup_complete");
+                println!(
+                    "probe_state=channel_setup_complete elapsed_ms={}",
+                    elapsed_ms_since_process_start()
+                );
                 println!("probe_state=observing_for_post_start_media_traffic");
                 crate::connection_state::report(
                     crate::connection_state::ConnectionState::Connected,
                 );
+                mark_kiosk_session_live();
                 *channel_setup_complete = true;
             }
             false
