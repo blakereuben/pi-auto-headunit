@@ -110,6 +110,61 @@ case "$1" in
         chown root:aa-headunit /var/lib/aa-headunit
         chmod 0770 /var/lib/aa-headunit
 
+        # Real deployment finding (2026-08-22): `usb wireless-bootstrap-probe`
+        # (crate's own `wireless_bootstrap.rs`) brings up a temporary Wi-Fi
+        # access point for the wireless Android Auto cold-start bootstrap,
+        # which needs to configure `wlan0`'s address/admin state and needs
+        # `hostapd`/`dnsmasq` binding/opening raw sockets on it — all of
+        # which fail with "Operation not permitted" for a plain unprivileged
+        # user, the same appliance user this whole package otherwise runs
+        # as (see the `sudo` finding recorded elsewhere in this project:
+        # running the app as root breaks Wayland/audio rendering outright,
+        # so root is not an acceptable answer here either). `nmcli`/`rfkill`
+        # are not included below — confirmed on real hardware that ordinary
+        # NetworkManager polkit rules already permit an active local desktop
+        # session to run those two unprivileged, without any file
+        # capability grant, so widening them would be an unnecessary
+        # privilege increase. `ip` is not included either (not a mistake):
+        # a first attempt granted it the capability directly and found, via
+        # `strace`, that Debian's own `ip` binary unconditionally drops all
+        # of its capabilities the instant it starts if not real root —
+        # deliberate upstream hardening this package cannot override, which
+        # is exactly why `wireless_bootstrap.rs` no longer shells out to
+        # `ip` at all and instead configures `wlan0` directly over netlink
+        # from this package's own binary, which has no such self-dropping
+        # logic of its own to fight.
+        #
+        # Fixed the same way `ping` and similar tools are traditionally
+        # made to work for unprivileged users: `setcap` grants exactly
+        # `CAP_NET_ADMIN`/`CAP_NET_RAW` (network interface configuration
+        # and raw-socket access — not full root) directly on the binaries
+        # that actually need them, rather than running any part of this app
+        # as root. Re-run on every install/upgrade, since dpkg replaces
+        # these binaries with a fresh inode each time and file capabilities
+        # do not survive that; each binary's absence is tolerated (`|| true`)
+        # — `hostapd`/`dnsmasq` come from separate packages this one only
+        # recommends, not requires, and a missing one simply leaves
+        # wireless bootstrap non-functional rather than breaking the rest
+        # of the appliance.
+        if command -v setcap >/dev/null 2>&1; then
+            for capable_binary in \
+                /usr/bin/aa-headunit-diagnostics \
+                /usr/sbin/hostapd \
+                /usr/sbin/dnsmasq; do
+                if [ -x "$capable_binary" ]; then
+                    # `setcap` refuses a symlink ("must be a regular
+                    # file") — real-hardware finding, 2026-08-22: some of
+                    # this project's own supported install layouts could
+                    # plausibly symlink a binary here even though none do
+                    # today, so resolving defensively costs nothing (a
+                    # no-op for an already-regular file, as all three are
+                    # right now).
+                    setcap cap_net_admin,cap_net_raw+ep \
+                        "$(readlink -f "$capable_binary")" || true
+                fi
+            done
+        fi
+
         # M5: point LightDM's autologin at the detected account and
         # install the fullscreen-app autostart into their own session —
         # only if autologin isn't already configured (never override an

@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use futures_util::TryStreamExt;
 use protocol_aap::{
     AawMessageId, AawStatus, AccessPointType, WifiInfoResponse, WifiSecurityMode, WifiStartRequest,
     decode_aaw_message, decode_wifi_connection_status, decode_wifi_start_response,
@@ -281,6 +282,119 @@ fn run_command(description: &str, mut command: Command) -> Result<(), CliError> 
     }
 }
 
+/// Configures `WLAN_INTERFACE`'s IPv4 address and admin (up/down) state
+/// directly over netlink, instead of shelling out to `ip` like every
+/// other command here does.
+///
+/// **Why this one command is different, real-hardware finding
+/// 2026-08-22**: after granting this binary `CAP_NET_ADMIN`/`CAP_NET_RAW`
+/// (`packaging/debian/aa-headunit-diagnostics.postinst`) specifically so
+/// the AP bring-up never needs `sudo`, `ip addr add`/`ip link set up`
+/// still failed with `Operation not permitted` — confirmed via `strace`
+/// that Debian's own `ip` binary unconditionally calls `capset` to drop
+/// *all* of its capabilities to zero the instant it starts, if its real
+/// uid isn't 0. That's deliberate upstream hardening against exactly the
+/// setcap-instead-of-setuid-root pattern this project needed, and no
+/// amount of file-capability tuning on `ip` itself gets around code that
+/// throws its own privileges away on purpose. Talking to the kernel
+/// directly from *this* process sidesteps it entirely: `aa-headunit-diagnostics`
+/// carries the capability itself, and has no such self-dropping logic of
+/// its own to fight. `rfkill unblock wifi`/`nmcli device set ... managed no`
+/// are unaffected by any of this and stay as plain subprocess calls —
+/// real-hardware-confirmed to already work unprivileged for an active
+/// local desktop session (`nmcli` via ordinary `NetworkManager` polkit
+/// rules; `rfkill` never even needed a capability grant), so widening
+/// either would be an unnecessary privilege increase, not a fix for
+/// anything actually broken.
+async fn resolve_wlan_index(handle: &rtnetlink::Handle) -> Result<u32, CliError> {
+    let mut links = handle
+        .link()
+        .get()
+        .match_name(WLAN_INTERFACE.to_string())
+        .execute();
+    let link = links
+        .try_next()
+        .await
+        .map_err(|error| CliError::Protocol(format!("netlink: resolve {WLAN_INTERFACE}: {error}")))?
+        .ok_or_else(|| CliError::Protocol(format!("netlink: {WLAN_INTERFACE} not found")))?;
+    Ok(link.header.index)
+}
+
+async fn flush_wlan_addresses(handle: &rtnetlink::Handle, index: u32) -> Result<(), CliError> {
+    let mut addresses = handle
+        .address()
+        .get()
+        .set_link_index_filter(index)
+        .execute();
+    while let Some(address) = addresses
+        .try_next()
+        .await
+        .map_err(|error| CliError::Protocol(format!("netlink: list addresses: {error}")))?
+    {
+        handle
+            .address()
+            .del(address)
+            .execute()
+            .await
+            .map_err(|error| CliError::Protocol(format!("netlink: flush address: {error}")))?;
+    }
+    Ok(())
+}
+
+async fn configure_wlan_interface_async() -> Result<(), CliError> {
+    let (connection, handle, _) = rtnetlink::new_connection().map_err(CliError::Io)?;
+    tokio::spawn(connection);
+
+    let index = resolve_wlan_index(&handle).await?;
+    flush_wlan_addresses(&handle, index).await?;
+
+    handle
+        .address()
+        .add(index, IpAddr::V4(AP_IP), AP_PREFIX_LEN)
+        .execute()
+        .await
+        .map_err(|error| CliError::Protocol(format!("netlink: add AP address: {error}")))?;
+
+    handle
+        .link()
+        .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+        .execute()
+        .await
+        .map_err(|error| {
+            CliError::Protocol(format!("netlink: set {WLAN_INTERFACE} up: {error}"))
+        })?;
+
+    Ok(())
+}
+
+/// Synchronous wrapper for [`configure_wlan_interface_async`] — every
+/// other caller in this file (`run`, `WifiAccessPoint::start`/`Drop`) is
+/// plain synchronous code; this is the only place that needs a Tokio
+/// runtime, kept as small and local as possible rather than making the
+/// whole module async.
+fn configure_wlan_interface() -> Result<(), CliError> {
+    tokio::runtime::Runtime::new()
+        .map_err(CliError::Io)?
+        .block_on(configure_wlan_interface_async())
+}
+
+async fn flush_wlan_interface_async() -> Result<(), CliError> {
+    let (connection, handle, _) = rtnetlink::new_connection().map_err(CliError::Io)?;
+    tokio::spawn(connection);
+    let index = resolve_wlan_index(&handle).await?;
+    flush_wlan_addresses(&handle, index).await
+}
+
+/// Best-effort cleanup counterpart to [`configure_wlan_interface`], used
+/// only from [`WifiAccessPoint`]'s `Drop` — mirrors that impl's existing
+/// "errors during cleanup are not fatal" posture for every other
+/// teardown step there.
+fn flush_wlan_interface() -> Result<(), CliError> {
+    tokio::runtime::Runtime::new()
+        .map_err(CliError::Io)?
+        .block_on(flush_wlan_interface_async())
+}
+
 /// A running `hostapd` + `dnsmasq` pair advertising this device's own
 /// Wi-Fi access point on `wlan0`, and the interface state changes needed
 /// to support it. `Drop` tears everything down: kills both processes and
@@ -306,27 +420,7 @@ impl WifiAccessPoint {
             "nmcli device set wlan0 managed no",
             command_with_args("nmcli", ["device", "set", WLAN_INTERFACE, "managed", "no"]),
         )?;
-        run_command(
-            "ip addr flush wlan0",
-            command_with_args("ip", ["addr", "flush", "dev", WLAN_INTERFACE]),
-        )?;
-        run_command(
-            "ip addr add AP address",
-            command_with_args(
-                "ip",
-                [
-                    "addr",
-                    "add",
-                    &format!("{AP_IP}/{AP_PREFIX_LEN}"),
-                    "dev",
-                    WLAN_INTERFACE,
-                ],
-            ),
-        )?;
-        run_command(
-            "ip link set wlan0 up",
-            command_with_args("ip", ["link", "set", WLAN_INTERFACE, "up"]),
-        )?;
+        configure_wlan_interface()?;
 
         let hostapd_config_path = write_temp_config("hostapd", &hostapd_config(ssid, password))?;
         let dnsmasq_config_path = write_temp_config("dnsmasq", &dnsmasq_config())?;
@@ -364,11 +458,7 @@ impl Drop for WifiAccessPoint {
         let _ = self.dnsmasq.wait();
         let _ = std::fs::remove_file(&self.hostapd_config_path);
         let _ = std::fs::remove_file(&self.dnsmasq_config_path);
-        let _ = Command::new("ip")
-            .args(["addr", "flush", "dev", WLAN_INTERFACE])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = flush_wlan_interface();
         let _ = Command::new("nmcli")
             .args(["device", "set", WLAN_INTERFACE, "managed", "yes"])
             .stdout(Stdio::null())

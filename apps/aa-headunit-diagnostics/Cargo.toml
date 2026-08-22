@@ -18,10 +18,13 @@ transport-usb = { path = "../../crates/transport-usb" }
 [target.'cfg(target_os = "linux")'.dependencies]
 credential-store = { path = "../../crates/credential-store" }
 ctrlc = "3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 gtk4 = "0.10.3"
 protocol-aap = { path = "../../crates/protocol-aap" }
+rtnetlink = "0.23.0"
 security-openssl = { path = "../../crates/security-openssl" }
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 toml = "0.9"
 transport-bluetooth = { version = "0.1.0", path = "../../crates/transport-bluetooth" }
 

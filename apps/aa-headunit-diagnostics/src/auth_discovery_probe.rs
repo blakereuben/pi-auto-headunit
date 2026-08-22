@@ -2911,9 +2911,25 @@ fn service_touch_input<T: SessionTransport>(
             )?;
             // Coordinates are never logged, matching the no-raw-payload-
             // logging rule applied to media `Data`/`CodecConfig` elsewhere
-            // in this file.
+            // in this file. `capture_to_sent_us` measures only this
+            // process's own contribution to end-to-end touch latency: real
+            // kernel evdev capture time (`frame.timestamp_micros`) to the
+            // report actually being written out to the transport — added
+            // 2026-08-22 after a real-hardware wireless trial reported
+            // touch "felt delayed", to find out whether that's this
+            // project's own code or purely network/phone-side (network
+            // transit and the phone's own rendering pipeline are entirely
+            // outside this number, which is deliberate: this isolates the
+            // one part of the delay this project could actually fix).
+            let capture_to_sent_us =
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |now| {
+                        now.as_micros()
+                            .saturating_sub(u128::from(frame.timestamp_micros))
+                    });
             println!(
-                "probe_state=touch_report_sent phase={:?} pointer_count={}",
+                "probe_state=touch_report_sent phase={:?} pointer_count={} capture_to_sent_us={capture_to_sent_us}",
                 frame.phase,
                 frame.points.len()
             );
