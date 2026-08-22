@@ -55,6 +55,43 @@ pub enum AudioSink {
     Fake,
 }
 
+/// `equalizer-10bands`' own fixed `band0..band9` center frequencies, in Hz
+/// — not this project's choice, and not inferred: confirmed directly
+/// against the real installed element on the reference Pi 5 (`gst-inspect-1.0
+/// equalizer-10bands`, `gstreamer1.0-plugins-good` 1.26.2), whose `bandN`
+/// property descriptions read "gain for the frequency band `<N>` Hz". Used
+/// only for UI labeling (`apps/aa-headunit-diagnostics`'s equalizer page) —
+/// the pipeline itself just sets `band0..band9` by index and never needs to
+/// know the Hz values.
+pub const EQ_BAND_CENTER_FREQUENCIES_HZ: [u32; 10] =
+    [29, 59, 119, 237, 474, 947, 1889, 3770, 7523, 15011];
+
+/// See [`AudioPlaybackPipeline::level_handle`]'s doc comment. `equalizer`/
+/// `volume` are `None` only if the pipeline's own `"eq"`/`"vol"` named
+/// elements were somehow missing at handle-creation time (should not
+/// happen given `AudioPlaybackPipeline::new`'s fixed pipeline
+/// description, but calling `set_eq_band`/`set_volume_percent` on such a
+/// handle is still a safe no-op rather than a panic).
+#[derive(Clone)]
+pub struct AudioLevelHandle {
+    equalizer: Option<gst::Element>,
+    volume: Option<gst::Element>,
+}
+
+impl AudioLevelHandle {
+    pub fn set_eq_band(&self, index: usize, gain_db: f64) {
+        if let Some(equalizer) = &self.equalizer {
+            equalizer.set_property(&format!("band{index}"), gain_db);
+        }
+    }
+
+    pub fn set_volume_percent(&self, percent: u8) {
+        if let Some(volume) = &self.volume {
+            volume.set_property("volume", f64::from(percent) / 100.0);
+        }
+    }
+}
+
 /// A running (or not-yet-started) audio playback pipeline for one AV
 /// sink channel (`MediaAudio`, `SystemAudio`, or `SpeechAudio` — each gets
 /// its own independent instance and its own independent `appsrc`, so the
@@ -87,12 +124,17 @@ impl AudioPlaybackPipeline {
     /// all-flat/empty slice is a no-op — `equalizer-10bands` itself
     /// already defaults every band to `0.0` (unmodified) — so this
     /// argument costs nothing for the (currently only) `Fake`-sink test
-    /// callers that pass `None`.
+    /// callers that pass `None`. `volume_percent` is the same kind of
+    /// fixed snapshot, applied to a plain `GStreamer` `volume` element —
+    /// `0..=100`, `None`/`100` is unity gain (a no-op), deliberately
+    /// capped at `100` (never boosting past the phone's own output
+    /// level) to avoid clipping/distortion.
     pub(crate) fn new(
         format: AudioFormat,
         sink: AudioSink,
         device: Option<&str>,
         eq_bands: Option<&[f64]>,
+        volume_percent: Option<u8>,
     ) -> Result<Self, GstreamerError> {
         let sink_element = match sink {
             AudioSink::Pulse => "pulsesink",
@@ -105,8 +147,8 @@ impl AudioPlaybackPipeline {
         let description = format!(
             "appsrc name=src is-live=true format=time \
              caps=\"audio/x-raw,format=S16LE,rate={},channels={},layout=interleaved\" \
-             ! audioconvert ! equalizer-10bands name=eq ! audioconvert ! audioresample \
-             ! {sink_element}{device_property} sync=false",
+             ! audioconvert ! equalizer-10bands name=eq ! volume name=vol ! audioconvert \
+             ! audioresample ! {sink_element}{device_property} sync=false",
             format.sampling_rate, format.channels,
         );
         let element = gst::parse::launch(&description)
@@ -134,7 +176,31 @@ impl AudioPlaybackPipeline {
                 }
             }
         }
+        if let Some(percent) = volume_percent {
+            if let Some(volume) = pipeline.by_name("vol") {
+                volume.set_property("volume", f64::from(percent) / 100.0);
+            }
+        }
         Ok(Self { pipeline, appsrc })
+    }
+
+    /// A cheap, `Clone`+`Send`+`Sync` handle for live-adjusting this
+    /// pipeline's equalizer/volume from any thread — added 2026-08-21
+    /// once "settings only apply at the next pipeline build" turned out
+    /// to be a worse experience for EQ/volume than for a one-time choice
+    /// like `audio_output_device` (no way to hear the effect while
+    /// actually dragging the slider). `gst::Element` is already
+    /// internally reference-counted and thread-safe for property access
+    /// (a standard, common `GStreamer` usage pattern — apps routinely
+    /// adjust a live element's properties from a UI thread while the
+    /// pipeline plays on its own streaming thread), so this needs no new
+    /// synchronization of its own — just a couple of element clones.
+    #[must_use]
+    pub fn level_handle(&self) -> AudioLevelHandle {
+        AudioLevelHandle {
+            equalizer: self.pipeline.by_name("eq"),
+            volume: self.pipeline.by_name("vol"),
+        }
     }
 
     /// Starts the pipeline (`Playing`). For `AudioSink::Pulse`, this is
@@ -264,7 +330,7 @@ mod tests {
         let backend = GstreamerBackend::new().expect("gstreamer available on this host");
         let format = media_audio_format();
         let pipeline = backend
-            .build_audio_playback_pipeline(format, AudioSink::Fake, None, None)
+            .build_audio_playback_pipeline(format, AudioSink::Fake, None, None, None)
             .expect("pipeline builds");
         pipeline.start().expect("pipeline starts");
 
@@ -287,7 +353,28 @@ mod tests {
         let format = media_audio_format();
         let bands = [6.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -6.0, 9.0];
         let pipeline = backend
-            .build_audio_playback_pipeline(format, AudioSink::Fake, None, Some(&bands))
+            .build_audio_playback_pipeline(format, AudioSink::Fake, None, Some(&bands), None)
+            .expect("pipeline builds");
+        pipeline.start().expect("pipeline starts");
+
+        let frames = synthetic_pcm_frames(format, 5);
+        for (index, frame) in frames.iter().enumerate() {
+            pipeline
+                .push_frame(frame, (index as u64) * 10_000)
+                .expect("frame pushes");
+            assert!(pipeline.poll_bus_error().is_none(), "no pipeline errors");
+        }
+        pipeline.shutdown().expect("clean EOS shutdown");
+    }
+
+    /// Proves `volume_percent` actually reaches the real `volume`
+    /// element, same standard as the equalizer test above.
+    #[test]
+    fn applies_volume_percent_without_pipeline_error() {
+        let backend = GstreamerBackend::new().expect("gstreamer available on this host");
+        let format = media_audio_format();
+        let pipeline = backend
+            .build_audio_playback_pipeline(format, AudioSink::Fake, None, None, Some(40))
             .expect("pipeline builds");
         pipeline.start().expect("pipeline starts");
 

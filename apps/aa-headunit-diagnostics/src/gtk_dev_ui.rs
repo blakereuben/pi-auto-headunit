@@ -56,14 +56,18 @@ use gtk4::{
     Orientation, Overlay, Picture, PolicyType, Scale, ScrolledWindow, SpinButton, glib,
 };
 use media_api::DecoderCapability;
-use media_gstreamer::{GstreamerBackend, GstreamerError, RenderSink, VideoRenderPipeline};
+use media_gstreamer::{
+    EQ_BAND_CENTER_FREQUENCIES_HZ, GstreamerBackend, GstreamerError, RenderSink,
+    VideoRenderPipeline,
+};
 use platform_api::{GestureEvent, GestureId, SharedArmWindow};
 use platform_linux::touch::{Rotation, SharedRotation};
 use transport_api::{AoaIdentification, AoaMachine};
 
 use crate::CliError;
 use crate::auth_discovery_probe::{
-    Gtk4WindowHandoff, SharedPanelVisibility, TouchSettingsHandoff, VideoRenderTarget,
+    Gtk4WindowHandoff, SharedAudioSettings, SharedPanelVisibility, TouchSettingsHandoff,
+    VideoRenderTarget,
 };
 use crate::cancellation::{self, CancellationFlag};
 use crate::connection_state::{self, ConnectionState};
@@ -120,6 +124,7 @@ struct ActivationState {
     handoff: Gtk4WindowHandoff,
     touch_settings: TouchSettingsHandoff,
     panel_visibility: SharedPanelVisibility,
+    audio_settings: Rc<RefCell<SharedAudioSettings>>,
     cancel: CancellationFlag,
     session_result_sender: mpsc::Sender<Result<(), CliError>>,
     capability_receiver: mpsc::Receiver<DecoderCapability>,
@@ -155,6 +160,9 @@ pub(crate) fn run_with_cancel(
     let (arm_window_sender, arm_window_receiver) = mpsc::channel::<SharedArmWindow>();
     let (gesture_sender, gesture_receiver) = mpsc::channel::<GestureEvent>();
     let panel_visibility = SharedPanelVisibility::new(false);
+    let audio_settings: Rc<RefCell<SharedAudioSettings>> =
+        Rc::new(RefCell::new(SharedAudioSettings::new()));
+    let audio_settings_for_handoff = audio_settings.borrow().clone();
 
     let activation_state = RefCell::new(Some(ActivationState {
         selector: selector.to_string(),
@@ -169,8 +177,10 @@ pub(crate) fn run_with_cancel(
             arm_window_sender,
             gesture_sender,
             panel_visibility: panel_visibility.clone(),
+            audio_settings: audio_settings_for_handoff,
         },
         panel_visibility,
+        audio_settings,
         cancel,
         session_result_sender,
         capability_receiver,
@@ -226,6 +236,7 @@ struct SessionPollState {
     picture: Picture,
     settings_panel: SettingsPanel,
     armed_mask: ArmedMask,
+    quick_controls: QuickControlsPopup,
     rotation_handle: Rc<RefCell<Option<SharedRotation>>>,
     current_rotation: Rc<Cell<Rotation>>,
     arm_window_handle: Rc<RefCell<Option<SharedArmWindow>>>,
@@ -426,6 +437,7 @@ fn activate_window(
         handoff,
         touch_settings,
         panel_visibility,
+        audio_settings,
         cancel,
         session_result_sender,
         capability_receiver,
@@ -466,6 +478,7 @@ fn activate_window(
         .connect_visible_notify(move |root| panel_visibility.set(root.is_visible()));
     let armed_mask = build_armed_mask();
     overlay.add_overlay(&armed_mask.root);
+    let quick_controls = build_and_add_quick_controls_popup(&overlay, &gesture_settings);
 
     build_and_wire_experimental_disclaimer(&overlay, &gesture_settings);
 
@@ -476,6 +489,7 @@ fn activate_window(
         .build();
     window.fullscreen();
     window.present();
+    wire_window_close_cancels_session(&window, &cancel);
 
     let rotation_handle: Rc<RefCell<Option<SharedRotation>>> = Rc::new(RefCell::new(None));
     // Loaded from settings, not always `Normal` — M5's persisted
@@ -491,6 +505,7 @@ fn activate_window(
     if current_rotation.get() == Rotation::Flipped180 {
         settings_panel.root.add_css_class("flipped-panel");
         armed_mask.root.add_css_class("flipped-panel");
+        quick_controls.root.add_css_class("flipped-panel");
     }
     let arm_window_handle: Rc<RefCell<Option<SharedArmWindow>>> = Rc::new(RefCell::new(None));
     // The window is created fullscreen above.
@@ -503,8 +518,9 @@ fn activate_window(
         &rotation_handle,
         &current_rotation,
         &arm_window_handle,
-        &is_fullscreen,
         &gesture_settings,
+        &audio_settings,
+        &quick_controls,
     );
 
     SessionPollState {
@@ -513,6 +529,7 @@ fn activate_window(
         picture,
         settings_panel,
         armed_mask,
+        quick_controls,
         rotation_handle,
         current_rotation,
         arm_window_handle,
@@ -554,6 +571,7 @@ fn wire_gesture_poll(
     gesture_receiver: mpsc::Receiver<GestureEvent>,
     settings_panel: SettingsPanel,
     armed_mask: ArmedMask,
+    quick_controls: QuickControlsPopup,
     window: ApplicationWindow,
     rotation_handle: Rc<RefCell<Option<SharedRotation>>>,
     current_rotation: Rc<Cell<Rotation>>,
@@ -573,6 +591,7 @@ fn wire_gesture_poll(
                             action,
                             &settings_panel,
                             &armed_mask,
+                            &quick_controls,
                             &window,
                             &rotation_handle,
                             &current_rotation,
@@ -627,6 +646,77 @@ fn install_hang_safety_net(
     ))))
 }
 
+/// Wires the window's native close button (and any other window-manager
+/// close request) to the same cooperative-cancellation path a real
+/// Ctrl-C already uses ([`CancellationFlag::trigger`]) — real-hardware
+/// finding, 2026-08-22: without this, closing the window let `main()`
+/// return with the detached background protocol thread still alive, and
+/// the OS killed it on process exit without ever running its `Drop`
+/// impls (the USB accessory interface, `LibUsbBulkTransport`'s own
+/// `Drop`), leaving the phone needing a physical unplug/replug before a
+/// freshly-relaunched process could connect again. Returns
+/// `glib::Propagation::Stop` so GTK doesn't destroy the window
+/// immediately — the existing session-result poll's own
+/// `application.quit()` (already reached once the background thread
+/// unwinds from `cancel.is_set()` and reports its result, cleanup
+/// already run by then) is what actually ends the process. Hides the
+/// window right away regardless, so the close feels instant even though
+/// the clean shutdown underneath takes a brief moment longer.
+fn wire_window_close_cancels_session(window: &ApplicationWindow, cancel: &CancellationFlag) {
+    let cancel = cancel.clone();
+    let window_for_hide = window.clone();
+    window.connect_close_request(move |_| {
+        cancel.trigger();
+        window_for_hide.set_visible(false);
+        glib::Propagation::Stop
+    });
+}
+
+/// Applies a real `SharedRotation`/`SharedArmWindow` handle to the running
+/// session the moment each becomes available — mirrors
+/// [`wire_kiosk_handle_polls`] exactly (the `usb kiosk` equivalent), split
+/// out of [`wire_session_polls`] purely to keep it under
+/// `clippy::too_many_lines`.
+fn wire_rotation_and_arm_window_polls(
+    rotation_handle: &Rc<RefCell<Option<SharedRotation>>>,
+    current_rotation: &Rc<Cell<Rotation>>,
+    arm_window_handle: &Rc<RefCell<Option<SharedArmWindow>>>,
+    rotation_receiver: mpsc::Receiver<Option<SharedRotation>>,
+    arm_window_receiver: mpsc::Receiver<SharedArmWindow>,
+) {
+    let rotation_handle_for_poll = Rc::clone(rotation_handle);
+    let current_rotation_for_poll = Rc::clone(current_rotation);
+    let _rotation_poll_id =
+        glib::timeout_add_local(POLL_INTERVAL, move || match rotation_receiver.try_recv() {
+            Ok(handle) => {
+                // Apply the settings-loaded rotation the instant a real
+                // `SharedRotation` becomes available — the touch reader
+                // thread only starts reporting frames through it from
+                // here on, so this is the earliest point a persisted
+                // non-zero rotation can actually take effect.
+                if let Some(handle) = &handle {
+                    handle.set(current_rotation_for_poll.get());
+                }
+                *rotation_handle_for_poll.borrow_mut() = handle;
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        });
+
+    let arm_window_handle_for_poll = Rc::clone(arm_window_handle);
+    let _arm_window_poll_id = glib::timeout_add_local(POLL_INTERVAL, move || {
+        match arm_window_receiver.try_recv() {
+            Ok(handle) => {
+                *arm_window_handle_for_poll.borrow_mut() = Some(handle);
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+}
+
 /// Spawns the background protocol thread and wires every poll bridging it
 /// (and the settings/rotation gesture machinery) back to the GTK main
 /// thread. Extracted from `connect_activate`'s closure purely to keep
@@ -638,6 +728,7 @@ fn wire_session_polls(state: SessionPollState) {
         picture,
         settings_panel,
         armed_mask,
+        quick_controls,
         rotation_handle,
         current_rotation,
         arm_window_handle,
@@ -677,42 +768,19 @@ fn wire_session_polls(state: SessionPollState) {
         }
     });
 
-    let rotation_handle_for_poll = Rc::clone(&rotation_handle);
-    let current_rotation_for_poll = Rc::clone(&current_rotation);
-    let _rotation_poll_id =
-        glib::timeout_add_local(POLL_INTERVAL, move || match rotation_receiver.try_recv() {
-            Ok(handle) => {
-                // Apply the settings-loaded rotation the instant a real
-                // `SharedRotation` becomes available — the touch reader
-                // thread only starts reporting frames through it from
-                // here on, so this is the earliest point a persisted
-                // non-zero rotation can actually take effect.
-                if let Some(handle) = &handle {
-                    handle.set(current_rotation_for_poll.get());
-                }
-                *rotation_handle_for_poll.borrow_mut() = handle;
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        });
-
-    let arm_window_handle_for_poll = Rc::clone(&arm_window_handle);
-    let _arm_window_poll_id = glib::timeout_add_local(POLL_INTERVAL, move || {
-        match arm_window_receiver.try_recv() {
-            Ok(handle) => {
-                *arm_window_handle_for_poll.borrow_mut() = Some(handle);
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        }
-    });
+    wire_rotation_and_arm_window_polls(
+        &rotation_handle,
+        &current_rotation,
+        &arm_window_handle,
+        rotation_receiver,
+        arm_window_receiver,
+    );
 
     let _gesture_poll_id = wire_gesture_poll(
         gesture_receiver,
         settings_panel.clone(),
         armed_mask.clone(),
+        quick_controls.clone(),
         window.clone(),
         Rc::clone(&rotation_handle),
         Rc::clone(&current_rotation),
@@ -768,12 +836,21 @@ struct KioskWindow {
     picture: Picture,
     settings_panel: SettingsPanel,
     armed_mask: ArmedMask,
+    quick_controls: QuickControlsPopup,
     rotation_handle: Rc<RefCell<Option<SharedRotation>>>,
     current_rotation: Rc<Cell<Rotation>>,
     arm_window_handle: Rc<RefCell<Option<SharedArmWindow>>>,
     is_fullscreen: Rc<Cell<bool>>,
     gesture_settings: Rc<RefCell<HeadUnitSettings>>,
     panel_visibility: SharedPanelVisibility,
+    /// Replaced with a fresh [`SharedAudioSettings`] at the top of every
+    /// [`start_kiosk_session`] attempt (old pipeline handles die with the
+    /// session that built them) — the equalizer/volume slider handlers,
+    /// wired once against this same cell in [`wire_settings_panel`],
+    /// always read whichever instance is current, exactly the way
+    /// `rotation_handle`/`arm_window_handle` above already track the
+    /// current session.
+    audio_settings: Rc<RefCell<SharedAudioSettings>>,
 }
 
 /// Builds the fullscreen window, its overlays, and every widget
@@ -785,7 +862,7 @@ struct KioskWindow {
 /// intertwines this with per-session channel setup in a way that can't
 /// be split without changing its own still-correct behavior for
 /// [`run`]/[`run_with_cancel`].
-fn build_kiosk_window(application: &Application) -> KioskWindow {
+fn build_kiosk_window(application: &Application, cancel: &CancellationFlag) -> KioskWindow {
     let gesture_settings: Rc<RefCell<HeadUnitSettings>> = Rc::new(RefCell::new(
         HeadUnitSettings::load(Path::new(DEFAULT_SETTINGS_PATH)),
     ));
@@ -810,6 +887,7 @@ fn build_kiosk_window(application: &Application) -> KioskWindow {
         .connect_visible_notify(move |root| panel_visibility_for_notify.set(root.is_visible()));
     let armed_mask = build_armed_mask();
     overlay.add_overlay(&armed_mask.root);
+    let quick_controls = build_and_add_quick_controls_popup(&overlay, &gesture_settings);
 
     build_and_wire_experimental_disclaimer(&overlay, &gesture_settings);
 
@@ -820,6 +898,7 @@ fn build_kiosk_window(application: &Application) -> KioskWindow {
         .build();
     window.fullscreen();
     window.present();
+    wire_window_close_cancels_session(&window, cancel);
 
     let rotation_handle: Rc<RefCell<Option<SharedRotation>>> = Rc::new(RefCell::new(None));
     let current_rotation: Rc<Cell<Rotation>> =
@@ -830,9 +909,12 @@ fn build_kiosk_window(application: &Application) -> KioskWindow {
     if current_rotation.get() == Rotation::Flipped180 {
         settings_panel.root.add_css_class("flipped-panel");
         armed_mask.root.add_css_class("flipped-panel");
+        quick_controls.root.add_css_class("flipped-panel");
     }
     let arm_window_handle: Rc<RefCell<Option<SharedArmWindow>>> = Rc::new(RefCell::new(None));
     let is_fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+    let audio_settings: Rc<RefCell<SharedAudioSettings>> =
+        Rc::new(RefCell::new(SharedAudioSettings::new()));
 
     wire_settings_panel(
         &settings_panel,
@@ -841,8 +923,9 @@ fn build_kiosk_window(application: &Application) -> KioskWindow {
         &rotation_handle,
         &current_rotation,
         &arm_window_handle,
-        &is_fullscreen,
         &gesture_settings,
+        &audio_settings,
+        &quick_controls,
     );
 
     KioskWindow {
@@ -851,12 +934,14 @@ fn build_kiosk_window(application: &Application) -> KioskWindow {
         picture,
         settings_panel,
         armed_mask,
+        quick_controls,
         rotation_handle,
         current_rotation,
         arm_window_handle,
         is_fullscreen,
         gesture_settings,
         panel_visibility,
+        audio_settings,
     }
 }
 
@@ -892,31 +977,93 @@ fn find_kiosk_candidate_device()
     Ok(None)
 }
 
-/// The kiosk background thread's full body for one attempt: poll for a
-/// candidate device, then run one `AAP` session against it. Combines what
-/// used to be `usb_kiosk`'s own discovery loop (`main.rs`) with
-/// `run_session` — moved here so the whole reconnect loop lives on one
-/// background thread per attempt instead of a synchronous loop in
-/// `main.rs` that used to rebuild the GTK window every cycle.
-fn discover_and_run_kiosk_session(
-    tls12_compatibility: bool,
-    handoff: Gtk4WindowHandoff,
-    touch_settings: TouchSettingsHandoff,
-    cancel: &CancellationFlag,
-) -> Result<(), CliError> {
-    let selector = loop {
+/// Best-effort software USB port reset
+/// (`transport_usb::LibUsbAoaBackend::soft_reset`, real-hardware-confirmed
+/// effective elsewhere in this project — `session_supervisor.rs`'s own
+/// `resolve_device`) on `device` — called only for the very first
+/// connection attempt of a freshly (re)started `usb kiosk` process, never
+/// on an ordinary reconnect within an already-running process's own loop
+/// (`discover_and_run_kiosk_session`'s `reset_before_attempt` parameter).
+/// Real-hardware finding, 2026-08-22: closing the app window and
+/// relaunching left the phone in its prior session's protocol state
+/// (still expecting encrypted post-handshake traffic), which made the
+/// very next handshake attempt fail (`encrypted frame received before
+/// TLS handshake completed` / `unexpected control message VersionResponse
+/// in state TlsHandshake`), repeatedly, until the phone's own internal
+/// timeout eventually expired on its own — observed directly ranging from
+/// roughly 15 seconds to well over two minutes, not a fixed or bounded
+/// delay, and indistinguishable from a genuine hang to an operator
+/// watching a black screen. A software reset here forces the same kind of
+/// fresh USB re-enumeration a physical unplug/replug already reliably
+/// fixes, without needing one. Failure is logged, not propagated —
+/// `discover_and_run_kiosk_session`'s own retry loop already covers a
+/// reset that didn't help.
+fn reset_stale_kiosk_device(device: &transport_api::UsbDeviceId) {
+    match transport_usb::LibUsbAoaBackend::new() {
+        Ok(backend) => match backend.soft_reset(device) {
+            Ok(outcome) => println!("probe_state=kiosk_startup_soft_reset outcome={outcome:?}"),
+            Err(error) => println!("probe_state=kiosk_startup_soft_reset_failed error={error}"),
+        },
+        Err(error) => {
+            println!("probe_state=kiosk_startup_soft_reset_backend_failed error={error}");
+        }
+    }
+}
+
+/// Polls for a candidate device, exactly as `discover_and_run_kiosk_session`
+/// always has — split out so it can be called a second time, after a
+/// [`reset_stale_kiosk_device`] reset, to (re)discover the device instead
+/// of reusing a `bus:address` a re-enumerating reset may have just made
+/// stale (see [`transport_usb::SoftResetOutcome::Reenumerated`]'s own doc
+/// comment). `None` only on cancellation.
+fn discover_kiosk_candidate(cancel: &CancellationFlag) -> Option<transport_api::UsbDeviceId> {
+    loop {
         if cancel.is_set() {
-            return Ok(());
+            return None;
         }
         match find_kiosk_candidate_device() {
-            Ok(Some(device)) => break format!("{}:{}", device.bus, device.address),
+            Ok(Some(device)) => return Some(device),
             Ok(None) => thread::sleep(KIOSK_DISCOVERY_POLL_INTERVAL),
             Err(error) => {
                 println!("probe_state=kiosk_discovery_failed error={error}");
                 thread::sleep(KIOSK_DISCOVERY_POLL_INTERVAL);
             }
         }
+    }
+}
+
+/// The kiosk background thread's full body for one attempt: poll for a
+/// candidate device, then run one `AAP` session against it. Combines what
+/// used to be `usb_kiosk`'s own discovery loop (`main.rs`) with
+/// `run_session` — moved here so the whole reconnect loop lives on one
+/// background thread per attempt instead of a synchronous loop in
+/// `main.rs` that used to rebuild the GTK window every cycle.
+/// `reset_before_attempt` gates [`reset_stale_kiosk_device`] — `true` only
+/// for the first attempt of a freshly (re)started process (see
+/// [`start_kiosk_session`]'s `is_first_attempt`), `false` for every
+/// ordinary reconnect thereafter, which needs no reset since it isn't
+/// recovering from an operator-driven restart. When it does reset,
+/// re-discovers the device afterward rather than reusing the pre-reset
+/// `bus:address` — a reset that re-enumerates the device changes its
+/// address, and dialing the stale one would just fail again.
+fn discover_and_run_kiosk_session(
+    tls12_compatibility: bool,
+    handoff: Gtk4WindowHandoff,
+    touch_settings: TouchSettingsHandoff,
+    cancel: &CancellationFlag,
+    reset_before_attempt: bool,
+) -> Result<(), CliError> {
+    let Some(mut device) = discover_kiosk_candidate(cancel) else {
+        return Ok(());
     };
+    if reset_before_attempt {
+        reset_stale_kiosk_device(&device);
+        let Some(post_reset_device) = discover_kiosk_candidate(cancel) else {
+            return Ok(());
+        };
+        device = post_reset_device;
+    }
+    let selector = format!("{}:{}", device.bus, device.address);
     println!("probe_state=kiosk_device_selected selector={selector}");
     run_session(
         &selector,
@@ -1006,6 +1153,7 @@ fn end_kiosk_attempt(
         .set_paintable(Option::<&gtk4::gdk::Paintable>::None);
     *window.rotation_handle.borrow_mut() = None;
     *window.arm_window_handle.borrow_mut() = None;
+    *window.audio_settings.borrow_mut() = SharedAudioSettings::new();
 
     if cancel.is_set() {
         *final_result.borrow_mut() = Some(result);
@@ -1020,6 +1168,7 @@ fn end_kiosk_attempt(
             hang_safety_net_seconds,
             &cancel,
             &final_result,
+            false,
         );
         glib::ControlFlow::Break
     });
@@ -1074,12 +1223,18 @@ fn wire_kiosk_handle_polls(
     });
 }
 
+/// `is_first_attempt` is `true` only when called from [`run_kiosk`]'s own
+/// `connect_activate` (the very first attempt of a freshly (re)started
+/// process) — see [`reset_stale_kiosk_device`]'s doc comment for why that
+/// specific transition, and only that one, resets the device first.
+/// [`end_kiosk_attempt`]'s own reconnect call always passes `false`.
 fn start_kiosk_session(
     window: &Rc<KioskWindow>,
     tls12_compatibility: bool,
     hang_safety_net_seconds: u32,
     cancel: &CancellationFlag,
     final_result: &Rc<RefCell<Option<Result<(), CliError>>>>,
+    is_first_attempt: bool,
 ) {
     let (capability_sender, capability_receiver) = mpsc::channel::<DecoderCapability>();
     let (pipeline_sender, pipeline_receiver) = mpsc::channel();
@@ -1087,6 +1242,9 @@ fn start_kiosk_session(
     let (rotation_sender, rotation_receiver) = mpsc::channel::<Option<SharedRotation>>();
     let (arm_window_sender, arm_window_receiver) = mpsc::channel::<SharedArmWindow>();
     let (gesture_sender, gesture_receiver) = mpsc::channel::<GestureEvent>();
+
+    let fresh_audio_settings = SharedAudioSettings::new();
+    *window.audio_settings.borrow_mut() = fresh_audio_settings.clone();
 
     let handoff = Gtk4WindowHandoff {
         capability_sender,
@@ -1097,6 +1255,7 @@ fn start_kiosk_session(
         arm_window_sender,
         gesture_sender,
         panel_visibility: window.panel_visibility.clone(),
+        audio_settings: fresh_audio_settings,
     };
 
     let attempt_ended = Rc::new(Cell::new(false));
@@ -1132,6 +1291,7 @@ fn start_kiosk_session(
         gesture_receiver,
         window.settings_panel.clone(),
         window.armed_mask.clone(),
+        window.quick_controls.clone(),
         window.window.clone(),
         Rc::clone(&window.rotation_handle),
         Rc::clone(&window.current_rotation),
@@ -1146,6 +1306,7 @@ fn start_kiosk_session(
             handoff,
             touch_settings,
             &cancel_for_thread,
+            is_first_attempt,
         );
         let _ = session_result_sender.send(result);
     });
@@ -1233,13 +1394,14 @@ pub(crate) fn run_kiosk(
         if already_started.replace(true) {
             return;
         }
-        let window = Rc::new(build_kiosk_window(application));
+        let window = Rc::new(build_kiosk_window(application, &cancel_for_activate));
         start_kiosk_session(
             &window,
             tls12_compatibility,
             hang_safety_net_seconds,
             &cancel_for_activate,
             &final_result_for_activate,
+            true,
         );
     });
 
@@ -1353,6 +1515,15 @@ struct SettingsPanel {
     /// One `Scale` per `equalizer-10bands` band, in `band0..band9` order —
     /// see `build_equalizer_page`'s doc comment.
     eq_scales: Rc<Vec<Scale>>,
+    legal_page: GtkBox,
+    legal_button: Button,
+    legal_back_button: Button,
+    legal_read_accepted_check: CheckButton,
+    legal_hide_check: CheckButton,
+    /// The "⋮" button on the top-level menu that un-hides
+    /// [`SettingsPage::Legal`] again — see [`build_legal_page`]'s doc
+    /// comment.
+    legal_unhide_button: Button,
     stub_pages: Rc<Vec<StubPage>>,
     rotation_label: Label,
     gesture_selectors: Rc<GestureSelectors>,
@@ -1366,12 +1537,21 @@ struct SettingsPanel {
     /// was never paused by the settings panel being open in the first
     /// place, so this is a pure navigation change — nothing to restart.
     android_auto_button: Button,
-    toggle_fullscreen_button: Button,
+    /// The "Desktop" entry in the top-level settings menu grid, right next
+    /// to "Android Auto" — real-hardware feedback, 2026-08-22: the
+    /// previous "Return to desktop" fullscreen-toggle button left AA still
+    /// visible in a windowed view, which didn't read as "minimized." This
+    /// calls `ApplicationWindow::minimize()` for a true minimize instead,
+    /// and never touches `is_fullscreen` — restoring the window later
+    /// returns to whichever fullscreen/windowed state it truly had, the
+    /// same way any other minimized GTK window behaves.
+    desktop_button: Button,
     flip_screen_button: Button,
     arm_timeout_spin: SpinButton,
     mtp_suppression_check: CheckButton,
     launch_on_boot_check: CheckButton,
     brightness_scale: Scale,
+    volume_scale: Scale,
     audio_output_dropdown: DropDown,
     audio_output_devices: Rc<Vec<String>>,
     microphone_input_dropdown: DropDown,
@@ -1401,6 +1581,9 @@ fn show_settings_page(settings_panel: &SettingsPanel, page: SettingsPage) {
     settings_panel
         .equalizer_page
         .set_visible(page == SettingsPage::Equalizer);
+    settings_panel
+        .legal_page
+        .set_visible(page == SettingsPage::Legal);
     for stub in settings_panel.stub_pages.iter() {
         stub.root.set_visible(stub.page == page);
     }
@@ -1431,6 +1614,164 @@ fn build_armed_mask() -> ArmedMask {
     label.set_vexpand(true);
     root.append(&label);
     ArmedMask { root }
+}
+
+/// How long the quick-controls popup ([`QuickControlsPopup`], default
+/// gesture: long press — [`crate::settings::Action::QuickControls`]) stays
+/// visible after the last slider drag or after opening before auto-hiding
+/// — a glance-and-go HUD, not a page the operator navigates away from, the
+/// same way a car's own volume/brightness popup behaves. Reset on every
+/// slider tick as well as on open, so an active drag is never cut off
+/// mid-adjustment; the popup's own `close_button` dismisses it immediately
+/// regardless.
+const QUICK_CONTROLS_AUTO_HIDE: Duration = Duration::from_secs(4);
+
+/// A full-width "brightness & volume" popup docked to the bottom of the
+/// screen, shown only while [`crate::settings::Action::QuickControls`] is
+/// active (default gesture: long press — Blake's explicit request,
+/// 2026-08-22: these two controls reachable without opening the full
+/// settings panel, and *only* by that gesture). Full-width
+/// (`halign`/`hexpand` on `root` itself) rather than content-sized and
+/// centered — real-hardware feedback, 2026-08-22: the original
+/// content-sized version was "far too small." Deliberately not part of
+/// [`SettingsPanel`]: docked to the bottom edge, not covering the whole
+/// screen, auto-hides itself ([`QUICK_CONTROLS_AUTO_HIDE`]), and has
+/// its own independent `brightness_scale`/`volume_scale` — not the
+/// Display page's — so opening this popup never depends on the settings
+/// panel being open at all. Both scales reuse the exact same live-apply
+/// paths as the Display page's own sliders
+/// ([`wire_brightness_scale`]/[`wire_volume_slider`]), so a level changed
+/// here and a level changed on the Display page are both real, immediate,
+/// audible/visible changes — just to two independently-initialized
+/// widgets (like every other pair of settings widgets in this file, only
+/// the value each was *built* with reflects the latest save; this is an
+/// existing limitation, not one introduced here).
+#[derive(Clone)]
+struct QuickControlsPopup {
+    root: GtkBox,
+    brightness_scale: Scale,
+    volume_scale: Scale,
+    close_button: Button,
+    auto_hide_timer: Rc<Cell<Option<glib::SourceId>>>,
+}
+
+fn build_quick_controls_popup(
+    initial_display_brightness_percent: u8,
+    initial_volume_percent: u8,
+) -> QuickControlsPopup {
+    let root = GtkBox::new(Orientation::Vertical, 8);
+    // Full screen width (real-hardware feedback, 2026-08-22: the original
+    // content-sized-and-centered popup was "far too small") — `Fill`
+    // + `hexpand` on `root` itself, not just its children, since a
+    // `GtkBox` child of an `Overlay` doesn't stretch on its own.
+    root.set_halign(gtk4::Align::Fill);
+    root.set_hexpand(true);
+    root.set_valign(gtk4::Align::End);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+    root.set_margin_top(12);
+    root.set_margin_bottom(48);
+    root.add_css_class("background");
+    root.set_visible(false);
+
+    let title = Label::new(Some("Brightness & volume"));
+    root.append(&title);
+
+    let brightness_row = GtkBox::new(Orientation::Horizontal, 8);
+    brightness_row.set_hexpand(true);
+    let brightness_label = Label::new(Some("Brightness"));
+    let brightness_scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+    brightness_scale.set_hexpand(true);
+    brightness_scale.set_value(f64::from(initial_display_brightness_percent));
+    brightness_row.append(&brightness_label);
+    brightness_row.append(&brightness_scale);
+    root.append(&brightness_row);
+
+    let volume_row = GtkBox::new(Orientation::Horizontal, 8);
+    volume_row.set_hexpand(true);
+    let volume_label = Label::new(Some("Volume"));
+    let volume_scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+    volume_scale.set_hexpand(true);
+    volume_scale.set_value(f64::from(initial_volume_percent));
+    volume_row.append(&volume_label);
+    volume_row.append(&volume_scale);
+    root.append(&volume_row);
+
+    let close_button = Button::with_label("Close");
+    root.append(&close_button);
+
+    QuickControlsPopup {
+        root,
+        brightness_scale,
+        volume_scale,
+        close_button,
+        auto_hide_timer: Rc::new(Cell::new(None)),
+    }
+}
+
+/// Builds a [`QuickControlsPopup`] seeded from the current persisted
+/// brightness/volume and adds it to `overlay` — shared by
+/// [`activate_window`] and [`build_kiosk_window`] purely to keep both
+/// under `clippy::too_many_lines`.
+fn build_and_add_quick_controls_popup(
+    overlay: &Overlay,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) -> QuickControlsPopup {
+    let quick_controls = build_quick_controls_popup(
+        gesture_settings.borrow().display_brightness_percent(),
+        gesture_settings.borrow().volume_percent(),
+    );
+    overlay.add_overlay(&quick_controls.root);
+    quick_controls
+}
+
+/// Cancels any pending auto-hide and starts a fresh [`QUICK_CONTROLS_AUTO_HIDE`]
+/// countdown — called both when the popup opens and on every slider tick,
+/// so an active drag is never cut off mid-adjustment.
+fn reset_quick_controls_auto_hide(popup: &QuickControlsPopup) {
+    if let Some(source_id) = popup.auto_hide_timer.take() {
+        source_id.remove();
+    }
+    let root = popup.root.clone();
+    let timer = Rc::clone(&popup.auto_hide_timer);
+    let source_id = glib::timeout_add_local(QUICK_CONTROLS_AUTO_HIDE, move || {
+        root.set_visible(false);
+        timer.set(None);
+        glib::ControlFlow::Break
+    });
+    popup.auto_hide_timer.set(Some(source_id));
+}
+
+/// Wires the quick-controls popup's two sliders (live-apply/persist, via
+/// [`wire_brightness_scale`]/[`wire_volume_slider`]) plus its own
+/// auto-hide/close behavior. Split out of [`wire_settings_panel`] purely
+/// for readability at the call site — this popup is independent of the
+/// settings panel itself.
+fn wire_quick_controls_popup(
+    popup: &QuickControlsPopup,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+    audio_settings: &Rc<RefCell<SharedAudioSettings>>,
+) {
+    wire_brightness_scale(&popup.brightness_scale, gesture_settings);
+    wire_volume_slider(&popup.volume_scale, gesture_settings, audio_settings);
+
+    let popup_for_brightness = popup.clone();
+    popup
+        .brightness_scale
+        .connect_value_changed(move |_| reset_quick_controls_auto_hide(&popup_for_brightness));
+    let popup_for_volume = popup.clone();
+    popup
+        .volume_scale
+        .connect_value_changed(move |_| reset_quick_controls_auto_hide(&popup_for_volume));
+
+    let root_for_close = popup.root.clone();
+    let timer_for_close = Rc::clone(&popup.auto_hide_timer);
+    popup.close_button.connect_clicked(move |_| {
+        if let Some(source_id) = timer_for_close.take() {
+            source_id.remove();
+        }
+        root_for_close.set_visible(false);
+    });
 }
 
 /// Shown on the boot popup itself — deliberately short (`RISK_REGISTER.md`
@@ -1489,35 +1830,48 @@ struct ExperimentalDisclaimer {
 }
 
 fn build_experimental_disclaimer() -> ExperimentalDisclaimer {
-    let root = GtkBox::new(Orientation::Vertical, 16);
+    // `root` is what actually paints the opaque `.background` covering
+    // the video underneath — real-hardware finding (2026-08-21): a
+    // margin directly on it insets that opaque paint from the window's
+    // real edges, leaving a border-width strip all the way around where
+    // the live AA video still showed through underneath (same bug found
+    // on the settings panel the same session — see
+    // `build_settings_scroller`'s doc comment). `content` holds the
+    // actual margin instead, so `root` stays edge-to-edge opaque no
+    // matter what.
+    let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_halign(gtk4::Align::Fill);
     root.set_valign(gtk4::Align::Fill);
     root.set_hexpand(true);
     root.set_vexpand(true);
     root.set_visible(false);
     root.add_css_class("background");
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
+
+    let content = GtkBox::new(Orientation::Vertical, 16);
+    content.set_vexpand(true);
+    content.set_margin_top(24);
+    content.set_margin_bottom(24);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+    root.append(&content);
 
     let title = Label::new(Some("Experimental Software — Use At Your Own Risk"));
     title.set_halign(gtk4::Align::Center);
-    root.append(&title);
+    content.append(&title);
 
     let body = Label::new(Some(EXPERIMENTAL_DISCLAIMER_SUMMARY_TEXT));
     body.set_wrap(true);
     body.set_justify(gtk4::Justification::Center);
     body.set_vexpand(true);
     body.set_valign(gtk4::Align::Center);
-    root.append(&body);
+    content.append(&body);
 
     let dont_show_again_check = CheckButton::with_label("Don't show this again");
     dont_show_again_check.set_halign(gtk4::Align::Center);
-    root.append(&dont_show_again_check);
+    content.append(&dont_show_again_check);
 
     let agree_button = Button::with_label("I Agree");
-    root.append(&agree_button);
+    content.append(&agree_button);
 
     ExperimentalDisclaimer {
         root,
@@ -1635,20 +1989,46 @@ const SCROLL_DRAG_MIN_TOTAL_PIXELS: f64 = 24.0;
 /// longer stuck at all, while a genuine vertical scroll (logged during
 /// the same trial at offsets like `(-6, -48)`, clearly vertical from the
 /// start) still claimed correctly.
+/// A drag whose *starting point* lands on a `Scale` (or one of its
+/// internal child widgets — GTK4 renders a `Scale`'s trough/slider as
+/// separate nodes under the same widget) is never this gesture's to
+/// claim, regardless of direction — added 2026-08-21 real-hardware
+/// feedback ("i want vertical sliders" for the equalizer, after the
+/// direction-based heuristic below was found to make *any* vertical
+/// slider indistinguishable from a scroll). Checked once, at
+/// `drag_begin`, via `Widget::pick`/`ancestor` — a real widget-identity
+/// check, not another direction heuristic to out-guess.
+fn drag_started_on_a_scale(scroller: &ScrolledWindow, x: f64, y: f64) -> bool {
+    scroller
+        .pick(x, y, gtk4::PickFlags::DEFAULT)
+        .is_some_and(|hit| hit.is::<Scale>() || hit.ancestor(Scale::static_type()).is_some())
+}
+
 fn enable_touch_drag_scroll(scroller: &ScrolledWindow) {
     let drag = gtk4::GestureDrag::new();
     drag.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let vadjustment = scroller.vadjustment();
     let start_value = Rc::new(Cell::new(0.0_f64));
+    let started_on_scale = Rc::new(Cell::new(false));
 
     let vadjustment_for_begin = vadjustment.clone();
     let start_value_for_begin = Rc::clone(&start_value);
-    drag.connect_drag_begin(move |_, _, _| {
+    let started_on_scale_for_begin = Rc::clone(&started_on_scale);
+    let scroller_for_begin = scroller.clone();
+    drag.connect_drag_begin(move |_, x, y| {
         start_value_for_begin.set(vadjustment_for_begin.value());
+        started_on_scale_for_begin.set(drag_started_on_a_scale(&scroller_for_begin, x, y));
     });
 
     let start_value_for_update = Rc::clone(&start_value);
     drag.connect_drag_update(move |gesture, offset_x, offset_y| {
+        // A drag that started on a slider is never scroll-claimed and
+        // never adjusts `vadjustment` either — otherwise the page would
+        // visibly scroll out from under a legitimate vertical slider
+        // drag even while the drag itself correctly reaches the `Scale`.
+        if started_on_scale.get() {
+            return;
+        }
         let total = offset_x.hypot(offset_y);
         if offset_y.abs() > SCROLL_DRAG_CLAIM_THRESHOLD_PIXELS
             && total > SCROLL_DRAG_MIN_TOTAL_PIXELS
@@ -1793,26 +2173,27 @@ fn selected_device(dropdown: &DropDown, devices: &[String]) -> Option<String> {
 
 /// Builds the brightness slider and the two audio-device dropdowns and
 /// appends them to the Display page — split out of `build_settings_panel`
-/// purely to keep it under `clippy::too_many_lines`. None of the three
-/// live-apply: brightness takes effect the next time the screen is
-/// turned off/on (no live-brightness-while-lit handle exists the way
-/// rotation/arm-timeout have `SharedRotation`/`SharedArmWindow` — building
-/// one would mean a new shared channel threaded through
-/// `Gtk4WindowHandoff` purely for this, not justified yet for a setting
-/// that already takes effect on the very next natural screen-power
-/// event), and a device change only takes effect the next time its
+/// purely to keep it under `clippy::too_many_lines`. Brightness (via
+/// [`wire_brightness_scale`]) and volume (via [`wire_volume_slider`]) both
+/// live-apply on every tick, in addition to their debounced persist — see
+/// those functions' own doc comments. The two device dropdowns still
+/// don't live-apply: a device change only takes effect the next time its
 /// pipeline (re)starts (a fresh session, or a channel `Start`
 /// reconfiguration), matching every other pipeline construction
 /// parameter in this project (format, codec, ...), none of which are
-/// hot-swappable mid-stream.
+/// hot-swappable mid-stream — and, unlike brightness/volume, a device
+/// dropdown has no meaningful "preview" concept to live-apply anyway.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn build_media_settings_controls(
     display_page: &GtkBox,
     initial_display_brightness_percent: u8,
+    initial_volume_percent: u8,
     initial_audio_output_device: Option<&str>,
     initial_microphone_input_device: Option<&str>,
     initial_night_mode_gpio_line: Option<u32>,
 ) -> (
+    Scale,
     Scale,
     DropDown,
     Vec<String>,
@@ -1834,6 +2215,23 @@ fn build_media_settings_controls(
     brightness_row.append(&brightness_label);
     brightness_row.append(&brightness_scale);
     display_page.append(&brightness_row);
+
+    // Horizontal, same reasoning as the equalizer sliders — matches the
+    // brightness slider's already-proven orientation so the panel's own
+    // scroll-claim gesture never mistakes a drag on it for a page scroll.
+    let volume_row = GtkBox::new(Orientation::Horizontal, 8);
+    let volume_label = Label::new(Some("Volume (%)"));
+    let volume_scale = Scale::with_range(
+        Orientation::Horizontal,
+        f64::from(crate::settings::MIN_VOLUME_PERCENT),
+        f64::from(crate::settings::MAX_VOLUME_PERCENT),
+        1.0,
+    );
+    volume_scale.set_hexpand(true);
+    volume_scale.set_value(f64::from(initial_volume_percent));
+    volume_row.append(&volume_label);
+    volume_row.append(&volume_scale);
+    display_page.append(&volume_row);
 
     let audio_output_devices = list_pulse_devices("sinks");
     let audio_output_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -1876,6 +2274,7 @@ fn build_media_settings_controls(
 
     (
         brightness_scale,
+        volume_scale,
         audio_output_dropdown,
         audio_output_devices,
         microphone_input_dropdown,
@@ -1933,33 +2332,66 @@ fn build_stub_page(page: SettingsPage) -> StubPage {
     }
 }
 
+/// Everything [`build_legal_page`] builds.
+struct LegalPageBuild {
+    page: GtkBox,
+    open_button: Button,
+    back_button: Button,
+    read_accepted_check: CheckButton,
+    hide_check: CheckButton,
+}
+
 /// The detailed, always-reachable counterpart to the boot-time
 /// disclaimer popup — see [`LEGAL_PAGE_DETAILED_TEXT`] for what it says
-/// and why. Reuses [`StubPage`]'s shape (it's the same
-/// title/content/Back layout, just with real content instead of "Coming
-/// soon.") rather than inventing a near-identical struct.
-fn build_legal_page() -> StubPage {
-    let root = GtkBox::new(Orientation::Vertical, 8);
-    root.set_visible(false);
+/// and why. Two checkboxes, deliberately ordered/gated (2026-08-21,
+/// Blake's explicit request): "I have read and accept this"
+/// (`read_accepted_check`, backed by the same
+/// `HeadUnitSettings::experimental_disclaimer_dismissed` flag the boot
+/// popup's own "don't show this again" checkbox uses — checking either
+/// one counts as agreeing) must be checked before "Hide this page from
+/// the menu" (`hide_check`) can be — `wire_legal_page` disables
+/// `hide_check` until then. Checking `hide_check` is what actually
+/// removes this page's button from the top-level menu grid and returns
+/// to it; a small "⋮" button there brings it back
+/// (`build_menu_page`/`wire_legal_unhide_button`).
+fn build_legal_page(initial_read_accepted: bool, initial_hidden: bool) -> LegalPageBuild {
+    let page = GtkBox::new(Orientation::Vertical, 8);
+    page.set_visible(false);
 
     let title = Label::new(Some(SettingsPage::Legal.label()));
-    root.append(&title);
+    page.append(&title);
 
     let body = Label::new(Some(LEGAL_PAGE_DETAILED_TEXT));
     body.set_wrap(true);
-    root.append(&body);
+    page.append(&body);
+
+    let read_accepted_check = CheckButton::with_label("I have read and accept this");
+    read_accepted_check.set_active(initial_read_accepted);
+    page.append(&read_accepted_check);
+
+    let hide_check = CheckButton::with_label("Hide this page from the menu");
+    hide_check.set_sensitive(initial_read_accepted);
+    hide_check.set_active(initial_hidden);
+    page.append(&hide_check);
 
     let back_button = Button::with_label("Back");
-    root.append(&back_button);
+    page.append(&back_button);
 
     let open_button = Button::with_label(SettingsPage::Legal.label());
     open_button.set_hexpand(true);
+    // Starts hidden from the menu grid if the operator already hid it;
+    // `wire_legal_page`/its "⋮" unhide button toggle this live
+    // afterward. Stays in the grid either way (an empty cell when
+    // hidden) rather than being removed, so the grid layout never has
+    // to be rebuilt.
+    open_button.set_visible(!initial_hidden);
 
-    StubPage {
-        page: SettingsPage::Legal,
-        root,
+    LegalPageBuild {
+        page,
         open_button,
         back_button,
+        read_accepted_check,
+        hide_check,
     }
 }
 
@@ -2031,6 +2463,7 @@ struct DisplayPageBuild {
     mtp_suppression_check: CheckButton,
     launch_on_boot_check: CheckButton,
     brightness_scale: Scale,
+    volume_scale: Scale,
     audio_output_dropdown: DropDown,
     audio_output_devices: Vec<String>,
     microphone_input_dropdown: DropDown,
@@ -2047,6 +2480,7 @@ fn build_display_page(
     initial_mtp_popup_suppression_enabled: bool,
     initial_launch_on_boot: bool,
     initial_display_brightness_percent: u8,
+    initial_volume_percent: u8,
     initial_audio_output_device: Option<&str>,
     initial_microphone_input_device: Option<&str>,
     initial_night_mode_gpio_line: Option<u32>,
@@ -2093,6 +2527,7 @@ fn build_display_page(
 
     let (
         brightness_scale,
+        volume_scale,
         audio_output_dropdown,
         audio_output_devices,
         microphone_input_dropdown,
@@ -2102,6 +2537,7 @@ fn build_display_page(
     ) = build_media_settings_controls(
         &page,
         initial_display_brightness_percent,
+        initial_volume_percent,
         initial_audio_output_device,
         initial_microphone_input_device,
         initial_night_mode_gpio_line,
@@ -2123,6 +2559,7 @@ fn build_display_page(
         mtp_suppression_check,
         launch_on_boot_check,
         brightness_scale,
+        volume_scale,
         audio_output_dropdown,
         audio_output_devices,
         microphone_input_dropdown,
@@ -2143,19 +2580,40 @@ struct EqualizerPageBuild {
     band_scales: Vec<Scale>,
 }
 
-/// Builds the Equalizer page: one vertical `Scale` per
+/// Formats one `equalizer-10bands` band's center frequency for its
+/// slider's label — e.g. `29 Hz`, `947 Hz`, `1.9 kHz`. Replaced the
+/// previous generic "Band 1".."Band 10" labels (real-hardware feedback,
+/// 2026-08-22: the operator could hear the equalizer working but had no
+/// way to tell which slider controlled which part of the sound) —
+/// `EQ_BAND_CENTER_FREQUENCIES_HZ`'s own doc comment records how these
+/// values were confirmed, not assumed.
+fn eq_band_frequency_label(hz: u32) -> String {
+    if hz >= 1000 {
+        format!("{:.1} kHz", f64::from(hz) / 1000.0)
+    } else {
+        format!("{hz} Hz")
+    }
+}
+
+/// Builds the Equalizer page: one vertical fader-style `Scale` per
 /// `equalizer-10bands` band (extras roadmap, 2026-08-21 — see
-/// `crates/media-gstreamer/src/audio.rs`'s matching pipeline change).
-/// Labeled generically ("Band 1".."Band 10", lowest to highest
-/// frequency) rather than asserting specific center-frequency numbers
-/// this project hasn't confirmed against a pinned `GStreamer` source —
-/// same evidentiary standard this project applies to the AAP protocol
-/// itself, just applied to a dependency's own documented behavior
-/// instead. Settings persist immediately (debounced, matching the
-/// brightness slider) but do not live-apply to an already-running
-/// session — see `HeadUnitSettings::eq_bands`'s doc comment for why
-/// that's a deliberate, already-established precedent for audio
-/// settings, not a shortcut taken here.
+/// `crates/media-gstreamer/src/audio.rs`'s matching pipeline change),
+/// labeled with that band's real center frequency
+/// ([`eq_band_frequency_label`]). Settings persist immediately
+/// (debounced, matching the brightness slider) and, since 2026-08-21,
+/// also live-apply to every currently-registered audio pipeline — see
+/// [`wire_equalizer_sliders`]'s doc comment.
+///
+/// **Vertical, real-hardware feedback (2026-08-21) both ways**: an
+/// earlier version of this page used horizontal sliders specifically to
+/// dodge a real bug (the settings panel's own scroll-claim gesture
+/// stealing a vertical drag — see `enable_touch_drag_scroll`'s doc
+/// comment for the mechanism). The operator asked for vertical faders
+/// back regardless, so the fix moved there instead: `enable_touch_drag_scroll`
+/// now exempts any drag that starts on a `Scale` from the scroll claim
+/// entirely (by widget identity via `Widget::pick`/`ancestor`, not
+/// direction), so orientation is a free styling choice again rather than
+/// something that has to dodge the panel's own gesture handling.
 fn build_equalizer_page(
     initial_eq_bands: [f64; crate::settings::EQ_BAND_COUNT],
 ) -> EqualizerPageBuild {
@@ -2174,7 +2632,8 @@ fn build_equalizer_page(
     let mut band_scales = Vec::with_capacity(crate::settings::EQ_BAND_COUNT);
     for (index, initial_gain_db) in initial_eq_bands.into_iter().enumerate() {
         let column = i32::try_from(index).unwrap_or(0);
-        let label = Label::new(Some(&format!("Band {}", index + 1)));
+        let hz = EQ_BAND_CENTER_FREQUENCIES_HZ[index];
+        let label = Label::new(Some(&eq_band_frequency_label(hz)));
         band_grid.attach(&label, column, 0, 1, 1);
 
         let scale = Scale::with_range(
@@ -2268,22 +2727,34 @@ fn build_settings_panel_from(gesture_settings: &Rc<RefCell<HeadUnitSettings>>) -
         gesture_settings.borrow().mtp_popup_suppression_enabled(),
         gesture_settings.borrow().launch_on_boot(),
         gesture_settings.borrow().display_brightness_percent(),
+        gesture_settings.borrow().volume_percent(),
         gesture_settings.borrow().audio_output_device(),
         gesture_settings.borrow().microphone_input_device(),
         gesture_settings.borrow().night_mode_gpio_line(),
         gesture_settings.borrow().eq_bands(),
+        gesture_settings
+            .borrow()
+            .experimental_disclaimer_dismissed(),
+        gesture_settings.borrow().legal_page_hidden(),
     )
 }
 
-/// Builds the top-level settings menu page: a title, a two-column grid of
-/// `buttons` (one per destination page — Android Auto, Gestures, Display,
-/// etc.), and the "Return to desktop" fullscreen toggle below it. Split
-/// out of `build_settings_panel` purely to keep it under
-/// `clippy::too_many_lines`. At the operator's explicit request
-/// (2026-08-19): the panel opened by the arm-swipe-then-gesture is a page
-/// full of buttons, each leading to its own page, rather than one long
-/// flat page of every control.
-fn build_menu_page(buttons: &[&Button]) -> (GtkBox, Button) {
+/// Builds the top-level settings menu page: a title and a two-column grid
+/// of `buttons` (one per destination page — Android Auto, Desktop,
+/// Gestures, Display, etc.). Split out of `build_settings_panel` purely to
+/// keep it under `clippy::too_many_lines`. At the operator's explicit
+/// request (2026-08-19): the panel opened by the arm-swipe-then-gesture is
+/// a page full of buttons, each leading to its own page, rather than one
+/// long flat page of every control. The separate "Return to desktop"
+/// fullscreen-toggle button below the grid (2026-08-21) was removed
+/// 2026-08-22 — real-hardware feedback: it unfullscreened into a windowed
+/// view that still showed AA on screen, not a real minimize, and its
+/// bidirectional "Return to desktop"/"Return to video" label was
+/// confusing next to the always-available "Android Auto" entry. "Desktop"
+/// is now just another grid button, right next to "Android Auto" (see
+/// `build_menu_page_and_unhide`), and truly minimizes the window
+/// (`SettingsPanel::desktop_button`'s own doc comment).
+fn build_menu_page(buttons: &[&Button]) -> GtkBox {
     let menu_page = GtkBox::new(Orientation::Vertical, 8);
 
     let title = Label::new(Some("Head unit settings"));
@@ -2306,22 +2777,98 @@ fn build_menu_page(buttons: &[&Button]) -> (GtkBox, Button) {
         menu_grid.attach(*button, index % 2, index / 2, 1, 1);
     }
 
-    let toggle_fullscreen_button = Button::with_label("Return to desktop");
-    menu_page.append(&toggle_fullscreen_button);
-
-    (menu_page, toggle_fullscreen_button)
+    menu_page
 }
 
+/// Assembles the top-level menu's button list (Android Auto and Desktop
+/// lead it, then every settings page, including the still-not-yet-implemented
+/// stubs) via [`build_menu_page`], then appends the "⋮" unhide
+/// affordance — deliberately small and out of the way, since it only
+/// ever matters once Legal has actually been hidden
+/// ([`wire_legal_page`]). Split out of `build_settings_panel` purely to
+/// keep it under `clippy::too_many_lines`.
 #[allow(clippy::too_many_arguments)]
+fn build_menu_page_and_unhide(
+    android_auto_button: &Button,
+    desktop_button: &Button,
+    gestures_open: &Button,
+    display_open: &Button,
+    themes_open: &Button,
+    equalizer_open: &Button,
+    legal_open: &Button,
+    stub_pages: &[StubPage],
+) -> (GtkBox, Button) {
+    let mut menu_buttons: Vec<&Button> = vec![
+        android_auto_button,
+        desktop_button,
+        gestures_open,
+        display_open,
+        themes_open,
+        equalizer_open,
+        legal_open,
+    ];
+    menu_buttons.extend(stub_pages.iter().map(|stub| &stub.open_button));
+    let menu_page = build_menu_page(&menu_buttons);
+
+    let legal_unhide_button = Button::with_label("⋮");
+    menu_page.append(&legal_unhide_button);
+
+    (menu_page, legal_unhide_button)
+}
+
+/// Wraps `content` in the panel's actual scrolling/styling root — split
+/// out of `build_settings_panel` purely to keep it under
+/// `clippy::too_many_lines`. Fills the whole window rather than floating
+/// as a small centered box — real-hardware feedback, 2026-08-16: a
+/// fixed-size centered panel left too little room for seven gesture rows
+/// on the 800x480 panel, and even filling the whole window, the picker
+/// page (back button + title + seven action buttons) still doesn't fit
+/// without scrolling. `enable_touch_drag_scroll` is what actually makes
+/// that scrolling usable — the plain scrollbar thumb was explicitly
+/// rejected as an unusable fallback.
+fn build_settings_scroller(content: &GtkBox) -> ScrolledWindow {
+    // Margins go on `content`, not `root` — real-hardware finding
+    // (2026-08-21): `root` is what actually paints the opaque
+    // `.background` covering the video underneath, so a margin *on it*
+    // just insets that opaque paint from the window's real edges,
+    // leaving a border-width strip all the way around where the live AA
+    // video still showed through — specifically visible on the left
+    // edge, where Android Auto renders its own app-switcher icon column.
+    // `content`'s margin gives the same breathing room around the
+    // buttons/labels without ever leaving `root`'s own edge-to-edge
+    // opaque coverage incomplete.
+    content.set_margin_top(24);
+    content.set_margin_bottom(24);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+
+    let root = ScrolledWindow::builder()
+        .child(content)
+        .hscrollbar_policy(PolicyType::Never)
+        .build();
+    enable_touch_drag_scroll(&root);
+    root.set_halign(gtk4::Align::Fill);
+    root.set_valign(gtk4::Align::Fill);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root.set_visible(false);
+    root.add_css_class("background");
+    root
+}
+
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn build_settings_panel(
     initial_arm_window_seconds: u32,
     initial_mtp_popup_suppression_enabled: bool,
     initial_launch_on_boot: bool,
     initial_display_brightness_percent: u8,
+    initial_volume_percent: u8,
     initial_audio_output_device: Option<&str>,
     initial_microphone_input_device: Option<&str>,
     initial_night_mode_gpio_line: Option<u32>,
     initial_eq_bands: [f64; crate::settings::EQ_BAND_COUNT],
+    initial_legal_read_accepted: bool,
+    initial_legal_hidden: bool,
 ) -> SettingsPanel {
     let gestures = build_gestures_page();
     let display = build_display_page(
@@ -2329,6 +2876,7 @@ fn build_settings_panel(
         initial_mtp_popup_suppression_enabled,
         initial_launch_on_boot,
         initial_display_brightness_percent,
+        initial_volume_percent,
         initial_audio_output_device,
         initial_microphone_input_device,
         initial_night_mode_gpio_line,
@@ -2336,9 +2884,10 @@ fn build_settings_panel(
 
     let themes = build_themes_page();
     let equalizer = build_equalizer_page(initial_eq_bands);
+    let legal = build_legal_page(initial_legal_read_accepted, initial_legal_hidden);
 
     // --- The three still-not-yet-implemented sibling pages ---
-    let mut stub_pages: Vec<StubPage> = [
+    let stub_pages: Vec<StubPage> = [
         SettingsPage::RearCamera,
         SettingsPage::DashCam,
         SettingsPage::ScreenMirroring,
@@ -2346,25 +2895,22 @@ fn build_settings_panel(
     .into_iter()
     .map(build_stub_page)
     .collect();
-    // Reuses the exact same `StubPage` shape (title/content/Back) as the
-    // stubs above — real content instead of "Coming soon.", but no
-    // dedicated `SettingsPanel` fields needed since the existing stub
-    // visibility/open/back-button wiring already handles it generically.
-    stub_pages.push(build_legal_page());
 
     // "Android Auto" leads the grid — the live AA view is the primary
     // destination, the rest are settings pages, matching the OpenAuto-style
     // "AA is one of the buttons" menu the operator asked for.
     let android_auto_button = Button::with_label("Android Auto");
-    let mut menu_buttons: Vec<&Button> = vec![
+    let desktop_button = Button::with_label("Desktop");
+    let (menu_page, legal_unhide_button) = build_menu_page_and_unhide(
         &android_auto_button,
+        &desktop_button,
         &gestures.open_button,
         &display.open_button,
         &themes.open_button,
         &equalizer.open_button,
-    ];
-    menu_buttons.extend(stub_pages.iter().map(|stub| &stub.open_button));
-    let (menu_page, toggle_fullscreen_button) = build_menu_page(&menu_buttons);
+        &legal.open_button,
+        &stub_pages,
+    );
 
     let picker = build_action_picker();
 
@@ -2374,34 +2920,13 @@ fn build_settings_panel(
     content.append(&display.page);
     content.append(&themes.page);
     content.append(&equalizer.page);
+    content.append(&legal.page);
     for stub in &stub_pages {
         content.append(&stub.root);
     }
     content.append(&picker.root);
 
-    let root = ScrolledWindow::builder()
-        .child(&content)
-        .hscrollbar_policy(PolicyType::Never)
-        .build();
-    // Fills the whole window rather than floating as a small centered
-    // box — real-hardware feedback, 2026-08-16: a fixed-size centered
-    // panel left too little room for seven gesture rows on the 800x480
-    // panel, and even filling the whole window, the picker page (back
-    // button + title + seven action buttons) still doesn't fit without
-    // scrolling. `enable_touch_drag_scroll` below is what actually makes
-    // that scrolling usable — the plain scrollbar thumb was explicitly
-    // rejected as an unusable fallback.
-    enable_touch_drag_scroll(&root);
-    root.set_halign(gtk4::Align::Fill);
-    root.set_valign(gtk4::Align::Fill);
-    root.set_hexpand(true);
-    root.set_vexpand(true);
-    root.set_visible(false);
-    root.add_css_class("background");
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
+    let root = build_settings_scroller(&content);
 
     SettingsPanel {
         root,
@@ -2421,17 +2946,24 @@ fn build_settings_panel(
         equalizer_button: equalizer.open_button,
         equalizer_back_button: equalizer.back_button,
         eq_scales: Rc::new(equalizer.band_scales),
+        legal_page: legal.page,
+        legal_button: legal.open_button,
+        legal_back_button: legal.back_button,
+        legal_read_accepted_check: legal.read_accepted_check,
+        legal_hide_check: legal.hide_check,
+        legal_unhide_button,
         stub_pages: Rc::new(stub_pages),
         rotation_label: display.rotation_label,
         gesture_selectors: Rc::new(gestures.selectors),
         picker,
         android_auto_button,
-        toggle_fullscreen_button,
+        desktop_button,
         flip_screen_button: display.flip_screen_button,
         arm_timeout_spin: display.arm_timeout_spin,
         mtp_suppression_check: display.mtp_suppression_check,
         launch_on_boot_check: display.launch_on_boot_check,
         brightness_scale: display.brightness_scale,
+        volume_scale: display.volume_scale,
         audio_output_dropdown: display.audio_output_dropdown,
         audio_output_devices: Rc::new(display.audio_output_devices),
         microphone_input_dropdown: display.microphone_input_dropdown,
@@ -2491,14 +3023,6 @@ fn apply_rotation(
         .save(Path::new(DEFAULT_SETTINGS_PATH));
 }
 
-fn toggle_fullscreen_button_label(is_fullscreen: bool) -> &'static str {
-    if is_fullscreen {
-        "Return to desktop"
-    } else {
-        "Return to video"
-    }
-}
-
 /// Hides the whole settings panel and resets it back to
 /// [`SettingsPage::Menu`] — so reopening it later never resumes showing
 /// a stale [`ActionPicker`] or sub-page left open from a previous visit.
@@ -2508,10 +3032,15 @@ fn close_settings_panel(settings_panel: &SettingsPanel) {
     show_settings_page(settings_panel, SettingsPage::Menu);
 }
 
-/// Flips between fullscreen video and the plain desktop, always closing
-/// the settings panel too. Bidirectional deliberately — see [`Action`]'s
-/// doc comment for the real-hardware trial that found the one-directional
-/// predecessor left the operator stuck with no way back.
+/// Flips between fullscreen video and windowed, always closing the
+/// settings panel too. Bidirectional deliberately — see [`Action`]'s doc
+/// comment for the real-hardware trial that found the one-directional
+/// predecessor left the operator stuck with no way back. Only reachable
+/// via [`Action::ToggleFullscreen`] (default gesture: two-finger tap) —
+/// the settings menu's own "Desktop" button ([`SettingsPanel::desktop_button`])
+/// does a true minimize instead, real-hardware feedback (2026-08-22):
+/// unfullscreening into a windowed view still showing AA on screen wasn't
+/// what "go to the desktop" meant to the operator.
 fn toggle_fullscreen(
     window: &ApplicationWindow,
     settings_panel: &SettingsPanel,
@@ -2524,9 +3053,6 @@ fn toggle_fullscreen(
         window.unfullscreen();
     }
     is_fullscreen.set(now_fullscreen);
-    settings_panel
-        .toggle_fullscreen_button
-        .set_label(toggle_fullscreen_button_label(now_fullscreen));
     close_settings_panel(settings_panel);
 }
 
@@ -2615,36 +3141,96 @@ fn wire_launch_on_boot_toggle(
 /// gesture claiming the touch sequence out from under this slider's
 /// drag), found via temporary per-gesture diagnostic logging rather than
 /// further guessing here.
+/// Live-applies to every currently-registered audio pipeline
+/// (`SharedAudioSettings::set_volume_percent`) on every tick, in addition
+/// to the same debounced persist-only save brightness uses below — unlike
+/// `eq_bands`, which used to only be "picked up at the next audio
+/// pipeline build," a volume slider with no audible effect until the next
+/// reconnect isn't usable, so this needed the same kind of live-apply path
+/// brightness's screen-power already has. Split out of
+/// `wire_brightness_and_device_settings` purely to keep it under
+/// `clippy::too_many_lines`.
+fn wire_volume_slider(
+    scale: &Scale,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+    audio_settings: &Rc<RefCell<SharedAudioSettings>>,
+) {
+    let gesture_settings_for_volume = Rc::clone(gesture_settings);
+    let audio_settings_for_volume = Rc::clone(audio_settings);
+    let pending_volume_save: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    scale.connect_value_changed(move |scale| {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let percent = scale.value() as u8;
+        gesture_settings_for_volume
+            .borrow_mut()
+            .set_volume_percent(percent);
+        audio_settings_for_volume
+            .borrow()
+            .set_volume_percent(percent);
+
+        if let Some(source_id) = pending_volume_save.take() {
+            source_id.remove();
+        }
+        let gesture_settings_for_save = Rc::clone(&gesture_settings_for_volume);
+        let pending_volume_save_for_timeout = Rc::clone(&pending_volume_save);
+        let source_id = glib::timeout_add_local(BRIGHTNESS_SAVE_DEBOUNCE, move || {
+            let _ = gesture_settings_for_save
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+            pending_volume_save_for_timeout.set(None);
+            glib::ControlFlow::Break
+        });
+        pending_volume_save.set(Some(source_id));
+    });
+}
+
+/// Wires a brightness `Scale` — the Display page's own, or the
+/// quick-controls popup's ([`QuickControlsPopup`]) — to live-apply via
+/// `auth_discovery_probe::set_screen_power` on every tick, debounced
+/// persist-to-disk the same as every other settings widget in this file.
+/// Extracted from `wire_brightness_and_device_settings` (2026-08-22) so
+/// the popup's own brightness slider reuses this exact behavior instead of
+/// a second copy — see that function's own doc comment for the two
+/// real-hardware findings behind the live-apply-plus-debounced-save
+/// design itself.
+fn wire_brightness_scale(scale: &Scale, gesture_settings: &Rc<RefCell<HeadUnitSettings>>) {
+    let gesture_settings_for_brightness = Rc::clone(gesture_settings);
+    let pending_brightness_save: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    scale.connect_value_changed(move |scale| {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let percent = scale.value() as u8;
+        gesture_settings_for_brightness
+            .borrow_mut()
+            .set_display_brightness_percent(percent);
+        crate::auth_discovery_probe::set_screen_power(true, percent);
+
+        if let Some(source_id) = pending_brightness_save.take() {
+            source_id.remove();
+        }
+        let gesture_settings_for_save = Rc::clone(&gesture_settings_for_brightness);
+        let pending_brightness_save_for_timeout = Rc::clone(&pending_brightness_save);
+        let source_id = glib::timeout_add_local(BRIGHTNESS_SAVE_DEBOUNCE, move || {
+            let _ = gesture_settings_for_save
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+            pending_brightness_save_for_timeout.set(None);
+            glib::ControlFlow::Break
+        });
+        pending_brightness_save.set(Some(source_id));
+    });
+}
+
 fn wire_brightness_and_device_settings(
     settings_panel: &SettingsPanel,
     gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+    audio_settings: &Rc<RefCell<SharedAudioSettings>>,
 ) {
-    let gesture_settings_for_brightness = Rc::clone(gesture_settings);
-    let pending_brightness_save: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-    settings_panel
-        .brightness_scale
-        .connect_value_changed(move |scale| {
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let percent = scale.value() as u8;
-            gesture_settings_for_brightness
-                .borrow_mut()
-                .set_display_brightness_percent(percent);
-            crate::auth_discovery_probe::set_screen_power(true, percent);
-
-            if let Some(source_id) = pending_brightness_save.take() {
-                source_id.remove();
-            }
-            let gesture_settings_for_save = Rc::clone(&gesture_settings_for_brightness);
-            let pending_brightness_save_for_timeout = Rc::clone(&pending_brightness_save);
-            let source_id = glib::timeout_add_local(BRIGHTNESS_SAVE_DEBOUNCE, move || {
-                let _ = gesture_settings_for_save
-                    .borrow()
-                    .save(Path::new(DEFAULT_SETTINGS_PATH));
-                pending_brightness_save_for_timeout.set(None);
-                glib::ControlFlow::Break
-            });
-            pending_brightness_save.set(Some(source_id));
-        });
+    wire_brightness_scale(&settings_panel.brightness_scale, gesture_settings);
+    wire_volume_slider(
+        &settings_panel.volume_scale,
+        gesture_settings,
+        audio_settings,
+    );
 
     let gesture_settings_for_audio = Rc::clone(gesture_settings);
     let audio_output_devices = Rc::clone(&settings_panel.audio_output_devices);
@@ -2719,27 +3305,32 @@ fn wire_brightness_and_device_settings(
         });
 }
 
-/// Wires the 10 equalizer band sliders — persist-only, like the audio
-/// device dropdowns above, not the live-applying brightness slider
-/// (`HeadUnitSettings::eq_bands`'s doc comment explains why: EQ settings
-/// are picked up at the next audio pipeline build, not mid-session).
-/// Debounced ([`BRIGHTNESS_SAVE_DEBOUNCE`]) with one shared timer for all
-/// 10 sliders, not one per band — every slider's handler saves the
-/// *whole* current settings snapshot regardless of which band moved, so
-/// a single shared debounce is already correct: rapid drags across
-/// multiple sliders collapse into one save, same as rapid drags on one.
+/// Wires the 10 equalizer band sliders. Now live-applies each band to
+/// every currently-registered audio pipeline
+/// (`SharedAudioSettings::set_eq_band`) the moment it moves, in addition
+/// to the debounced persist ([`BRIGHTNESS_SAVE_DEBOUNCE`]) with one
+/// shared timer for all 10 sliders, not one per band — every slider's
+/// handler saves the *whole* current settings snapshot regardless of
+/// which band moved, so a single shared debounce is already correct:
+/// rapid drags across multiple sliders collapse into one save, same as
+/// rapid drags on one. (Previously persist-only — real-hardware finding,
+/// 2026-08-21: moving these sliders had no audible effect until the next
+/// reconnect, which isn't usable for an equalizer.)
 fn wire_equalizer_sliders(
     settings_panel: &SettingsPanel,
     gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+    audio_settings: &Rc<RefCell<SharedAudioSettings>>,
 ) {
     let pending_eq_save: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
     for (index, scale) in settings_panel.eq_scales.iter().enumerate() {
         let gesture_settings = Rc::clone(gesture_settings);
+        let audio_settings = Rc::clone(audio_settings);
         let pending_eq_save = Rc::clone(&pending_eq_save);
         scale.connect_value_changed(move |scale| {
             gesture_settings
                 .borrow_mut()
                 .set_eq_band(index, scale.value());
+            audio_settings.borrow().set_eq_band(index, scale.value());
 
             if let Some(source_id) = pending_eq_save.take() {
                 source_id.remove();
@@ -2863,6 +3454,15 @@ fn wire_settings_navigation(settings_panel: &SettingsPanel) {
             show_settings_page(&settings_panel_for_equalizer_back, SettingsPage::Menu);
         });
 
+    let settings_panel_for_legal_open = settings_panel.clone();
+    settings_panel.legal_button.connect_clicked(move |_| {
+        show_settings_page(&settings_panel_for_legal_open, SettingsPage::Legal);
+    });
+    let settings_panel_for_legal_back = settings_panel.clone();
+    settings_panel.legal_back_button.connect_clicked(move |_| {
+        show_settings_page(&settings_panel_for_legal_back, SettingsPage::Menu);
+    });
+
     for stub in settings_panel.stub_pages.iter() {
         let page = stub.page;
         let settings_panel_for_open = settings_panel.clone();
@@ -2903,6 +3503,66 @@ fn wire_theme_selection(
     }
 }
 
+/// Wires the Legal page's two checkboxes and the menu's "⋮" unhide
+/// button — split out of `wire_settings_panel` purely to keep it under
+/// `clippy::too_many_lines`. See [`build_legal_page`]'s doc comment for
+/// the gating this implements (`hide_check` only usable once
+/// `read_accepted_check` is).
+fn wire_legal_page(
+    settings_panel: &SettingsPanel,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    let gesture_settings_for_accept = Rc::clone(gesture_settings);
+    let hide_check_for_accept = settings_panel.legal_hide_check.clone();
+    settings_panel
+        .legal_read_accepted_check
+        .connect_toggled(move |check| {
+            let accepted = check.is_active();
+            hide_check_for_accept.set_sensitive(accepted);
+            gesture_settings_for_accept
+                .borrow_mut()
+                .set_experimental_disclaimer_dismissed(accepted);
+            let _ = gesture_settings_for_accept
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+        });
+
+    let gesture_settings_for_hide = Rc::clone(gesture_settings);
+    let legal_button_for_hide = settings_panel.legal_button.clone();
+    let settings_panel_for_hide = settings_panel.clone();
+    settings_panel
+        .legal_hide_check
+        .connect_toggled(move |check| {
+            let hidden = check.is_active();
+            legal_button_for_hide.set_visible(!hidden);
+            gesture_settings_for_hide
+                .borrow_mut()
+                .set_legal_page_hidden(hidden);
+            let _ = gesture_settings_for_hide
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+            if hidden {
+                show_settings_page(&settings_panel_for_hide, SettingsPage::Menu);
+            }
+        });
+
+    let gesture_settings_for_unhide = Rc::clone(gesture_settings);
+    let legal_button_for_unhide = settings_panel.legal_button.clone();
+    let legal_hide_check_for_unhide = settings_panel.legal_hide_check.clone();
+    settings_panel
+        .legal_unhide_button
+        .connect_clicked(move |_| {
+            legal_button_for_unhide.set_visible(true);
+            legal_hide_check_for_unhide.set_active(false);
+            gesture_settings_for_unhide
+                .borrow_mut()
+                .set_legal_page_hidden(false);
+            let _ = gesture_settings_for_unhide
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wire_settings_panel(
     settings_panel: &SettingsPanel,
@@ -2911,12 +3571,15 @@ fn wire_settings_panel(
     rotation_handle: &Rc<RefCell<Option<SharedRotation>>>,
     current_rotation: &Rc<Cell<Rotation>>,
     arm_window_handle: &Rc<RefCell<Option<SharedArmWindow>>>,
-    is_fullscreen: &Rc<Cell<bool>>,
     gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+    audio_settings: &Rc<RefCell<SharedAudioSettings>>,
+    quick_controls: &QuickControlsPopup,
 ) {
     wire_gesture_editing(settings_panel, gesture_settings);
     wire_settings_navigation(settings_panel);
     wire_theme_selection(settings_panel, gesture_settings);
+    wire_legal_page(settings_panel, gesture_settings);
+    wire_quick_controls_popup(quick_controls, gesture_settings, audio_settings);
 
     let arm_window_handle_for_spin = Rc::clone(arm_window_handle);
     let gesture_settings_for_spin = Rc::clone(gesture_settings);
@@ -2938,8 +3601,8 @@ fn wire_settings_panel(
 
     wire_mtp_suppression_toggle(settings_panel, gesture_settings);
     wire_launch_on_boot_toggle(settings_panel, gesture_settings);
-    wire_brightness_and_device_settings(settings_panel, gesture_settings);
-    wire_equalizer_sliders(settings_panel, gesture_settings);
+    wire_brightness_and_device_settings(settings_panel, gesture_settings, audio_settings);
+    wire_equalizer_sliders(settings_panel, gesture_settings, audio_settings);
 
     let settings_panel_for_cycle = settings_panel.clone();
     let armed_mask_for_cycle = armed_mask.clone();
@@ -2965,18 +3628,12 @@ fn wire_settings_panel(
             close_settings_panel(&settings_panel_for_close);
         });
 
-    let window_for_toggle = window.clone();
-    let settings_panel_for_toggle = settings_panel.clone();
-    let is_fullscreen_for_toggle = Rc::clone(is_fullscreen);
-    settings_panel
-        .toggle_fullscreen_button
-        .connect_clicked(move |_| {
-            toggle_fullscreen(
-                &window_for_toggle,
-                &settings_panel_for_toggle,
-                &is_fullscreen_for_toggle,
-            );
-        });
+    let window_for_desktop = window.clone();
+    let settings_panel_for_desktop = settings_panel.clone();
+    settings_panel.desktop_button.connect_clicked(move |_| {
+        close_settings_panel(&settings_panel_for_desktop);
+        window_for_desktop.minimize();
+    });
 }
 
 /// Executes whichever [`Action`] the settings gesture that just fired is
@@ -2990,6 +3647,7 @@ fn dispatch_action(
     action: Action,
     settings_panel: &SettingsPanel,
     armed_mask: &ArmedMask,
+    quick_controls: &QuickControlsPopup,
     window: &ApplicationWindow,
     rotation_handle: &Rc<RefCell<Option<SharedRotation>>>,
     current_rotation: &Rc<Cell<Rotation>>,
@@ -3009,6 +3667,11 @@ fn dispatch_action(
                 current_rotation,
                 gesture_settings,
             );
+        }
+        // Default gesture: long press ([`crate::settings::HeadUnitSettings::defaults`]).
+        Action::QuickControls => {
+            quick_controls.root.set_visible(true);
+            reset_quick_controls_auto_hide(quick_controls);
         }
         // All no-ops here, dispatched instead from the background protocol
         // thread (`auth_discovery_probe.rs::service_touch_input`), for two

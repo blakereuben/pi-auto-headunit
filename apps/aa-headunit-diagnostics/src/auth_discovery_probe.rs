@@ -493,6 +493,7 @@ use protocol_aap::{
     encode_touch_report, encode_video_focus_notification,
 };
 use security_openssl::{OpenSslTlsClient, TlsVersionPolicy};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -903,6 +904,84 @@ impl SharedPanelVisibility {
     }
 }
 
+/// A cross-thread registry of whichever `MediaAudio`/`SystemAudio`/
+/// `SpeechAudio` pipelines are currently built for this session — added
+/// 2026-08-21 so the equalizer/volume settings controls can actually be
+/// heard changing live instead of only taking effect on the next
+/// connection (`HeadUnitSettings::eq_bands`/`volume_percent`'s own doc
+/// comments explain why that was the original, deliberate default —
+/// this adds live-apply on top, it doesn't replace persistence). Same
+/// "both sides hold a clone from construction, no one-shot channel
+/// needed" shape as [`SharedPanelVisibility`]: starts empty each
+/// session, `register` is called once per channel as its pipeline
+/// finishes building (0 to 3 times, independently, since the three
+/// channels open at different times), and `set_eq_band`/
+/// `set_volume_percent` apply to every currently-registered pipeline —
+/// so a call before any channel has opened, or while some have and
+/// others haven't yet, is always a safe, harmless no-op/partial-apply
+/// rather than an error. `media_gstreamer::AudioLevelHandle` is already
+/// thread-safe on its own (a `GStreamer` element's property access
+/// doesn't need external locking) — the `Mutex` here only protects the
+/// `Vec` itself against concurrent registration/iteration.
+#[derive(Clone, Default)]
+pub(crate) struct SharedAudioSettings(
+    std::sync::Arc<std::sync::Mutex<Vec<media_gstreamer::AudioLevelHandle>>>,
+);
+
+impl SharedAudioSettings {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn register(&self, handle: media_gstreamer::AudioLevelHandle) {
+        if let Ok(mut handles) = self.0.lock() {
+            handles.push(handle);
+        }
+    }
+
+    pub(crate) fn set_eq_band(&self, index: usize, gain_db: f64) {
+        if let Ok(handles) = self.0.lock() {
+            for handle in handles.iter() {
+                handle.set_eq_band(index, gain_db);
+            }
+        }
+    }
+
+    pub(crate) fn set_volume_percent(&self, percent: u8) {
+        if let Ok(handles) = self.0.lock() {
+            for handle in handles.iter() {
+                handle.set_volume_percent(percent);
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Set once, at the very top of [`run`], from that same call's own
+    /// `touch_settings_handoff(&video_render_target)` — reached from
+    /// `start_audio_playback_pipeline` via [`current_audio_settings`]
+    /// instead of being threaded down as a parameter through the whole
+    /// `handle_media_audio_channel_message`/`handle_system_audio_channel_message`/
+    /// `handle_speech_audio_channel_message` call chain, matching this
+    /// project's existing "settings are cheap to reload/reach on demand
+    /// rather than adding a parameter to a long call chain" precedent
+    /// (`start_audio_playback_pipeline`'s own doc comment, for
+    /// `HeadUnitSettings` itself). Safe as a thread-local specifically
+    /// because `run` and every function it calls, including this whole
+    /// channel-message chain, execute on one background thread for the
+    /// life of one session — never actually shared across threads.
+    static CURRENT_AUDIO_SETTINGS: RefCell<Option<SharedAudioSettings>> = const { RefCell::new(None) };
+}
+
+fn set_current_audio_settings(audio_settings: Option<SharedAudioSettings>) {
+    CURRENT_AUDIO_SETTINGS.with_borrow_mut(|current| *current = audio_settings);
+}
+
+fn current_audio_settings() -> Option<SharedAudioSettings> {
+    CURRENT_AUDIO_SETTINGS.with_borrow(Clone::clone)
+}
+
 /// Bridges the background protocol thread's touch handling to the GTK
 /// thread's settings panel (`gtk_dev_ui.rs`). `rotation_sender` fires at
 /// most once, as soon as the touchscreen (if any) is opened, carrying a
@@ -926,6 +1005,8 @@ pub(crate) struct TouchSettingsHandoff {
     pub(crate) arm_window_sender: mpsc::Sender<platform_api::SharedArmWindow>,
     pub(crate) gesture_sender: mpsc::Sender<GestureEvent>,
     pub(crate) panel_visibility: SharedPanelVisibility,
+    /// See [`SharedAudioSettings`]'s own doc comment.
+    pub(crate) audio_settings: SharedAudioSettings,
 }
 
 /// Well under `PING_WATCHDOG_TIMEOUT` (5s) — deliberately, not just
@@ -1259,6 +1340,9 @@ pub fn run<T: SessionTransport>(
         }
     );
     println!("probe_payload_logging=disabled");
+    set_current_audio_settings(
+        touch_settings_handoff(&video_render_target).map(|handoff| handoff.audio_settings.clone()),
+    );
 
     let mut tls = OpenSslTlsClient::from_pem_with_policy(
         credentials.certificate_pem(),
@@ -1397,8 +1481,9 @@ pub fn run<T: SessionTransport>(
 
 /// `run()`'s outcome once its loop exits without an earlier explicit
 /// stop — either the deadline was reached or the operator cancelled
-/// (`Ctrl-C`) — split out purely to keep `run()` itself under
-/// `clippy::too_many_lines`.
+/// (`Ctrl-C`, or — since `gtk_dev_ui.rs`'s window `close-request` handler,
+/// 2026-08-22 — closing the app window) — split out purely to keep
+/// `run()` itself under `clippy::too_many_lines`.
 fn finish_probe_after_loop<T: SessionTransport>(
     channel_setup_complete: bool,
     cancelled: bool,
@@ -1406,13 +1491,19 @@ fn finish_probe_after_loop<T: SessionTransport>(
     tls: &mut OpenSslTlsClient,
     limits: ProtocolLimits,
 ) -> Result<(), CliError> {
+    // Send the courtesy notice before checking `cancelled` — see
+    // `send_byebye_request`'s own doc comment for the real-hardware
+    // finding (2026-08-22) that this must happen on a cancelled stop too,
+    // not just a deadline-reached one.
+    if channel_setup_complete {
+        send_byebye_request(transport, tls, limits);
+    }
     if cancelled {
         println!("probe_state=cancelled_by_operator");
         println!("probe_result=cancelled");
         return Err(CliError::Cancelled);
     }
     if channel_setup_complete {
-        send_byebye_request(transport, tls, limits);
         println!("probe_result=observation_window_complete");
         return Ok(());
     }
@@ -1422,21 +1513,36 @@ fn finish_probe_after_loop<T: SessionTransport>(
     ))
 }
 
-/// Best-effort courtesy notice sent to the phone right before a clean,
-/// deadline-reached stop (never on Ctrl-C — that path is treated as an
-/// abrupt stop, not a graceful one, matching real appliance behaviour
-/// when the operator forces a stop). Without this, the only prior signal
-/// the phone got that a session was ending was the transport silently
-/// dropping — no wire notice at all. Real-hardware-discovered gap
-/// (2026-08-18): a supervised `session-supervisor` reconnect cycle right
-/// after a clean stop got `encrypted frame received before TLS handshake
-/// completed` on its very next handshake, every single cycle, because the
-/// phone's prior session state was still fully live when the new cycle's
-/// TLS handshake started. `encode_byebye_request`'s doc comment has the
-/// full citation confirming this is a legitimate head-unit-initiated
-/// message, not phone-only. Failure to send is logged, not propagated —
-/// the observation window itself completed successfully either way, and
-/// this is a courtesy notice, not part of the probe's core result.
+/// Best-effort courtesy notice sent to the phone right before a clean
+/// stop, whenever channel setup had completed (a real mid-session stop,
+/// not an early probe timeout) — deadline-reached *or* cancelled.
+/// Without this, the only prior signal the phone got that a session was
+/// ending was the transport silently dropping — no wire notice at all.
+/// Originally sent only on the deadline-reached path (2026-08-18 finding
+/// below); **also sent on `cancelled` since 2026-08-22** — real-hardware
+/// finding: closing and reopening `usb kiosk`'s window now cleanly
+/// cancels and exits the head-unit side (`gtk_dev_ui.rs`'s
+/// `wire_window_close_cancels_session`), but the phone was never told,
+/// so it stayed in its old session state and rejected the fresh TLS
+/// handshake on reconnect (`encrypted frame received before TLS
+/// handshake completed`, repeatedly, until the phone's own internal
+/// timeout eventually expired — several seconds of black screen, or
+/// occasionally bad enough to need a physical unplug/replug). The
+/// original "never on Ctrl-C, that's an abrupt stop matching real
+/// appliance behaviour" reasoning was sound for a diagnostic CLI probe
+/// killed mid-test, but wrong for `usb kiosk`/`gtk-dev-ui`'s window
+/// close, which is the *normal, expected* way an operator ends a session
+/// — a real appliance says goodbye on that path, it doesn't just vanish.
+/// 2026-08-18 finding this notice exists for in the first place: a
+/// supervised `session-supervisor` reconnect cycle right after a clean
+/// stop got the same `encrypted frame received before TLS handshake
+/// completed` error on its very next handshake, every single cycle,
+/// because the phone's prior session state was still fully live when the
+/// new cycle's TLS handshake started. `encode_byebye_request`'s doc
+/// comment has the full citation confirming this is a legitimate
+/// head-unit-initiated message, not phone-only. Failure to send is
+/// logged, not propagated — this is a courtesy notice, not part of the
+/// probe's core result.
 fn send_byebye_request<T: SessionTransport>(
     transport: &mut T,
     tls: &mut OpenSslTlsClient,
@@ -3461,10 +3567,14 @@ fn start_audio_playback_pipeline(
         AudioSink::Pulse,
         settings.audio_output_device(),
         Some(&eq_bands),
+        Some(settings.volume_percent()),
     ) {
         Ok(pipeline) => match pipeline.start() {
             Ok(()) => {
                 println!("probe_state={label}_playback_pipeline_started");
+                if let Some(audio_settings) = current_audio_settings() {
+                    audio_settings.register(pipeline.level_handle());
+                }
                 let now = std::time::Instant::now();
                 *audio_playback = AudioPlaybackState::Running(RunningAudioPipeline {
                     pipeline,

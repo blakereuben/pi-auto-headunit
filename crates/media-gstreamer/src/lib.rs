@@ -12,7 +12,9 @@ mod microphone_capture;
 mod render;
 
 #[cfg(target_os = "linux")]
-pub use audio::{AudioFormat, AudioPlaybackPipeline, AudioSink};
+pub use audio::{
+    AudioFormat, AudioLevelHandle, AudioPlaybackPipeline, AudioSink, EQ_BAND_CENTER_FREQUENCIES_HZ,
+};
 #[cfg(target_os = "linux")]
 pub use capture::{AudioCapturePipeline, AudioCaptureSource, CaptureLevel};
 #[cfg(target_os = "linux")]

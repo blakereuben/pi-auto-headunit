@@ -61,6 +61,16 @@ pub const DEFAULT_DISPLAY_BRIGHTNESS_PERCENT: u8 = 100;
 /// control to fix it.
 pub const MIN_DISPLAY_BRIGHTNESS_PERCENT: u8 = 1;
 pub const MAX_DISPLAY_BRIGHTNESS_PERCENT: u8 = 100;
+/// `100` (unity gain on the `GStreamer` `volume` element — no change
+/// from whatever level the phone itself sends) is the default, so a
+/// fresh install sounds exactly like it did before this setting existed.
+/// Capped at `100` rather than allowing a boost above the phone's own
+/// output level, to avoid clipping/distortion — a deliberately
+/// conservative starting range, not a hard technical limit of the
+/// underlying element.
+pub const DEFAULT_VOLUME_PERCENT: u8 = 100;
+pub const MIN_VOLUME_PERCENT: u8 = 0;
+pub const MAX_VOLUME_PERCENT: u8 = 100;
 /// `equalizer-10bands`' own documented per-band gain range in dB — not
 /// this project's choice, matched here so a saved value never gets
 /// clamped to something different than what the `GStreamer` element itself
@@ -122,11 +132,12 @@ pub enum Action {
     SwitchToRadio,
     SwitchToPhone,
     ScreenOff,
+    QuickControls,
 }
 
 impl Action {
     #[must_use]
-    pub const fn all() -> [Action; 8] {
+    pub const fn all() -> [Action; 9] {
         [
             Action::OpenSettings,
             Action::ToggleFullscreen,
@@ -136,6 +147,7 @@ impl Action {
             Action::SwitchToRadio,
             Action::SwitchToPhone,
             Action::ScreenOff,
+            Action::QuickControls,
         ]
     }
 
@@ -150,6 +162,7 @@ impl Action {
             Action::SwitchToRadio => "Switch to radio",
             Action::SwitchToPhone => "Switch to phone",
             Action::ScreenOff => "Screen off",
+            Action::QuickControls => "Brightness & volume",
         }
     }
 
@@ -165,7 +178,8 @@ impl Action {
             Action::OpenSettings
             | Action::ToggleFullscreen
             | Action::FlipScreen
-            | Action::ScreenOff => None,
+            | Action::ScreenOff
+            | Action::QuickControls => None,
         }
     }
 
@@ -179,6 +193,7 @@ impl Action {
             Action::SwitchToRadio => "switch_to_radio",
             Action::SwitchToPhone => "switch_to_phone",
             Action::ScreenOff => "screen_off",
+            Action::QuickControls => "quick_controls",
         }
     }
 
@@ -192,6 +207,7 @@ impl Action {
             "switch_to_radio" => Some(Action::SwitchToRadio),
             "switch_to_phone" => Some(Action::SwitchToPhone),
             "screen_off" => Some(Action::ScreenOff),
+            "quick_controls" => Some(Action::QuickControls),
             _ => None,
         }
     }
@@ -262,6 +278,10 @@ struct RawSettings {
     eq_bands: Option<Vec<f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     experimental_disclaimer_dismissed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legal_page_hidden: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_percent: Option<u8>,
 }
 
 /// `ProviderPreference` (`platform_api`) has no `Display`/serialization
@@ -335,6 +355,10 @@ impl RawSettings {
     }
 }
 
+// Plain persisted operator preferences, independent of each other — a
+// state machine/enum refactor would add indirection without removing any
+// real complexity here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeadUnitSettings {
     mappings: HashMap<GestureId, Action>,
@@ -354,12 +378,25 @@ pub struct HeadUnitSettings {
     /// 29 Hz to 15 kHz). All-zero is flat/unmodified — the default, so a
     /// fresh install sounds exactly like it did before this existed.
     eq_bands: [f64; EQ_BAND_COUNT],
-    /// Whether the operator has already dismissed the dashcam/rear-camera
-    /// experimental-feature disclaimer with "don't show this again" —
-    /// `false` (the default) means it's shown again on every boot. See
-    /// `gtk_dev_ui.rs`'s `build_dashcam_disclaimer` doc comment for what
-    /// it actually says and why (`RISK_REGISTER.md` R-021).
+    /// Whether the operator has already agreed to the head-unit-wide
+    /// experimental-software disclaimer — either via the boot popup's
+    /// "don't show this again" checkbox, or the Legal settings page's
+    /// "I have read and accept this" checkbox (the same flag, reachable
+    /// two ways). `false` (the default) means the boot popup is shown
+    /// again every boot. See `gtk_dev_ui.rs`'s `build_experimental_disclaimer`
+    /// doc comment for what it actually says and why (`RISK_REGISTER.md`
+    /// R-021).
     experimental_disclaimer_dismissed: bool,
+    /// Whether the operator has hidden the Legal settings page from the
+    /// top-level menu (the "⋮" button on that menu brings it back). Only
+    /// ever meaningful when `experimental_disclaimer_dismissed` is also
+    /// `true` — see `legal_page_hidden()`'s doc comment.
+    legal_page_hidden: bool,
+    /// Applied to the `GStreamer` `volume` element in each audio
+    /// pipeline (`crates/media-gstreamer/src/audio.rs`) — `100` (unity
+    /// gain) is the default. Same "not live-applied mid-session"
+    /// precedent as `eq_bands`.
+    volume_percent: u8,
 }
 
 /// `equalizer-10bands`' own fixed band count (its name says so, and its
@@ -369,22 +406,25 @@ pub const EQ_BAND_COUNT: usize = 10;
 
 impl HeadUnitSettings {
     /// Double-tap opens settings (the discoverable, always-safe default);
-    /// two-finger tap toggles fullscreen; long press cycles rotation; three
-    /// of the four swipe directions default to category-switch actions in a
-    /// spatially obvious layout (up→navigation, down→media, matching how a
-    /// map sits above and music sits below on a typical AA home screen;
-    /// left→phone) — chosen so every gesture does something distinct out of
-    /// the box, not because any one mapping is more "correct" than another.
-    /// Swipe right defaults to `ToggleFullscreen` (redundant with
-    /// two-finger tap, but genuinely functional) rather than
-    /// `SwitchToRadio`: `SwitchToRadio` is real-hardware-confirmed to
-    /// correctly navigate to Android Auto's own native radio screen (see
-    /// `protocol_aap::RadioCapability`'s doc comment), but that screen is
-    /// empty without a real tuner backend this project deliberately
-    /// doesn't implement — not a good default for a fresh install.
-    /// `SwitchToRadio` is still a fully selectable, working action.
-    /// `Circle` defaults to `ScreenOff` — the gesture this action was
-    /// added for (2026-08-17), originally a triple-finger double-tap
+    /// two-finger tap toggles fullscreen; three of the four swipe
+    /// directions default to category-switch actions in a spatially
+    /// obvious layout (up→navigation, down→media, matching how a map sits
+    /// above and music sits below on a typical AA home screen; left→phone)
+    /// — chosen so every gesture does something distinct out of the box,
+    /// not because any one mapping is more "correct" than another.
+    /// Long press defaults to `QuickControls` (2026-08-22, Blake's explicit
+    /// request: a brightness/volume popup reachable by long press only, not
+    /// buried in the full settings panel) — previously `FlipScreen`, which
+    /// moved to swipe right instead of being dropped. Swipe right defaults
+    /// to `FlipScreen` (genuinely functional, and no longer duplicated by
+    /// long press) rather than `SwitchToRadio`: `SwitchToRadio` is
+    /// real-hardware-confirmed to correctly navigate to Android Auto's own
+    /// native radio screen (see `protocol_aap::RadioCapability`'s doc
+    /// comment), but that screen is empty without a real tuner backend this
+    /// project deliberately doesn't implement — not a good default for a
+    /// fresh install. `SwitchToRadio` is still a fully selectable, working
+    /// action. `Circle` defaults to `ScreenOff` — the gesture this action
+    /// was added for (2026-08-17), originally a triple-finger double-tap
     /// replaced 2026-08-18 after real-hardware testing found three-finger
     /// coordination unreliable (see `platform_api::gesture`'s doc
     /// comment).
@@ -393,11 +433,11 @@ impl HeadUnitSettings {
         let mut mappings = HashMap::new();
         mappings.insert(GestureId::DoubleTap, Action::OpenSettings);
         mappings.insert(GestureId::TwoFingerTap, Action::ToggleFullscreen);
-        mappings.insert(GestureId::LongPress, Action::FlipScreen);
+        mappings.insert(GestureId::LongPress, Action::QuickControls);
         mappings.insert(GestureId::SwipeUp, Action::SwitchToNavigation);
         mappings.insert(GestureId::SwipeDown, Action::SwitchToMedia);
         mappings.insert(GestureId::SwipeLeft, Action::SwitchToPhone);
-        mappings.insert(GestureId::SwipeRight, Action::ToggleFullscreen);
+        mappings.insert(GestureId::SwipeRight, Action::FlipScreen);
         mappings.insert(GestureId::Circle, Action::ScreenOff);
         Self {
             mappings,
@@ -414,6 +454,8 @@ impl HeadUnitSettings {
             launch_on_boot: false,
             eq_bands: [0.0; EQ_BAND_COUNT],
             experimental_disclaimer_dismissed: false,
+            legal_page_hidden: false,
+            volume_percent: DEFAULT_VOLUME_PERCENT,
         }
     }
 
@@ -646,6 +688,34 @@ impl HeadUnitSettings {
         self.experimental_disclaimer_dismissed = dismissed;
     }
 
+    /// `true` only when the operator has *both* explicitly hidden the
+    /// page *and* already agreed to the disclaimer it holds — a
+    /// defensive `&&`, not just trusting the stored `legal_page_hidden`
+    /// bit alone, so a hand-edited or otherwise inconsistent settings
+    /// file can never hide the one page that explains the operator
+    /// hasn't actually agreed to anything yet. The real UI flow already
+    /// enforces this ordering (the "hide" checkbox is disabled until
+    /// "read and accepted" is checked); this is the same guarantee
+    /// enforced again at the data layer.
+    #[must_use]
+    pub fn legal_page_hidden(&self) -> bool {
+        self.legal_page_hidden && self.experimental_disclaimer_dismissed
+    }
+
+    pub fn set_legal_page_hidden(&mut self, hidden: bool) {
+        self.legal_page_hidden = hidden;
+    }
+
+    #[must_use]
+    pub fn volume_percent(&self) -> u8 {
+        self.volume_percent
+    }
+
+    /// Clamped to [`MIN_VOLUME_PERCENT`]..=[`MAX_VOLUME_PERCENT`].
+    pub fn set_volume_percent(&mut self, percent: u8) {
+        self.volume_percent = percent.clamp(MIN_VOLUME_PERCENT, MAX_VOLUME_PERCENT);
+    }
+
     /// Loads from `path`; falls back to [`Self::defaults`] on any error
     /// (missing file, unreadable, malformed, or an unrecognized
     /// gesture/action key — forward/backward compatible with a future
@@ -700,6 +770,12 @@ impl HeadUnitSettings {
         }
         if let Some(dismissed) = raw.experimental_disclaimer_dismissed {
             settings.set_experimental_disclaimer_dismissed(dismissed);
+        }
+        if let Some(hidden) = raw.legal_page_hidden {
+            settings.set_legal_page_hidden(hidden);
+        }
+        if let Some(percent) = raw.volume_percent {
+            settings.set_volume_percent(percent);
         }
         // A wrong-length array (hand-edited file, or a future format
         // change) is simply ignored rather than treated as corruption —
@@ -778,6 +854,8 @@ impl HeadUnitSettings {
             .or_else(|| on_disk.as_ref().and_then(|settings| settings.theme.clone()));
         raw.launch_on_boot = Some(self.launch_on_boot);
         raw.experimental_disclaimer_dismissed = Some(self.experimental_disclaimer_dismissed);
+        raw.legal_page_hidden = Some(self.legal_page_hidden);
+        raw.volume_percent = Some(self.volume_percent);
         let text = toml::to_string_pretty(&raw)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         if let Some(parent) = path.parent() {
@@ -804,7 +882,7 @@ mod tests {
         );
         assert_eq!(
             settings.action_for(GestureId::LongPress),
-            Action::FlipScreen
+            Action::QuickControls
         );
         assert_eq!(
             settings.action_for(GestureId::SwipeUp),
@@ -823,7 +901,7 @@ mod tests {
         // `defaults`'s own doc comment.
         assert_eq!(
             settings.action_for(GestureId::SwipeRight),
-            Action::ToggleFullscreen
+            Action::FlipScreen
         );
         assert_eq!(settings.action_for(GestureId::Circle), Action::ScreenOff);
     }
@@ -850,6 +928,7 @@ mod tests {
         assert_eq!(Action::ToggleFullscreen.key_code(), None);
         assert_eq!(Action::FlipScreen.key_code(), None);
         assert_eq!(Action::ScreenOff.key_code(), None);
+        assert_eq!(Action::QuickControls.key_code(), None);
     }
 
     #[test]
@@ -1224,6 +1303,66 @@ mod tests {
 
         let loaded = HeadUnitSettings::load(&path);
         assert!(loaded.experimental_disclaimer_dismissed());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legal_page_hidden_defaults_to_false_and_round_trips_true() {
+        let defaults = HeadUnitSettings::defaults();
+        assert!(!defaults.legal_page_hidden());
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-legal-page-hidden-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_experimental_disclaimer_dismissed(true);
+        settings.set_legal_page_hidden(true);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert!(loaded.legal_page_hidden());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legal_page_hidden_reads_as_false_when_disclaimer_not_accepted() {
+        // The defensive `&&` in `legal_page_hidden()`: a settings file
+        // with `legal_page_hidden = true` but no acceptance recorded
+        // (hand-edited, or a future bug elsewhere) must never actually
+        // hide the one page that explains the operator hasn't agreed to
+        // anything yet.
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_legal_page_hidden(true);
+        assert!(!settings.experimental_disclaimer_dismissed());
+        assert!(!settings.legal_page_hidden());
+    }
+
+    #[test]
+    fn volume_percent_defaults_to_100_and_clamps_and_round_trips() {
+        let defaults = HeadUnitSettings::defaults();
+        assert_eq!(defaults.volume_percent(), 100);
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_volume_percent(255);
+        assert_eq!(settings.volume_percent(), MAX_VOLUME_PERCENT);
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-volume-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_volume_percent(42);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert_eq!(loaded.volume_percent(), 42);
 
         let _ = fs::remove_dir_all(&dir);
     }

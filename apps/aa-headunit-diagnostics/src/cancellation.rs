@@ -33,6 +33,20 @@ impl CancellationFlag {
     pub(crate) fn is_set(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
+
+    /// Sets the flag exactly as a real `SIGINT` would — used by
+    /// `gtk_dev_ui.rs`'s window `close-request` handler (2026-08-22) so
+    /// closing the GTK window drives the same cooperative-cancellation
+    /// path Ctrl-C already does, instead of the OS abruptly killing the
+    /// detached background protocol thread when `main()` returns.
+    /// Real-hardware finding: without this, closing and relaunching the
+    /// app left the USB accessory interface never cleanly released (the
+    /// background thread's `Drop` impls never got to run — see
+    /// `LibUsbBulkTransport`'s own `Drop`), and the phone needed a
+    /// physical unplug/replug before a new process could connect again.
+    pub(crate) fn trigger(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Installs the process's `SIGINT` handler. Must be called at most once per
@@ -66,5 +80,14 @@ mod tests {
         let flag = CancellationFlag(Arc::clone(&inner));
         inner.store(true, Ordering::SeqCst);
         assert!(flag.is_set());
+    }
+
+    #[test]
+    fn trigger_sets_the_flag_visibly_through_a_clone() {
+        let flag = CancellationFlag(Arc::new(AtomicBool::new(false)));
+        let clone = flag.clone();
+        assert!(!clone.is_set());
+        flag.trigger();
+        assert!(clone.is_set());
     }
 }

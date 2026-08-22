@@ -99,8 +99,9 @@ impl GstreamerBackend {
         sink: crate::AudioSink,
         device: Option<&str>,
         eq_bands: Option<&[f64]>,
+        volume_percent: Option<u8>,
     ) -> Result<crate::AudioPlaybackPipeline, GstreamerError> {
-        crate::AudioPlaybackPipeline::new(format, sink, device, eq_bands)
+        crate::AudioPlaybackPipeline::new(format, sink, device, eq_bands, volume_percent)
     }
 
     pub fn build_audio_capture_pipeline(
