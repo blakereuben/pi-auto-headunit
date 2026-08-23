@@ -1039,6 +1039,19 @@ fn reset_stale_kiosk_device(device: &transport_api::UsbDeviceId) {
     }
 }
 
+/// Where `usb kiosk`/`usb wireless-kiosk` source their `AAP` transport
+/// from, threaded through the whole persistent-window reconnect chain
+/// (`run_kiosk` → `start_kiosk_session` → `install_kiosk_hang_safety_net`
+/// / `end_kiosk_attempt` → `discover_and_run_kiosk_session`) so every
+/// reconnect after the first keeps using the same source the process was
+/// started with. Only `discover_and_run_kiosk_session` actually branches
+/// on it; every other function in the chain just forwards it along.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KioskTransportSource {
+    Usb,
+    Wireless,
+}
+
 /// Polls for a candidate device, exactly as `discover_and_run_kiosk_session`
 /// always has — split out so it can be called a second time, after a
 /// [`reset_stale_kiosk_device`] reset, to (re)discover the device instead
@@ -1079,31 +1092,78 @@ fn discover_kiosk_candidate(cancel: &CancellationFlag) -> Option<transport_api::
 /// one would just fail again.
 fn discover_and_run_kiosk_session(
     tls12_compatibility: bool,
+    source: KioskTransportSource,
     handoff: Gtk4WindowHandoff,
     touch_settings: TouchSettingsHandoff,
     cancel: &CancellationFlag,
     reset_before_attempt: bool,
 ) -> Result<(), CliError> {
-    let Some(mut device) = discover_kiosk_candidate(cancel) else {
-        return Ok(());
-    };
-    if reset_before_attempt {
-        reset_stale_kiosk_device(&device);
-        let Some(post_reset_device) = discover_kiosk_candidate(cancel) else {
-            return Ok(());
-        };
-        device = post_reset_device;
+    match source {
+        KioskTransportSource::Usb => {
+            let Some(mut device) = discover_kiosk_candidate(cancel) else {
+                return Ok(());
+            };
+            if reset_before_attempt {
+                reset_stale_kiosk_device(&device);
+                let Some(post_reset_device) = discover_kiosk_candidate(cancel) else {
+                    return Ok(());
+                };
+                device = post_reset_device;
+            }
+            let selector = format!("{}:{}", device.bus, device.address);
+            println!(
+                "probe_state=kiosk_device_selected selector={selector} elapsed_ms={}",
+                crate::auth_discovery_probe::elapsed_ms_since_process_start()
+            );
+            run_session(
+                &selector,
+                tls12_compatibility,
+                handoff,
+                touch_settings,
+                cancel,
+            )
+        }
+        // No USB device to reset — `reset_before_attempt` is meaningful
+        // only for the `Usb` source, so it's deliberately not threaded
+        // in here at all.
+        KioskTransportSource::Wireless => {
+            run_wireless_kiosk_session(tls12_compatibility, handoff, touch_settings, cancel)
+        }
     }
-    let selector = format!("{}:{}", device.bus, device.address);
-    println!(
-        "probe_state=kiosk_device_selected selector={selector} elapsed_ms={}",
-        crate::auth_discovery_probe::elapsed_ms_since_process_start()
+}
+
+/// The `KioskTransportSource::Wireless` counterpart to [`run_session`]:
+/// sources its transport from
+/// [`crate::wireless_bootstrap::bootstrap_wireless_transport`] (AP
+/// bring-up + Bluetooth→Wi-Fi handoff) instead of USB/AOA, then hands off
+/// to the same `auth_discovery_probe::run`, under `Gtk4Window` so
+/// gestures actually work over wireless (see `wireless_bootstrap`'s own
+/// module doc comment for why `Wayland` didn't). Holds the returned
+/// `WifiAccessPoint` guard for the whole session — dropping it at the end
+/// of this function tears the access point down, exactly as
+/// `wireless_bootstrap::run` already does for `usb
+/// wireless-bootstrap-probe`.
+fn run_wireless_kiosk_session(
+    tls12_compatibility: bool,
+    handoff: Gtk4WindowHandoff,
+    touch_settings: TouchSettingsHandoff,
+    cancel: &CancellationFlag,
+) -> Result<(), CliError> {
+    connection_state::report(ConnectionState::Ready);
+    let paths = credential_store::CredentialPaths::from(
+        credential_store::load_config(Path::new("/etc/aa-headunit/config.toml"))
+            .map_err(|error| CliError::Credentials(error.to_string()))?,
     );
-    run_session(
-        &selector,
+    let credentials = credential_store::load_credentials(&paths, true)
+        .map_err(|error| CliError::Credentials(error.to_string()))?;
+
+    let (mut transport, _ap_guard) = crate::wireless_bootstrap::bootstrap_wireless_transport()?;
+
+    crate::auth_discovery_probe::run(
+        &mut transport,
         tls12_compatibility,
-        handoff,
-        touch_settings,
+        credentials.material,
+        VideoRenderTarget::Gtk4Window(handoff, touch_settings),
         cancel,
     )
 }
@@ -1117,6 +1177,7 @@ fn discover_and_run_kiosk_session(
 fn install_kiosk_hang_safety_net(
     window: Rc<KioskWindow>,
     tls12_compatibility: bool,
+    source: KioskTransportSource,
     hang_safety_net_seconds: u32,
     cancel: CancellationFlag,
     final_result: Rc<RefCell<Option<Result<(), CliError>>>>,
@@ -1133,6 +1194,7 @@ fn install_kiosk_hang_safety_net(
             end_kiosk_attempt(
                 Rc::clone(&window),
                 tls12_compatibility,
+                source,
                 hang_safety_net_seconds,
                 cancel.clone(),
                 Rc::clone(&final_result),
@@ -1192,6 +1254,7 @@ fn install_kiosk_hang_safety_net(
 fn end_kiosk_attempt(
     window: Rc<KioskWindow>,
     tls12_compatibility: bool,
+    source: KioskTransportSource,
     hang_safety_net_seconds: u32,
     cancel: CancellationFlag,
     final_result: Rc<RefCell<Option<Result<(), CliError>>>>,
@@ -1233,6 +1296,7 @@ fn end_kiosk_attempt(
         start_kiosk_session(
             &window,
             tls12_compatibility,
+            source,
             hang_safety_net_seconds,
             &cancel,
             &final_result,
@@ -1301,10 +1365,11 @@ fn wire_kiosk_handle_polls(
 /// and reverted). `run_kiosk` always passes `(true, false)`;
 /// [`end_kiosk_attempt`]'s own reconnect call always passes `false` for
 /// `is_first_attempt`.
-#[allow(clippy::fn_params_excessive_bools)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn start_kiosk_session(
     window: &Rc<KioskWindow>,
     tls12_compatibility: bool,
+    source: KioskTransportSource,
     hang_safety_net_seconds: u32,
     cancel: &CancellationFlag,
     final_result: &Rc<RefCell<Option<Result<(), CliError>>>>,
@@ -1337,6 +1402,7 @@ fn start_kiosk_session(
     let safety_net_id = install_kiosk_hang_safety_net(
         Rc::clone(window),
         tls12_compatibility,
+        source,
         hang_safety_net_seconds,
         cancel.clone(),
         Rc::clone(final_result),
@@ -1380,6 +1446,7 @@ fn start_kiosk_session(
     thread::spawn(move || {
         let result = discover_and_run_kiosk_session(
             tls12_compatibility,
+            source,
             handoff,
             touch_settings,
             &cancel_for_thread,
@@ -1399,6 +1466,7 @@ fn start_kiosk_session(
                 end_kiosk_attempt(
                     Rc::clone(&window_for_result),
                     tls12_compatibility,
+                    source,
                     hang_safety_net_seconds,
                     cancel_for_result.clone(),
                     Rc::clone(&final_result_for_result),
@@ -1416,13 +1484,18 @@ fn start_kiosk_session(
     });
 }
 
-/// Entry point for `usb kiosk --allow-live-aap [--tls12-compat]` — the
-/// unattended, boot-time, reconnect-forever equivalent of
+/// Entry point for `usb kiosk --allow-live-aap [--tls12-compat]` (`source
+/// = Usb`) and `usb wireless-kiosk --allow-live-aap [--tls12-compat]`
+/// (`source = Wireless`, added 2026-08-23 so head-unit gestures work over
+/// a wireless session too — see [`KioskTransportSource`]'s own doc
+/// comment) — the unattended, boot-time, reconnect-forever equivalent of
 /// [`run`]/[`run_with_cancel`]. Builds the fullscreen window exactly once
 /// ([`build_kiosk_window`]) and keeps it alive for the whole process
 /// lifetime, running one `AAP` session attempt after another against it
 /// ([`start_kiosk_session`]) without ever tearing down or recreating the
-/// window/`Application` in between.
+/// window/`Application` in between. `source` stays fixed for the whole
+/// process — a process either always reconnects over USB or always over
+/// wireless, never switching mid-run.
 ///
 /// **Why this exists (2026-08-21)**: the previous design called
 /// `run_with_cancel` fresh for every single reconnect attempt from a loop
@@ -1452,6 +1525,7 @@ fn start_kiosk_session(
 /// caused the original hang.
 pub(crate) fn run_kiosk(
     tls12_compatibility: bool,
+    source: KioskTransportSource,
     cancel: &CancellationFlag,
 ) -> Result<(), CliError> {
     let hang_safety_net_seconds = hang_safety_net_seconds()?;
@@ -1483,6 +1557,7 @@ pub(crate) fn run_kiosk(
         start_kiosk_session(
             &window,
             tls12_compatibility,
+            source,
             hang_safety_net_seconds,
             &cancel_for_activate,
             &final_result_for_activate,

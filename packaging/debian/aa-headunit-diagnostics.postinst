@@ -137,15 +137,23 @@ case "$1" in
         # Fixed the same way `ping` and similar tools are traditionally
         # made to work for unprivileged users: `setcap` grants exactly
         # `CAP_NET_ADMIN`/`CAP_NET_RAW` (network interface configuration
-        # and raw-socket access — not full root) directly on the binaries
-        # that actually need them, rather than running any part of this app
-        # as root. Re-run on every install/upgrade, since dpkg replaces
-        # these binaries with a fresh inode each time and file capabilities
-        # do not survive that; each binary's absence is tolerated (`|| true`)
-        # — `hostapd`/`dnsmasq` come from separate packages this one only
-        # recommends, not requires, and a missing one simply leaves
-        # wireless bootstrap non-functional rather than breaking the rest
-        # of the appliance.
+        # and raw-socket access) plus `CAP_NET_BIND_SERVICE` (network
+        # interface configuration, raw-socket access, and binding a
+        # privileged port — not full root) directly on the binaries that
+        # actually need them, rather than running any part of this app as
+        # root. `CAP_NET_BIND_SERVICE` specifically was a second
+        # real-hardware finding, 2026-08-23, one layer deeper than the
+        # first: `dnsmasq` still failed even once its lease-file
+        # permission problem was fixed, this time with "failed to bind
+        # DHCP server socket: Permission denied" — DHCP's server port
+        # (67/UDP) is itself a privileged port under 1024, a completely
+        # separate check from `CAP_NET_ADMIN`/`CAP_NET_RAW`. Re-run on
+        # every install/upgrade, since dpkg replaces these binaries with a
+        # fresh inode each time and file capabilities do not survive that;
+        # each binary's absence is tolerated (`|| true`) — `hostapd`/`dnsmasq`
+        # come from separate packages this one only recommends, not
+        # requires, and a missing one simply leaves wireless bootstrap
+        # non-functional rather than breaking the rest of the appliance.
         if command -v setcap >/dev/null 2>&1; then
             for capable_binary in \
                 /usr/bin/aa-headunit-diagnostics \
@@ -159,7 +167,7 @@ case "$1" in
                     # today, so resolving defensively costs nothing (a
                     # no-op for an already-regular file, as all three are
                     # right now).
-                    setcap cap_net_admin,cap_net_raw+ep \
+                    setcap cap_net_admin,cap_net_bind_service,cap_net_raw+ep \
                         "$(readlink -f "$capable_binary")" || true
                 fi
             done

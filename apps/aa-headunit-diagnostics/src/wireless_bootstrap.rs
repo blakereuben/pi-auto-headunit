@@ -7,15 +7,24 @@
 //! the full M7 milestone (no persistence, no reconnect loop, no soak
 //! testing, no multi-radio provider selection).
 //!
-//! Sequence: bring up a Wi-Fi access point on `wlan0` (`hostapd` +
-//! `dnsmasq`, matching `f-io/LIVI`'s own documented runtime dependencies)
-//! → become Bluetooth-discoverable and accept one RFCOMM connection
-//! (`transport_bluetooth`) → drive the `aaw` bootstrap exchange
-//! (`protocol_aap::{encode_aaw_message, decode_aaw_message, ...}`) →
-//! once the phone reports success, accept its incoming Wi-Fi connection
-//! (`transport_tcp::WirelessTcpTransport`) → hand that transport to the
-//! exact same, completely unmodified `auth_discovery_probe::run` every
-//! other command already calls.
+//! Sequence ([`bootstrap_wireless_transport`]): bring up a Wi-Fi access
+//! point on `wlan0` (`hostapd` + `dnsmasq`, matching `f-io/LIVI`'s own
+//! documented runtime dependencies) → become Bluetooth-discoverable and
+//! accept one RFCOMM connection (`transport_bluetooth`) → drive the `aaw`
+//! bootstrap exchange (`protocol_aap::{encode_aaw_message,
+//! decode_aaw_message, ...}`) → once the phone reports success, accept
+//! its incoming Wi-Fi connection (`transport_tcp::WirelessTcpTransport`)
+//! → hand that transport to the exact same, completely unmodified
+//! `auth_discovery_probe::run` every other command already calls. [`run`]
+//! (`usb wireless-bootstrap-probe`) is this sequence alone, under
+//! `VideoRenderTarget::Wayland`; `usb wireless-kiosk`
+//! (`gtk_dev_ui::discover_and_run_kiosk_session`'s `Wireless` branch)
+//! reuses [`bootstrap_wireless_transport`] directly, under
+//! `VideoRenderTarget::Gtk4Window` instead, so head-unit gestures
+//! (arm-swipe → settings/quick-controls/screen-off) actually work over a
+//! wireless session — `Wayland` never wires a `TouchSettingsHandoff` (see
+//! `auth_discovery_probe::touch_settings_handoff`'s own doc comment),
+//! which is why they didn't the first time this was tried (2026-08-23).
 //!
 //! **Honesty up front**: unlike the wired protocol, this is reverse-
 //! engineered, non-official behaviour with real but not first-party-
@@ -59,7 +68,21 @@ const AP_PORT: u16 = 5288;
 // for the operator to pair at the OS level, then separately open the
 // Android Auto app and let it notice.
 const BLUETOOTH_ACCEPT_TIMEOUT: Duration = Duration::from_secs(180);
-const BLUETOOTH_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Raised from an initial 10s — real-hardware finding, 2026-08-23: a
+/// single `transport.receive()` call bounds the *entire* wait for each
+/// `aaw` message (`receive_aaw_message` gives up on its very first
+/// timeout, it doesn't loop-and-retry for an overall longer budget — see
+/// that function's own doc comment). Most `aaw` reads really are
+/// near-instant protocol acks, but the last one in the exchange,
+/// `WifiConnectionStatus`, only arrives after the phone has *actually*
+/// associated to the new Wi-Fi network and obtained a DHCP lease — a
+/// genuine multi-second real-world operation, not a protocol
+/// round-trip, especially the first time a phone sees a brand-new SSID.
+/// 10s was intermittently too tight for that specific wait — it timed
+/// out even with the operator actively watching their phone, nothing to
+/// do with attention. Matches [`WIFI_ACCEPT_TIMEOUT`]'s own existing 30s
+/// precedent for "waiting on a real phone-side Wi-Fi operation."
+const BLUETOOTH_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const WIFI_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const WIFI_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hostapd/dnsmasq need a moment to actually start listening after being
@@ -80,12 +103,44 @@ pub(crate) fn run(tls12_compatibility: bool) -> Result<(), CliError> {
     let credentials = credential_store::load_credentials(&paths, true)
         .map_err(|error| CliError::Credentials(error.to_string()))?;
 
+    let (mut transport, _ap_guard) = bootstrap_wireless_transport()?;
+
+    let result = crate::auth_discovery_probe::run(
+        &mut transport,
+        tls12_compatibility,
+        credentials.material,
+        crate::auth_discovery_probe::VideoRenderTarget::Wayland,
+        &cancel,
+    );
+    if result.is_err() {
+        connection_state::report(ConnectionState::Error);
+    }
+    result
+}
+
+/// The transport-acquisition sequence shared by [`run`] (the standalone
+/// `usb wireless-bootstrap-probe` diagnostic, which hands the result to
+/// `auth_discovery_probe::run` under `VideoRenderTarget::Wayland`) and
+/// `usb wireless-kiosk`
+/// (`gtk_dev_ui::discover_and_run_kiosk_session`'s `Wireless` branch,
+/// which uses `VideoRenderTarget::Gtk4Window` instead so gestures work):
+/// bring up this device's own Wi-Fi access point, wait for a phone to
+/// pair over Bluetooth and complete the `aaw` credential handoff, then
+/// accept that phone's resulting Wi-Fi connection.
+///
+/// Returns the [`WifiAccessPoint`] guard alongside the transport — the
+/// caller must keep it alive for the whole `AAP` session that follows,
+/// not just this handshake, since it's the actual network the phone
+/// stays connected to for streaming. Dropping it tears down
+/// `hostapd`/`dnsmasq`/the interface.
+pub(crate) fn bootstrap_wireless_transport()
+-> Result<(WirelessTcpTransport, WifiAccessPoint), CliError> {
     let ssid = format!("aa-headunit-{}", random_hex(2)?);
     let password = random_hex(8)?;
     let bssid = wlan_mac_address()?;
 
     println!("wireless_bootstrap_state=bringing_up_access_point");
-    let _ap_guard = WifiAccessPoint::start(&ssid, &password)?;
+    let ap_guard = WifiAccessPoint::start(&ssid, &password)?;
     println!("wireless_bootstrap_state=access_point_ready ssid={ssid}");
 
     connection_state::report(ConnectionState::Connecting);
@@ -99,7 +154,7 @@ pub(crate) fn run(tls12_compatibility: bool) -> Result<(), CliError> {
     drop(bluetooth);
 
     println!("wireless_bootstrap_state=waiting_for_wifi_connection");
-    let mut transport = WirelessTcpTransport::listen(
+    let transport = WirelessTcpTransport::listen(
         SocketAddr::new(IpAddr::V4(AP_IP), AP_PORT),
         WIFI_ACCEPT_TIMEOUT,
         WIFI_IO_TIMEOUT,
@@ -110,17 +165,7 @@ pub(crate) fn run(tls12_compatibility: bool) -> Result<(), CliError> {
         transport.peer()
     );
 
-    let result = crate::auth_discovery_probe::run(
-        &mut transport,
-        tls12_compatibility,
-        credentials.material,
-        crate::auth_discovery_probe::VideoRenderTarget::Wayland,
-        &cancel,
-    );
-    if result.is_err() {
-        connection_state::report(ConnectionState::Error);
-    }
-    result
+    Ok((transport, ap_guard))
 }
 
 /// Drives the `aaw` exchange over an already-connected Bluetooth RFCOMM
@@ -401,11 +446,12 @@ fn flush_wlan_interface() -> Result<(), CliError> {
 /// restores `wlan0` to `NetworkManager`'s management, best-effort (errors
 /// during cleanup are not fatal — this is a diagnostic tool, not a
 /// long-running service).
-struct WifiAccessPoint {
+pub(crate) struct WifiAccessPoint {
     hostapd: Child,
     dnsmasq: Child,
     hostapd_config_path: PathBuf,
     dnsmasq_config_path: PathBuf,
+    dnsmasq_lease_path: PathBuf,
 }
 
 impl WifiAccessPoint {
@@ -422,8 +468,11 @@ impl WifiAccessPoint {
         )?;
         configure_wlan_interface()?;
 
+        let dnsmasq_lease_path =
+            std::env::temp_dir().join(format!("aa-headunit-dnsmasq-{}.leases", std::process::id()));
         let hostapd_config_path = write_temp_config("hostapd", &hostapd_config(ssid, password))?;
-        let dnsmasq_config_path = write_temp_config("dnsmasq", &dnsmasq_config())?;
+        let dnsmasq_config_path =
+            write_temp_config("dnsmasq", &dnsmasq_config(&dnsmasq_lease_path))?;
 
         let hostapd = Command::new("hostapd")
             .arg(&hostapd_config_path)
@@ -446,6 +495,7 @@ impl WifiAccessPoint {
             dnsmasq,
             hostapd_config_path,
             dnsmasq_config_path,
+            dnsmasq_lease_path,
         })
     }
 }
@@ -458,6 +508,7 @@ impl Drop for WifiAccessPoint {
         let _ = self.dnsmasq.wait();
         let _ = std::fs::remove_file(&self.hostapd_config_path);
         let _ = std::fs::remove_file(&self.dnsmasq_config_path);
+        let _ = std::fs::remove_file(&self.dnsmasq_lease_path);
         let _ = flush_wlan_interface();
         let _ = Command::new("nmcli")
             .args(["device", "set", WLAN_INTERFACE, "managed", "yes"])
@@ -473,13 +524,30 @@ fn command_with_args<const N: usize>(program: &str, args: [&str; N]) -> Command 
     command
 }
 
+/// `hw_mode=a`/`channel=36` (5GHz), not the original `g`/`6` (2.4GHz) —
+/// real-hardware finding, 2026-08-23: the very first fully-working
+/// wireless Android Auto session (real video/audio confirmed on the head
+/// unit's own screen) still "felt very laggy" to the operator. 2.4GHz is
+/// far more congestion-prone and lower-bandwidth than 5GHz, and this AP
+/// had never had any latency/throughput tuning before that first session
+/// — this project's own onboard radio (`iw list`, confirmed directly on
+/// this hardware) supports 5GHz AP mode. Channel 36 is deliberately a
+/// non-DFS channel (no `(radar detection)` flag in `iw list`'s output)
+/// so beaconing starts immediately, with no mandatory Channel
+/// Availability Check delay a DFS channel would add. `country_code=GB`
+/// matches this device's own already-configured regulatory domain
+/// (`iw reg get`, confirmed directly) — required for hostapd to use the
+/// correct 5GHz power/channel rules rather than falling back to the
+/// more restrictive "00" world regulatory domain.
 fn hostapd_config(ssid: &str, password: &str) -> String {
     format!(
         "interface={WLAN_INTERFACE}\n\
          driver=nl80211\n\
          ssid={ssid}\n\
-         hw_mode=g\n\
-         channel=6\n\
+         country_code=GB\n\
+         ieee80211d=1\n\
+         hw_mode=a\n\
+         channel=36\n\
          wpa=2\n\
          wpa_passphrase={password}\n\
          wpa_key_mgmt=WPA-PSK\n\
@@ -487,12 +555,27 @@ fn hostapd_config(ssid: &str, password: &str) -> String {
     )
 }
 
-fn dnsmasq_config() -> String {
+/// `lease_path` is required, not optional — real-hardware finding,
+/// 2026-08-23: dnsmasq's own default lease file
+/// (`/var/lib/misc/dnsmasq.leases`) is root-owned, so it silently exits
+/// with "Permission denied" the instant it starts as this project's
+/// unprivileged appliance user, well before it ever answers a DHCP
+/// request. The phone still receives real Wi-Fi credentials over
+/// Bluetooth and reports back a success status for that exchange (which
+/// is *not* a real connection — see `run_aaw_bootstrap`'s own doc
+/// comment: it only covers the `aaw` credential handoff), then genuinely
+/// fails to associate, because there is no DHCP server left alive to
+/// hand it an IP address. `write_temp_config`'s own temp-file convention
+/// is reused here for the lease path too — a real lease file, just one
+/// this unprivileged user can actually write.
+fn dnsmasq_config(lease_path: &Path) -> String {
     format!(
         "interface={WLAN_INTERFACE}\n\
          bind-interfaces\n\
          dhcp-range={AP_DHCP_RANGE_START},{AP_DHCP_RANGE_END},255.255.255.0,12h\n\
-         port=0\n"
+         dhcp-leasefile={}\n\
+         port=0\n",
+        lease_path.display()
     )
 }
 
