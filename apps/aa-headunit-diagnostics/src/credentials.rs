@@ -4,8 +4,11 @@ use credential_store::{
 use std::path::{Path, PathBuf};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/aa-headunit/config.toml";
-const DEFAULT_CERTIFICATE_PATH: &str = "/etc/aa-headunit/credentials/headunit.crt";
-const DEFAULT_PRIVATE_KEY_PATH: &str = "/etc/aa-headunit/credentials/headunit.key";
+/// Shared with [`crate::credentials_setup_wizard`], which installs to the
+/// exact same destination the `credentials install` CLI command below
+/// does — one default location, not two independently-maintained copies.
+pub(crate) const DEFAULT_CERTIFICATE_PATH: &str = "/etc/aa-headunit/credentials/headunit.crt";
+pub(crate) const DEFAULT_PRIVATE_KEY_PATH: &str = "/etc/aa-headunit/credentials/headunit.key";
 
 pub fn run(command: &str, args: &[String]) -> Result<(), CredentialError> {
     match command {

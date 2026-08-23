@@ -20,5 +20,7 @@ override_dh_auto_install:
 		debian/aa-headunit-diagnostics/usr/share/aa-headunit/labwc-autostart
 	install -D -m0644 packaging/labwc/aa-headunit.desktop \
 		debian/aa-headunit-diagnostics/usr/share/aa-headunit/aa-headunit.desktop
+	install -D -m0644 packaging/labwc/aa-headunit-setup.desktop \
+		debian/aa-headunit-diagnostics/usr/share/aa-headunit/aa-headunit-setup.desktop
 	install -D -m0644 packaging/systemd/journald-40-rpi-volatile-storage.conf \
 		debian/aa-headunit-diagnostics/etc/systemd/journald.conf.d/40-rpi-volatile-storage.conf

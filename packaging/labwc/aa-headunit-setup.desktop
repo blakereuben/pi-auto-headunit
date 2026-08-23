@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Android Auto Head Unit Setup
+Comment=Install your Android Auto certificate and private key with a guided wizard
+Exec=/usr/bin/aa-headunit-diagnostics credentials setup
+Icon=security-high
+Terminal=false
+Categories=Settings;

@@ -87,6 +87,33 @@ const AA_WIRELESS_SDP_CHANNEL: u16 = 22;
 /// wait): this is a quick nudge, not the real wait.
 const ACTIVE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Privacy review finding, 2026-08-23
+/// (`docs/protocol/wireless-security-review.md`): the active-reconnect
+/// loop's own diagnostic logging printed a connecting phone's full
+/// Bluetooth MAC address — not a credential, but still a phone
+/// identifier CLAUDE.md's own standing rule names explicitly. Rather than
+/// drop the address entirely (real value for an operator debugging
+/// "which paired device did this actually try" when more than one is
+/// paired), only the last two octets are logged — enough to
+/// distinguish devices in a diagnostic session without printing a
+/// complete, globally-unique identifier. `bluer::Address`'s `Display`
+/// always renders six colon-separated hex octets
+/// (`AA:BB:CC:DD:EE:FF`); this asserts that shape rather than silently
+/// producing a misleading redaction if it were ever wrong.
+fn redact_bluetooth_address(address: bluer::Address) -> String {
+    let full = address.to_string();
+    match full.rsplit_once(':') {
+        Some((_prefix, last_octet)) => {
+            let second_to_last = full
+                .split(':')
+                .nth(4)
+                .expect("bluer::Address::to_string() is six colon-separated hex octets");
+            format!("xx:xx:xx:xx:{second_to_last}:{last_octet}")
+        }
+        None => "xx:xx:xx:xx:xx:xx".to_string(),
+    }
+}
+
 #[derive(Debug)]
 pub enum BluetoothError {
     Session(String),
@@ -254,6 +281,7 @@ pub fn accept_wireless_bootstrap_connection(
                     continue;
                 };
                 if device.is_paired().await.unwrap_or(false) {
+                    let redacted = redact_bluetooth_address(address);
                     match tokio::time::timeout(
                         ACTIVE_RECONNECT_TIMEOUT,
                         device.connect_profile(&handsfree_uuid),
@@ -261,16 +289,18 @@ pub fn accept_wireless_bootstrap_connection(
                     .await
                     {
                         Ok(Ok(())) => {
-                            println!("wireless_bootstrap_state=paired_device_reconnected address={address}");
+                            println!(
+                                "wireless_bootstrap_state=paired_device_reconnected address={redacted}"
+                            );
                         }
                         Ok(Err(error)) => {
                             eprintln!(
-                                "wireless_bootstrap_state=paired_device_reconnect_failed address={address} error={error}"
+                                "wireless_bootstrap_state=paired_device_reconnect_failed address={redacted} error={error}"
                             );
                         }
                         Err(_elapsed) => {
                             eprintln!(
-                                "wireless_bootstrap_state=paired_device_reconnect_failed address={address} error=timed out after {ACTIVE_RECONNECT_TIMEOUT:?}"
+                                "wireless_bootstrap_state=paired_device_reconnect_failed address={redacted} error=timed out after {ACTIVE_RECONNECT_TIMEOUT:?}"
                             );
                         }
                     }
@@ -352,5 +382,11 @@ mod tests {
     fn profile_uuid_constants_parse() {
         assert!(Uuid::parse_str(AA_WIRELESS_PROFILE_UUID).is_ok());
         assert!(Uuid::parse_str(HANDSFREE_AG_PROFILE_UUID).is_ok());
+    }
+
+    #[test]
+    fn redacts_bluetooth_address_to_last_two_octets() {
+        let address = bluer::Address::new([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(redact_bluetooth_address(address), "xx:xx:xx:xx:EE:FF");
     }
 }

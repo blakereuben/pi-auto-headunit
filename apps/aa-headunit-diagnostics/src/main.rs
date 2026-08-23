@@ -16,6 +16,9 @@ mod cancellation;
 mod credentials;
 
 #[cfg(target_os = "linux")]
+mod credentials_setup_wizard;
+
+#[cfg(target_os = "linux")]
 mod session_supervisor;
 
 #[cfg(target_os = "linux")]
@@ -338,6 +341,7 @@ fn print_help() {
            credentials check --certificate PATH --private-key PATH\n\
            credentials install --certificate PATH --private-key PATH\n\
            credentials status [--config PATH]\n\
+           credentials setup  (guided GTK4 wizard around check/install, for a graphical first-run setup)\n\
            developer tcp-probe\n\
            developer tls-probe --allow-live-aap [--tls12-compat]\n\
            developer credential-probe --allow-live-aap [--tls12-compat]\n\
@@ -362,6 +366,9 @@ fn print_help() {
 
 #[cfg(target_os = "linux")]
 fn credentials_command(command: &str, args: &[String]) -> Result<(), CliError> {
+    if command == "setup" {
+        return credentials_setup_wizard::run();
+    }
     credentials::run(command, args).map_err(|error| CliError::Credentials(error.to_string()))
 }
 

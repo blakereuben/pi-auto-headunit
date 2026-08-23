@@ -221,6 +221,25 @@ case "$1" in
                 chown -R "$active_user:$active_user" \
                     "$active_home/.local/share/applications"
             fi
+            # Same pattern as the icon above, for the guided credential
+            # setup wizard (`aa-headunit-diagnostics credentials setup`) —
+            # a separate icon so an operator installing their certificate
+            # for the first time has something to double-tap without
+            # needing a terminal.
+            if [ -n "$active_home" ] && [ -d "$active_home" ] \
+                && [ -f /usr/share/aa-headunit/aa-headunit-setup.desktop ]; then
+                if [ -d "$active_home/Desktop" ]; then
+                    install -m0755 /usr/share/aa-headunit/aa-headunit-setup.desktop \
+                        "$active_home/Desktop/aa-headunit-setup.desktop"
+                    chown "$active_user:$active_user" \
+                        "$active_home/Desktop/aa-headunit-setup.desktop"
+                fi
+                mkdir -p "$active_home/.local/share/applications"
+                install -m0755 /usr/share/aa-headunit/aa-headunit-setup.desktop \
+                    "$active_home/.local/share/applications/aa-headunit-setup.desktop"
+                chown -R "$active_user:$active_user" \
+                    "$active_home/.local/share/applications"
+            fi
         fi
 
         # Obsolete files from earlier designs (the VT-templated
