@@ -267,6 +267,8 @@ struct RawSettings {
     theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     launch_on_boot: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wireless_bluetooth_auto_connect: Option<bool>,
     /// `Vec<f64>` rather than `[f64; 10]` purely to sidestep any doubt
     /// about this project's pinned `serde`/`toml` versions' fixed-size
     /// array support — `HeadUnitSettings::eq_bands`/`set_eq_bands` are
@@ -385,6 +387,7 @@ pub struct HeadUnitSettings {
     bluetooth_preference: platform_api::ProviderPreference,
     theme: Option<String>,
     launch_on_boot: bool,
+    wireless_bluetooth_auto_connect: bool,
     /// Gains in dB for `GStreamer`'s `equalizer-10bands` element's
     /// `band0`..`band9` properties (ISO center frequencies, roughly
     /// 29 Hz to 15 kHz). All-zero is flat/unmodified — the default, so a
@@ -487,6 +490,7 @@ impl HeadUnitSettings {
             bluetooth_preference: platform_api::ProviderPreference::Auto,
             theme: None,
             launch_on_boot: false,
+            wireless_bluetooth_auto_connect: true,
             eq_bands: [0.0; EQ_BAND_COUNT],
             eq_presets: [[0.0; EQ_BAND_COUNT]; EQ_PRESET_COUNT],
             eq_preset_names: std::array::from_fn(|index| format!("Preset {}", index + 1)),
@@ -771,6 +775,23 @@ impl HeadUnitSettings {
         self.launch_on_boot = enabled;
     }
 
+    /// Whether `usb wireless-kiosk`/`usb wireless-bootstrap-probe` should
+    /// actively reconnect an already-OS-paired phone
+    /// (`transport_bluetooth::accept_wireless_bootstrap_connection`)
+    /// before falling back to passively advertising and waiting — added
+    /// 2026-08-23 at the operator's explicit request, real-hardware-
+    /// confirmed working the same night. Defaults on, unlike
+    /// `launch_on_boot`: this isn't a can-silently-hang-on-boot risk, just
+    /// the now-proven-correct way wireless reconnection should behave.
+    #[must_use]
+    pub fn wireless_bluetooth_auto_connect(&self) -> bool {
+        self.wireless_bluetooth_auto_connect
+    }
+
+    pub fn set_wireless_bluetooth_auto_connect(&mut self, enabled: bool) {
+        self.wireless_bluetooth_auto_connect = enabled;
+    }
+
     #[must_use]
     pub fn experimental_disclaimer_dismissed(&self) -> bool {
         self.experimental_disclaimer_dismissed
@@ -859,6 +880,9 @@ impl HeadUnitSettings {
         }
         if let Some(enabled) = raw.launch_on_boot {
             settings.set_launch_on_boot(enabled);
+        }
+        if let Some(enabled) = raw.wireless_bluetooth_auto_connect {
+            settings.set_wireless_bluetooth_auto_connect(enabled);
         }
         if let Some(dismissed) = raw.experimental_disclaimer_dismissed {
             settings.set_experimental_disclaimer_dismissed(dismissed);
@@ -969,6 +993,7 @@ impl HeadUnitSettings {
             .clone()
             .or_else(|| on_disk.as_ref().and_then(|settings| settings.theme.clone()));
         raw.launch_on_boot = Some(self.launch_on_boot);
+        raw.wireless_bluetooth_auto_connect = Some(self.wireless_bluetooth_auto_connect);
         raw.experimental_disclaimer_dismissed = Some(self.experimental_disclaimer_dismissed);
         raw.legal_page_hidden = Some(self.legal_page_hidden);
         raw.volume_percent = Some(self.volume_percent);
@@ -1398,6 +1423,27 @@ mod tests {
 
         let loaded = HeadUnitSettings::load(&path);
         assert!(loaded.launch_on_boot());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wireless_bluetooth_auto_connect_defaults_on_and_round_trips_disabled() {
+        let defaults = HeadUnitSettings::defaults();
+        assert!(defaults.wireless_bluetooth_auto_connect());
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-headunit-settings-bt-auto-connect-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.toml");
+
+        let mut settings = HeadUnitSettings::defaults();
+        settings.set_wireless_bluetooth_auto_connect(false);
+        settings.save(&path).expect("save succeeds");
+
+        let loaded = HeadUnitSettings::load(&path);
+        assert!(!loaded.wireless_bluetooth_auto_connect());
 
         let _ = fs::remove_dir_all(&dir);
     }

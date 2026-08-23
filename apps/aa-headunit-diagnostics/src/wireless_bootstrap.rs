@@ -145,9 +145,16 @@ pub(crate) fn bootstrap_wireless_transport()
 
     connection_state::report(ConnectionState::Connecting);
     println!("wireless_bootstrap_state=bluetooth_discoverable_waiting_for_phone");
-    let mut bluetooth =
-        accept_wireless_bootstrap_connection(BLUETOOTH_ACCEPT_TIMEOUT, BLUETOOTH_IO_TIMEOUT)
-            .map_err(|error| CliError::Protocol(error.to_string()))?;
+    let auto_connect_paired_devices = crate::settings::HeadUnitSettings::load(
+        std::path::Path::new(crate::settings::DEFAULT_SETTINGS_PATH),
+    )
+    .wireless_bluetooth_auto_connect();
+    let mut bluetooth = accept_wireless_bootstrap_connection(
+        BLUETOOTH_ACCEPT_TIMEOUT,
+        BLUETOOTH_IO_TIMEOUT,
+        auto_connect_paired_devices,
+    )
+    .map_err(|error| CliError::Protocol(error.to_string()))?;
     println!("wireless_bootstrap_state=bluetooth_connected");
 
     run_aaw_bootstrap(&mut bluetooth, &ssid, &password, &bssid)?;

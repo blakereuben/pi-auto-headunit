@@ -33,6 +33,15 @@
 //! empirically, expect possible failure, matching this project's
 //! `docs/protocol/error-2-investigation.md` precedent for reverse-
 //! engineered behaviour.
+//!
+//! [`accept_wireless_bootstrap_connection`] also now actively reconnects
+//! any already-OS-paired device before falling back to its original
+//! passive advertise-and-wait behaviour — real production head units
+//! don't just wait for the phone to notice them, they proactively
+//! reconnect a known phone the moment they power up, which is what
+//! prompts the phone's own Android Auto app to offer wireless
+//! projection. Not yet confirmed on real hardware whether this actually
+//! has that effect.
 
 #![cfg(target_os = "linux")]
 
@@ -145,7 +154,11 @@ impl SessionTransport for BluetoothTransport {
 /// by `accept_timeout`) for a phone to connect over the AA-Wireless
 /// RFCOMM channel, and returns a ready-to-use [`BluetoothTransport`] once
 /// it does. `io_timeout` bounds every later `receive`/`send_all` call on
-/// the returned transport.
+/// the returned transport. `auto_connect_paired_devices` gates the
+/// active-reconnect step below (`HeadUnitSettings::wireless_bluetooth_auto_connect`,
+/// an operator-facing setting added 2026-08-23) — `false` skips it
+/// entirely and falls straight to the passive advertise-and-wait flow,
+/// this function's original behaviour.
 ///
 /// # Panics
 ///
@@ -155,6 +168,7 @@ impl SessionTransport for BluetoothTransport {
 pub fn accept_wireless_bootstrap_connection(
     accept_timeout: Duration,
     io_timeout: Duration,
+    auto_connect_paired_devices: bool,
 ) -> Result<BluetoothTransport, BluetoothError> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| BluetoothError::Session(error.to_string()))?;
@@ -183,6 +197,59 @@ pub fn accept_wireless_bootstrap_connection(
             .expect("AA_WIRELESS_PROFILE_UUID is a valid, fixed UUID literal");
         let handsfree_uuid = Uuid::parse_str(HANDSFREE_AG_PROFILE_UUID)
             .expect("HANDSFREE_AG_PROFILE_UUID is a valid, fixed UUID literal");
+
+        // Actively reconnect any already-paired device, 2026-08-23 —
+        // Blake's explicit product requirement, matching how real
+        // production wireless-AA head units behave: they don't just sit
+        // passively advertising and waiting for the phone to notice them
+        // (the SDP-advertise-and-wait flow below, which is all this used
+        // to do); once a phone is OS-level paired, the head unit
+        // proactively reconnects it the moment it powers up, and it's
+        // that reconnection event the phone's own Android Auto app
+        // watches for to offer wireless projection. Best-effort and
+        // non-fatal per device (a phone that's out of range, already
+        // connected, or slow to respond just means this has no visible
+        // effect — the existing passive flow below still runs exactly as
+        // before as a fallback).
+        //
+        // Real-hardware finding, first trial: the generic `Device::connect()`
+        // (bluer's wrapper around BlueZ's own bearer-auto-selecting
+        // `Connect` D-Bus method) failed outright with
+        // `le-connection-abort-by-local` — BlueZ picked the LE bearer for
+        // this dual-mode phone (its own documented tie-break order favors
+        // "latest seen bearer", not always BR/EDR) and the phone wasn't
+        // actively LE-connectable at that moment. Switched to
+        // `Device::connect_profile(&handsfree_uuid)` instead: Handsfree
+        // AG is inherently a classic BR/EDR-only profile (there is no LE
+        // variant), so this can never hit the same LE-bearer failure, and
+        // it's the exact standard reconnection a real car's Bluetooth
+        // stack performs — HFP reconnecting is what a phone's own OS/AA
+        // app watches for as the "car is back" signal, matching this
+        // whole feature's premise. Standard, publicly-specified Bluetooth
+        // SIG behaviour, not an Android-Auto-specific protocol, so no
+        // AASDK/LIVI source citation is needed — matches
+        // `docs/protocol/wireless-source-assessment.md`'s own reasoning
+        // for why the underlying SDP/pairing handshake itself doesn't
+        // need one either.
+        if auto_connect_paired_devices {
+            for address in adapter.device_addresses().await.unwrap_or_default() {
+                let Ok(device) = adapter.device(address) else {
+                    continue;
+                };
+                if device.is_paired().await.unwrap_or(false) {
+                    match device.connect_profile(&handsfree_uuid).await {
+                        Ok(()) => {
+                            println!("wireless_bootstrap_state=paired_device_reconnected address={address}");
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "wireless_bootstrap_state=paired_device_reconnect_failed address={address} error={error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let mut aa_wireless_handle = session
             .register_profile(Profile {

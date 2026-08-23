@@ -279,14 +279,34 @@ impl Drop for VideoRenderPipeline {
         // whole process rather than returning an error, confirmed via a
         // real boot-to-kiosk session that crashed exactly this way right
         // after a clean session end. Marshal the actual teardown onto the
-        // main `GLib` context instead (safe to call from any thread) —
-        // best-effort and fire-and-forget, matching this Drop impl's
-        // existing contract: Drop cannot propagate errors, and EOS is not
-        // required for a safe teardown (Null is always sufficient).
+        // main `GLib` context instead (safe to call from any thread).
+        //
+        // Real-hardware finding, 2026-08-23: the marshalled call used to
+        // be pure fire-and-forget, not waited on at all. That raced
+        // `usb wireless-kiosk`'s reconnect loop, which builds a brand new
+        // `VideoRenderPipeline` against the *same* `gtk4::Picture` widget
+        // as soon as the next session reaches video setup — with nothing
+        // guaranteeing this pipeline's `Null` transition actually
+        // finished releasing the `gtk4paintablesink`'s rendering surface
+        // first, two pipelines could briefly overlap against the same
+        // widget. Real-hardware symptom this caused: the screen freezing
+        // on the previous session's last frame after a reconnect, not
+        // updating to the new session's live video despite it genuinely
+        // streaming underneath (confirmed via log evidence — real,
+        // current `video_media_data_received` events with no visible
+        // change on screen). Now waits (bounded, not indefinite — a
+        // stuck main loop must never hang a `Drop`) for the marshalled
+        // call to actually run before returning, so by the time this
+        // function returns, the pipeline has genuinely reached `Null` —
+        // GStreamer's own contract is that a `Null` transition is always
+        // synchronous/immediate, so 500ms is generous, not tight.
         let pipeline = self.pipeline.clone();
+        let (done_sender, done_receiver) = std::sync::mpsc::channel::<()>();
         gst::glib::MainContext::default().invoke(move || {
             let _ = pipeline.set_state(gst::State::Null);
+            let _ = done_sender.send(());
         });
+        let _ = done_receiver.recv_timeout(std::time::Duration::from_millis(500));
     }
 }
 

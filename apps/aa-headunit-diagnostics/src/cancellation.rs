@@ -47,6 +47,20 @@ impl CancellationFlag {
     pub(crate) fn trigger(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
+
+    /// Resets the flag back to unset — used by `usb kiosk`/`usb
+    /// wireless-kiosk`'s reconnect loop (`gtk_dev_ui.rs`) when a window
+    /// `close-request` should only end the *current* session attempt,
+    /// not quit the whole reconnect-forever process: the same shared
+    /// flag that bounds one attempt's underlying protocol session is
+    /// reused for every subsequent attempt too, so it must be cleared
+    /// before the next one starts, exactly like a real Ctrl-C never
+    /// needs to be (a real `SIGINT` should always mean quit, not just
+    /// end one attempt — `end_kiosk_attempt` only calls this when it's
+    /// determined the trigger was the window, not the signal handler).
+    pub(crate) fn reset(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Installs the process's `SIGINT` handler. Must be called at most once per

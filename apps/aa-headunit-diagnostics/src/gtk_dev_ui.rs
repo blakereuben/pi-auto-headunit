@@ -89,6 +89,24 @@ const BRIGHTNESS_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 /// plus AOA-transition margin.
 const HANG_SAFETY_NET_SECONDS: u32 = 120;
 
+/// `Wireless`-only floor for [`hang_safety_net_seconds`] — real-hardware
+/// finding, 2026-08-23, caught by code review before it could produce
+/// spurious "hang" failures during a reconnect-cycle soak: unlike `Usb`,
+/// `Wireless`'s own transport-acquisition phase
+/// (`wireless_bootstrap::bootstrap_wireless_transport`) has two
+/// legitimate real-world waits of its own — up to `BLUETOOTH_ACCEPT_TIMEOUT`
+/// (180s, waiting for the phone to notice this device again) plus up to
+/// `WIFI_ACCEPT_TIMEOUT` (30s) after that — neither of which
+/// [`HANG_SAFETY_NET_SECONDS`] (120s, tuned around `Usb`'s own much
+/// shorter `PROBE_TIMEOUT`/AOA-transition timing) leaves any room for. A
+/// cycle where the phone genuinely takes over two minutes to reconnect —
+/// exactly the kind of real, expected variance `BLUETOOTH_ACCEPT_TIMEOUT`
+/// itself already tolerates — would otherwise get force-ended by this
+/// timer as a false "hang" before its own legitimate wait ever got a
+/// chance to either succeed or time out cleanly. Set well above the 210s
+/// worst case, not tightly against it.
+const WIRELESS_HANG_SAFETY_NET_SECONDS: u32 = 300;
+
 /// A real gap this fixes: the hang safety net used to be the fixed
 /// [`HANG_SAFETY_NET_SECONDS`] constant, unaware of
 /// `AA_HEADUNIT_OBSERVATION_WINDOW_SECONDS` — real-hardware trial,
@@ -99,14 +117,30 @@ const HANG_SAFETY_NET_SECONDS: u32 = 120;
 /// looked exactly like "the settings gesture stopped working" but was
 /// actually the whole process already gone. Now derived from the same
 /// override `auth_discovery_probe::run` itself uses, plus a fixed margin,
-/// so the two timeouts can never race like that again.
-fn hang_safety_net_seconds() -> Result<u32, CliError> {
+/// so the two timeouts can never race like that again. Also takes
+/// `source` now, for the unrelated `Wireless`-specific floor described on
+/// [`WIRELESS_HANG_SAFETY_NET_SECONDS`] — an explicit
+/// `AA_HEADUNIT_OBSERVATION_WINDOW_SECONDS` override still wins outright
+/// (an operator's deliberate choice, same as `observation_window`'s own
+/// precedence), it just isn't the only thing this function has to leave
+/// room for any more. The `source` floor and the override are combined
+/// with `max`, not either/or: the override only extends the *observation*
+/// window (the post-connect receive loop), not `Wireless`'s own
+/// transport-acquisition wait, so even an explicit override smaller than
+/// [`WIRELESS_HANG_SAFETY_NET_SECONDS`] must not shrink the safety net
+/// below that floor.
+fn hang_safety_net_seconds(source: KioskTransportSource) -> Result<u32, CliError> {
+    let source_floor = match source {
+        KioskTransportSource::Usb => HANG_SAFETY_NET_SECONDS,
+        KioskTransportSource::Wireless => WIRELESS_HANG_SAFETY_NET_SECONDS,
+    };
     match crate::auth_discovery_probe::read_observation_window_override()? {
         Some(duration) => {
             let margin = Duration::from_secs(60);
-            Ok(u32::try_from((duration + margin).as_secs()).unwrap_or(u32::MAX))
+            let override_seconds = u32::try_from((duration + margin).as_secs()).unwrap_or(u32::MAX);
+            Ok(source_floor.max(override_seconds))
         }
-        None => Ok(HANG_SAFETY_NET_SECONDS),
+        None => Ok(source_floor),
     }
 }
 
@@ -152,7 +186,7 @@ pub(crate) fn run_with_cancel(
     tls12_compatibility: bool,
     cancel: CancellationFlag,
 ) -> Result<(), CliError> {
-    let hang_safety_net_seconds = hang_safety_net_seconds()?;
+    let hang_safety_net_seconds = hang_safety_net_seconds(KioskTransportSource::Usb)?;
     let (capability_sender, capability_receiver) = mpsc::channel::<DecoderCapability>();
     let (pipeline_sender, pipeline_receiver) = mpsc::channel();
     let (session_result_sender, session_result_receiver) = mpsc::channel::<Result<(), CliError>>();
@@ -425,6 +459,7 @@ fn apply_theme(active_theme_provider: &Rc<RefCell<Option<gtk4::CssProvider>>>, n
     active_theme_provider.replace(Some(provider));
 }
 
+#[allow(clippy::too_many_lines)]
 fn activate_window(
     application: &Application,
     state: ActivationState,
@@ -485,6 +520,18 @@ fn activate_window(
     let window = ApplicationWindow::builder()
         .application(application)
         .title("pi-auto-headunit live session")
+        // Tried `.decorated(false)` here, 2026-08-23, on the theory that
+        // stray taps on `labwc`'s windowed-mode close decoration were
+        // causing repeated unexplained mid-session `wireless-kiosk`
+        // exits. Reverted the same night, real-hardware feedback: it did
+        // NOT stop those exits (a `probe_state=window_close_requested`
+        // diagnostic added alongside it kept firing with no decorations
+        // present, so that was never the actual cause), and it broke a
+        // real, wanted interaction — the windowed-mode close ("X") button
+        // used to return from `ToggleFullscreen`'s windowed view back to
+        // the desktop; without it the only way to close AA became a
+        // right-click on the taskbar tab instead. The real cause of the
+        // repeated `close-request` firing is still unidentified.
         .child(&overlay)
         .build();
     window.fullscreen();
@@ -521,6 +568,7 @@ fn activate_window(
         &gesture_settings,
         &audio_settings,
         &quick_controls,
+        &is_fullscreen,
     );
 
     SessionPollState {
@@ -666,8 +714,80 @@ fn wire_window_close_cancels_session(window: &ApplicationWindow, cancel: &Cancel
     let cancel = cancel.clone();
     let window_for_hide = window.clone();
     window.connect_close_request(move |_| {
+        // Diagnostic print, 2026-08-23: added to distinguish this
+        // in-app `close-request` path from a real OS-level `SIGINT`
+        // (`cancellation::install_ctrlc_handler`'s handler sets the same
+        // flag with no print of its own, deliberately — signal-handler
+        // context, avoid I/O there) after several unexplained
+        // `wireless-kiosk` sessions ended with the generic
+        // "cancelled by operator (Ctrl-C)" message and no way to tell
+        // which path actually fired. If this line is absent from the log
+        // when a cancellation happens, it was a real signal, not this.
+        println!("probe_state=window_close_requested");
         cancel.trigger();
         window_for_hide.set_visible(false);
+        glib::Propagation::Stop
+    });
+}
+
+/// The `usb kiosk`/`usb wireless-kiosk` counterpart to
+/// [`wire_window_close_cancels_session`] — real-hardware finding,
+/// 2026-08-23: a window `close-request` kept firing mid-session,
+/// unprompted and unexplained (root cause never identified despite
+/// extensive investigation — ruled out `labwc` window decorations, a
+/// competing kiosk process, and every in-app code path that could
+/// programmatically trigger it), and because this whole file's kiosk
+/// window shares one `CancellationFlag` for its whole *process* lifetime
+/// ([`wire_window_close_cancels_session`]'s original, correct behavior
+/// for the single-shot `run`/`run_with_cancel` case), every one of those
+/// close-requests was quitting the entire reconnect-forever kiosk
+/// process outright — directly blocking the very reconnect behavior
+/// `usb wireless-kiosk` exists for. Sets [`KioskWindow::window_close_requested`]
+/// instead of hiding the window (the window is persistent for the whole
+/// process, unlike the single-shot case — it must stay visible so the
+/// next reconnect attempt has something to render into); still triggers
+/// the same shared `cancel` flag so the *current* attempt's underlying
+/// protocol session stops promptly, but [`end_kiosk_attempt`] checks
+/// this marker to tell a window close apart from a real `SIGINT` and
+/// resets the flag before scheduling a reconnect, instead of quitting.
+/// A `close-request` firing within this long of the *current* attempt's
+/// own start is suppressed, not acted on — real-hardware finding,
+/// 2026-08-23: after fixing the original bug (a single window close
+/// killing the whole reconnect-forever process instead of just ending
+/// one attempt), a real-hardware trial found `close-request` firing
+/// again in rapid, repeated succession — twice within milliseconds of
+/// the *previous* attempt's own end, before the *next* attempt had even
+/// finished bringing its access point back up — cancelling every new
+/// attempt again almost as soon as it started, in a tight loop, so no
+/// reconnect ever got a real chance to run. Root cause not identified
+/// (ruled out: window decorations, a competing kiosk process, the
+/// auto-refullscreen-on-activate handler removed the same night, and
+/// every in-app code path that could programmatically trigger a real
+/// GTK `close-request`) — this is a defensive mitigation, not a fix for
+/// whatever is actually generating these. 3 seconds is short enough that
+/// a genuine close shortly after a reconnect still works quickly, and
+/// comfortably longer than the millisecond-scale burst actually
+/// observed.
+const WINDOW_CLOSE_DEBOUNCE: Duration = Duration::from_secs(3);
+
+fn wire_kiosk_window_close_ends_current_attempt(
+    window: &ApplicationWindow,
+    cancel: &CancellationFlag,
+    window_close_requested: Rc<Cell<bool>>,
+    attempt_started_at: Rc<Cell<Option<Instant>>>,
+) {
+    let cancel = cancel.clone();
+    window.connect_close_request(move |_| {
+        let debounced = attempt_started_at
+            .get()
+            .is_some_and(|started_at| started_at.elapsed() < WINDOW_CLOSE_DEBOUNCE);
+        if debounced {
+            println!("probe_state=window_close_requested_debounced");
+            return glib::Propagation::Stop;
+        }
+        println!("probe_state=window_close_requested");
+        window_close_requested.set(true);
+        cancel.trigger();
         glib::Propagation::Stop
     });
 }
@@ -851,6 +971,21 @@ struct KioskWindow {
     /// `rotation_handle`/`arm_window_handle` above already track the
     /// current session.
     audio_settings: Rc<RefCell<SharedAudioSettings>>,
+    /// Set by [`wire_kiosk_window_close_ends_current_attempt`]'s
+    /// `close-request` handler, read and cleared by [`end_kiosk_attempt`]
+    /// — distinguishes a window close from a real `SIGINT` sharing the
+    /// same [`CancellationFlag`], so a close only ends the current
+    /// session attempt and reconnects, instead of quitting the whole
+    /// reconnect-forever process the way a genuine Ctrl-C still does.
+    window_close_requested: Rc<Cell<bool>>,
+    /// Set to `Some(Instant::now())` at the top of every
+    /// [`start_kiosk_session`] attempt — lets
+    /// [`wire_kiosk_window_close_ends_current_attempt`]'s handler tell a
+    /// genuine close request apart from the real-hardware-observed
+    /// close-request storm (see that function's own doc comment): a
+    /// `close-request` firing within [`WINDOW_CLOSE_DEBOUNCE`] of the
+    /// *current* attempt's own start is suppressed rather than acted on.
+    attempt_started_at: Rc<Cell<Option<Instant>>>,
 }
 
 /// Builds the fullscreen window, its overlays, and every widget
@@ -894,11 +1029,30 @@ fn build_kiosk_window(application: &Application, cancel: &CancellationFlag) -> K
     let window = ApplicationWindow::builder()
         .application(application)
         .title("pi-auto-headunit live session")
+        // Tried `.decorated(false)` here, 2026-08-23, on the theory that
+        // stray taps on `labwc`'s windowed-mode close decoration were
+        // causing repeated unexplained mid-session `wireless-kiosk`
+        // exits. Reverted the same night, real-hardware feedback: it did
+        // NOT stop those exits (a `probe_state=window_close_requested`
+        // diagnostic added alongside it kept firing with no decorations
+        // present, so that was never the actual cause), and it broke a
+        // real, wanted interaction — the windowed-mode close ("X") button
+        // used to return from `ToggleFullscreen`'s windowed view back to
+        // the desktop; without it the only way to close AA became a
+        // right-click on the taskbar tab instead. The real cause of the
+        // repeated `close-request` firing is still unidentified.
         .child(&overlay)
         .build();
     window.fullscreen();
     window.present();
-    wire_window_close_cancels_session(&window, cancel);
+    let window_close_requested = Rc::new(Cell::new(false));
+    let attempt_started_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+    wire_kiosk_window_close_ends_current_attempt(
+        &window,
+        cancel,
+        Rc::clone(&window_close_requested),
+        Rc::clone(&attempt_started_at),
+    );
 
     let rotation_handle: Rc<RefCell<Option<SharedRotation>>> = Rc::new(RefCell::new(None));
     let current_rotation: Rc<Cell<Rotation>> =
@@ -926,6 +1080,7 @@ fn build_kiosk_window(application: &Application, cancel: &CancellationFlag) -> K
         &gesture_settings,
         &audio_settings,
         &quick_controls,
+        &is_fullscreen,
     );
 
     KioskWindow {
@@ -942,6 +1097,8 @@ fn build_kiosk_window(application: &Application, cancel: &CancellationFlag) -> K
         gesture_settings,
         panel_visibility,
         audio_settings,
+        window_close_requested,
+        attempt_started_at,
     }
 }
 
@@ -1282,14 +1439,34 @@ fn end_kiosk_attempt(
     window
         .picture
         .set_paintable(Option::<&gtk4::gdk::Paintable>::None);
+    window.picture.queue_draw();
+    // Real-hardware finding, 2026-08-23: hides the window instead of just
+    // leaving it visible with a cleared paintable — see
+    // `start_kiosk_session`'s capability-poll closure (which re-presents
+    // it once the next session's video is genuinely ready) for the full
+    // reasoning. Gives the operator the clean close they actually asked
+    // for, and sidesteps whatever GTK4/GStreamer state was keeping the
+    // screen frozen on stale content across several other targeted fixes
+    // that didn't resolve it.
+    window.window.set_visible(false);
     *window.rotation_handle.borrow_mut() = None;
     *window.arm_window_handle.borrow_mut() = None;
     *window.audio_settings.borrow_mut() = SharedAudioSettings::new();
 
     if cancel.is_set() {
-        *final_result.borrow_mut() = Some(result);
-        window.application.quit();
-        return;
+        if window.window_close_requested.replace(false) {
+            // A window close-request, not a real SIGINT — end only this
+            // attempt, not the whole process. Reset the shared flag so
+            // the next attempt's own underlying session isn't
+            // immediately cancelled too (see
+            // `wire_kiosk_window_close_ends_current_attempt`'s doc
+            // comment for why this whole distinction exists).
+            cancel.reset();
+        } else {
+            *final_result.borrow_mut() = Some(result);
+            window.application.quit();
+            return;
+        }
     }
 
     glib::timeout_add_seconds_local(KIOSK_RECONNECT_DELAY_SECONDS, move || {
@@ -1365,7 +1542,11 @@ fn wire_kiosk_handle_polls(
 /// and reverted). `run_kiosk` always passes `(true, false)`;
 /// [`end_kiosk_attempt`]'s own reconnect call always passes `false` for
 /// `is_first_attempt`.
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines
+)]
 fn start_kiosk_session(
     window: &Rc<KioskWindow>,
     tls12_compatibility: bool,
@@ -1376,6 +1557,8 @@ fn start_kiosk_session(
     is_first_attempt: bool,
     reset_before_attempt: bool,
 ) {
+    window.attempt_started_at.set(Some(Instant::now()));
+
     let (capability_sender, capability_receiver) = mpsc::channel::<DecoderCapability>();
     let (pipeline_sender, pipeline_receiver) = mpsc::channel();
     let (session_result_sender, session_result_receiver) = mpsc::channel::<Result<(), CliError>>();
@@ -1413,6 +1596,8 @@ fn start_kiosk_session(
 
     let safety_net_id_for_capability = Rc::clone(&safety_net_id);
     let picture_for_capability = window.picture.clone();
+    let window_for_capability = window.window.clone();
+    let is_fullscreen_for_capability = Rc::clone(&window.is_fullscreen);
     let _capability_poll_id = glib::timeout_add_local(POLL_INTERVAL, move || {
         match capability_receiver.try_recv() {
             Ok(capability) => {
@@ -1420,6 +1605,29 @@ fn start_kiosk_session(
                     id.remove();
                 }
                 let outcome = build_gtk4_pipeline(&capability, &picture_for_capability);
+                // Real-hardware finding, 2026-08-23: swapping the
+                // paintable on an already-visible window was not reliably
+                // enough to make the screen actually update on a
+                // `usb wireless-kiosk` reconnect — confirmed frozen on
+                // stale content across several targeted attempts, even
+                // with real fresh video data confirmed decoding
+                // underneath. `end_kiosk_attempt` now hides the window
+                // entirely when a session ends, instead of leaving it
+                // visible with a cleared paintable; re-presenting it only
+                // once the new session's pipeline is genuinely ready
+                // gives the compositor an unambiguous fresh-presentation
+                // signal, matching the operator's own request: the window
+                // should cleanly close, then reconnect on its own.
+                if outcome.is_ok() {
+                    window_for_capability.present();
+                    // `set_visible(false)` then `present()` isn't
+                    // documented to guarantee the window comes back in
+                    // the exact fullscreen state it left in — re-assert
+                    // it explicitly rather than assume.
+                    if is_fullscreen_for_capability.get() {
+                        window_for_capability.fullscreen();
+                    }
+                }
                 let _ = pipeline_sender.send(outcome);
                 glib::ControlFlow::Break
             }
@@ -1528,11 +1736,31 @@ pub(crate) fn run_kiosk(
     source: KioskTransportSource,
     cancel: &CancellationFlag,
 ) -> Result<(), CliError> {
-    let hang_safety_net_seconds = hang_safety_net_seconds()?;
+    let hang_safety_net_seconds = hang_safety_net_seconds(source)?;
     let final_result: Rc<RefCell<Option<Result<(), CliError>>>> = Rc::new(RefCell::new(None));
 
+    // Real-hardware finding, 2026-08-23: `usb kiosk` and `usb
+    // wireless-kiosk` used to share the exact same `application_id` as
+    // `run`/`run_with_cancel` (`usb gtk-dev-ui`). GLib's `GApplication`
+    // treats a shared id as one logical single-instance app registered on
+    // the session bus — a second process launched with the same id
+    // doesn't start its own instance at all, it just sends "activate" to
+    // whichever instance registered first (a silent, exit-code-0 no-op,
+    // not an error) and the *first* instance's own `connect_activate`
+    // guard (`already_started`, here and in `activate_window`) ignores a
+    // repeat activation too, so neither process does anything. Caught
+    // because a `usb kiosk` process left idle from earlier testing
+    // silently absorbed a `usb wireless-kiosk` launch this way. `Wireless`
+    // gets its own distinct id so the two can run concurrently — `Usb`
+    // keeps the original id unchanged (still shared with `usb
+    // gtk-dev-ui`, whose own single-instance behavior against `usb kiosk`
+    // is unrelated to today's fix and out of scope here).
+    let application_id = match source {
+        KioskTransportSource::Usb => "dev.pi-auto-headunit.gtk-dev-ui",
+        KioskTransportSource::Wireless => "dev.pi-auto-headunit.gtk-dev-ui.wireless",
+    };
     let application = Application::builder()
-        .application_id("dev.pi-auto-headunit.gtk-dev-ui")
+        .application_id(application_id)
         .build();
 
     // `connect_activate` requires `Fn`, callable more than once in
@@ -1740,6 +1968,7 @@ struct SettingsPanel {
     arm_timeout_spin: SpinButton,
     mtp_suppression_check: CheckButton,
     launch_on_boot_check: CheckButton,
+    wireless_bluetooth_auto_connect_check: CheckButton,
     brightness_scale: Scale,
     volume_scale: Scale,
     audio_output_dropdown: DropDown,
@@ -2717,6 +2946,7 @@ struct DisplayPageBuild {
     arm_timeout_spin: SpinButton,
     mtp_suppression_check: CheckButton,
     launch_on_boot_check: CheckButton,
+    wireless_bluetooth_auto_connect_check: CheckButton,
     brightness_scale: Scale,
     volume_scale: Scale,
     audio_output_dropdown: DropDown,
@@ -2734,6 +2964,7 @@ fn build_display_page(
     initial_arm_window_seconds: u32,
     initial_mtp_popup_suppression_enabled: bool,
     initial_launch_on_boot: bool,
+    initial_wireless_bluetooth_auto_connect: bool,
     initial_display_brightness_percent: u8,
     initial_volume_percent: u8,
     initial_audio_output_device: Option<&str>,
@@ -2780,6 +3011,17 @@ fn build_display_page(
     launch_on_boot_check.set_active(initial_launch_on_boot);
     page.append(&launch_on_boot_check);
 
+    // On by default (`HeadUnitSettings::wireless_bluetooth_auto_connect`'s
+    // doc comment) — real-hardware-confirmed 2026-08-23: actively
+    // reconnecting an already-paired phone over Bluetooth before falling
+    // back to passively advertising is what actually makes `usb
+    // wireless-kiosk` reconnect hands-off. An operator can turn it off
+    // here if they'd rather it just wait passively.
+    let wireless_bluetooth_auto_connect_check =
+        CheckButton::with_label("Wireless: auto-connect paired phone");
+    wireless_bluetooth_auto_connect_check.set_active(initial_wireless_bluetooth_auto_connect);
+    page.append(&wireless_bluetooth_auto_connect_check);
+
     let (
         brightness_scale,
         volume_scale,
@@ -2813,6 +3055,7 @@ fn build_display_page(
         arm_timeout_spin,
         mtp_suppression_check,
         launch_on_boot_check,
+        wireless_bluetooth_auto_connect_check,
         brightness_scale,
         volume_scale,
         audio_output_dropdown,
@@ -3123,6 +3366,7 @@ fn build_settings_panel_from(gesture_settings: &Rc<RefCell<HeadUnitSettings>>) -
         gesture_settings.borrow().arm_window_seconds(),
         gesture_settings.borrow().mtp_popup_suppression_enabled(),
         gesture_settings.borrow().launch_on_boot(),
+        gesture_settings.borrow().wireless_bluetooth_auto_connect(),
         gesture_settings.borrow().display_brightness_percent(),
         gesture_settings.borrow().volume_percent(),
         gesture_settings.borrow().audio_output_device(),
@@ -3264,6 +3508,7 @@ fn build_settings_panel(
     initial_arm_window_seconds: u32,
     initial_mtp_popup_suppression_enabled: bool,
     initial_launch_on_boot: bool,
+    initial_wireless_bluetooth_auto_connect: bool,
     initial_display_brightness_percent: u8,
     initial_volume_percent: u8,
     initial_audio_output_device: Option<&str>,
@@ -3279,6 +3524,7 @@ fn build_settings_panel(
         initial_arm_window_seconds,
         initial_mtp_popup_suppression_enabled,
         initial_launch_on_boot,
+        initial_wireless_bluetooth_auto_connect,
         initial_display_brightness_percent,
         initial_volume_percent,
         initial_audio_output_device,
@@ -3370,6 +3616,7 @@ fn build_settings_panel(
         arm_timeout_spin: display.arm_timeout_spin,
         mtp_suppression_check: display.mtp_suppression_check,
         launch_on_boot_check: display.launch_on_boot_check,
+        wireless_bluetooth_auto_connect_check: display.wireless_bluetooth_auto_connect_check,
         brightness_scale: display.brightness_scale,
         volume_scale: display.volume_scale,
         audio_output_dropdown: display.audio_output_dropdown,
@@ -3440,6 +3687,24 @@ fn close_settings_panel(settings_panel: &SettingsPanel) {
     show_settings_page(settings_panel, SettingsPage::Menu);
 }
 
+// `wire_restore_fullscreen_on_activate` (added alongside `desktop_button`'s
+// unfullscreen-before-minimize workaround, to re-apply fullscreen once the
+// window became active again) was removed the same night, 2026-08-23,
+// real-hardware finding: calling `window.fullscreen()` on every `is-active`
+// change was never actually the harmless no-op its own doc comment assumed
+// — real-hardware evidence found multiple `probe_state=window_close_requested`
+// events firing in near-simultaneous succession, clustered right at
+// `wireless-kiosk` reconnect-attempt boundaries (exactly where window
+// activation churns as GTK processes a fresh session's paintable/pipeline),
+// strongly correlating this handler with the very `close-request` storm
+// that was killing whole reconnect-forever kiosk processes. Removed rather
+// than guarded more carefully, given the tight time budget to confirm a
+// fix — `desktop_button`'s own unfullscreen-before-minimize fix (the part
+// that actually fixed the original black-screen hang) is untouched, so the
+// only real regression is the "Desktop" button no longer auto-restoring
+// fullscreen on its own; the operator can still re-fullscreen manually
+// (`ToggleFullscreen`, default two-finger tap).
+
 /// Flips between fullscreen video and windowed, always closing the
 /// settings panel too. Bidirectional deliberately — see [`Action`]'s doc
 /// comment for the real-hardware trial that found the one-directional
@@ -3504,6 +3769,31 @@ fn wire_launch_on_boot_toggle(
             gesture_settings
                 .borrow_mut()
                 .set_launch_on_boot(check.is_active());
+            let _ = gesture_settings
+                .borrow()
+                .save(Path::new(DEFAULT_SETTINGS_PATH));
+        });
+}
+
+/// Mirrors [`wire_mtp_suppression_toggle`] for the "Wireless: auto-connect
+/// paired phone" check button — see
+/// `HeadUnitSettings::wireless_bluetooth_auto_connect`'s doc comment for
+/// what this actually gates. Unlike `mtp_suppression`, nothing needs
+/// live-syncing on toggle: the setting is only ever read fresh, at the
+/// start of the next `usb wireless-kiosk`/`usb wireless-bootstrap-probe`
+/// Bluetooth bootstrap attempt (`wireless_bootstrap.rs`), not something a
+/// currently-running session could apply retroactively.
+fn wire_wireless_bluetooth_auto_connect_toggle(
+    settings_panel: &SettingsPanel,
+    gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
+) {
+    let gesture_settings = Rc::clone(gesture_settings);
+    settings_panel
+        .wireless_bluetooth_auto_connect_check
+        .connect_toggled(move |check| {
+            gesture_settings
+                .borrow_mut()
+                .set_wireless_bluetooth_auto_connect(check.is_active());
             let _ = gesture_settings
                 .borrow()
                 .save(Path::new(DEFAULT_SETTINGS_PATH));
@@ -4151,6 +4441,7 @@ fn wire_settings_panel(
     gesture_settings: &Rc<RefCell<HeadUnitSettings>>,
     audio_settings: &Rc<RefCell<SharedAudioSettings>>,
     quick_controls: &QuickControlsPopup,
+    is_fullscreen: &Rc<Cell<bool>>,
 ) {
     wire_gesture_editing(settings_panel, gesture_settings);
     wire_settings_navigation(settings_panel);
@@ -4178,6 +4469,7 @@ fn wire_settings_panel(
 
     wire_mtp_suppression_toggle(settings_panel, gesture_settings);
     wire_launch_on_boot_toggle(settings_panel, gesture_settings);
+    wire_wireless_bluetooth_auto_connect_toggle(settings_panel, gesture_settings);
     wire_brightness_and_device_settings(settings_panel, gesture_settings, audio_settings);
     wire_equalizer_sliders(settings_panel, gesture_settings, audio_settings);
     wire_equalizer_presets(settings_panel, gesture_settings);
@@ -4209,8 +4501,36 @@ fn wire_settings_panel(
 
     let window_for_desktop = window.clone();
     let settings_panel_for_desktop = settings_panel.clone();
+    let is_fullscreen_for_desktop = Rc::clone(is_fullscreen);
     settings_panel.desktop_button.connect_clicked(move |_| {
         close_settings_panel(&settings_panel_for_desktop);
+        // Real-hardware finding, 2026-08-23: minimizing while the window
+        // is still in the fullscreened `xdg_toplevel` state is the
+        // confirmed trigger for `docs/development/appliance-recovery.md`'s
+        // still-open "return to desktop can hang the entire compositor"
+        // issue (open since 2026-08-19, never previously root-caused) —
+        // reproduced again here, this time over a wireless kiosk session,
+        // ending in a real forced physical reboot. Un-fullscreening first
+        // means the compositor only ever has to minimize an ordinary
+        // windowed toplevel, the ordinary/well-tested case every ordinary
+        // desktop app already exercises constantly, rather than the
+        // fullscreen+minimize combination that's a legitimately less
+        // common, less-tested code path in a wlroots-based compositor
+        // like `labwc`. `is_fullscreen` itself is deliberately left
+        // untouched here (matching `desktop_button`'s own established
+        // doc comment) — the window's real fullscreen state is restored
+        // by [`build_kiosk_window`]'s `is-active` handler once the window
+        // is brought back, not by anything recorded here.
+        //
+        // Honesty: this is a reasoned hypothesis from the documented
+        // investigation, not a confirmed root cause — the original
+        // 2026-08-19 investigation left the actual mechanism unconfirmed
+        // even after a partial mitigation (`VideoRenderPipeline`'s
+        // `window-width`/`window-height` sink properties). Real-hardware
+        // re-testing is needed before trusting this closes the issue.
+        if is_fullscreen_for_desktop.get() {
+            window_for_desktop.unfullscreen();
+        }
         window_for_desktop.minimize();
     });
 }
@@ -4296,6 +4616,16 @@ fn build_gtk4_pipeline(
             )
         })?;
     picture.set_paintable(Some(&paintable));
+    // Real-hardware finding, 2026-08-23: after a `usb wireless-kiosk`
+    // reconnect, the screen was observed staying frozen on the previous
+    // session's last frame even once this new pipeline was confirmed (via
+    // log evidence) genuinely decoding and pushing real, current frames —
+    // `set_paintable` alone was not reliably enough to make GTK4 actually
+    // repaint the surface in this specific reconnect-to-a-live-widget
+    // case (as opposed to the widget's first-ever paintable assignment,
+    // which always worked). Force it explicitly rather than relying on
+    // `Picture`'s own paintable-swap change detection.
+    picture.queue_draw();
     // See `VideoRenderPipeline::set_window_size`'s doc comment — keeps
     // the sink informed of the actual rendering surface size, last set
     // (staler than ideal, but real) here at build time. `toggle_fullscreen`
