@@ -17,10 +17,11 @@
 //! → hand that transport to the exact same, completely unmodified
 //! `auth_discovery_probe::run` every other command already calls. [`run`]
 //! (`usb wireless-bootstrap-probe`) is this sequence alone, under
-//! `VideoRenderTarget::Wayland`; `usb wireless-kiosk`
-//! (`gtk_dev_ui::discover_and_run_kiosk_session`'s `Wireless` branch)
-//! reuses [`bootstrap_wireless_transport`] directly, under
-//! `VideoRenderTarget::Gtk4Window` instead, so head-unit gestures
+//! `VideoRenderTarget::Wayland`; `usb kiosk`'s wireless fallback
+//! (`gtk_dev_ui::discover_and_run_kiosk_session`'s `Auto` branch, when no
+//! wired device is plugged in) reuses [`bootstrap_wireless_transport`]
+//! directly, under `VideoRenderTarget::Gtk4Window` instead, so head-unit
+//! gestures
 //! (arm-swipe → settings/quick-controls/screen-off) actually work over a
 //! wireless session — `Wayland` never wires a `TouchSettingsHandoff` (see
 //! `auth_discovery_probe::touch_settings_handoff`'s own doc comment),
@@ -121,9 +122,10 @@ pub(crate) fn run(tls12_compatibility: bool) -> Result<(), CliError> {
 /// The transport-acquisition sequence shared by [`run`] (the standalone
 /// `usb wireless-bootstrap-probe` diagnostic, which hands the result to
 /// `auth_discovery_probe::run` under `VideoRenderTarget::Wayland`) and
-/// `usb wireless-kiosk`
-/// (`gtk_dev_ui::discover_and_run_kiosk_session`'s `Wireless` branch,
-/// which uses `VideoRenderTarget::Gtk4Window` instead so gestures work):
+/// `usb kiosk`'s wireless fallback
+/// (`gtk_dev_ui::discover_and_run_kiosk_session`'s `Auto` branch, when no
+/// wired device is plugged in, which uses `VideoRenderTarget::Gtk4Window`
+/// instead so gestures work):
 /// bring up this device's own Wi-Fi access point, wait for a phone to
 /// pair over Bluetooth and complete the `aaw` credential handoff, then
 /// accept that phone's resulting Wi-Fi connection.
@@ -145,16 +147,19 @@ pub(crate) fn bootstrap_wireless_transport()
 
     connection_state::report(ConnectionState::Connecting);
     println!("wireless_bootstrap_state=bluetooth_discoverable_waiting_for_phone");
-    let auto_connect_paired_devices = crate::settings::HeadUnitSettings::load(
-        std::path::Path::new(crate::settings::DEFAULT_SETTINGS_PATH),
-    )
-    .wireless_bluetooth_auto_connect();
-    let mut bluetooth = accept_wireless_bootstrap_connection(
-        BLUETOOTH_ACCEPT_TIMEOUT,
-        BLUETOOTH_IO_TIMEOUT,
-        auto_connect_paired_devices,
-    )
-    .map_err(|error| CliError::Protocol(error.to_string()))?;
+    // Real-hardware finding, 2026-08-23: this used to read
+    // `wireless_bluetooth_auto_connect` and skip the active push when
+    // off — but that setting now means something else entirely (whether
+    // `usb kiosk` keeps reconnecting automatically after the operator
+    // closes AA; see its own doc comment). Every time this function
+    // actually runs at all — a fresh process's first attempt, an
+    // automatic retry, or a deliberate manual reopen — is already a
+    // moment the head unit is genuinely trying to connect, so it should
+    // always try its hardest: always actively push a reconnect to an
+    // already-paired phone before falling back to passively advertising.
+    let mut bluetooth =
+        accept_wireless_bootstrap_connection(BLUETOOTH_ACCEPT_TIMEOUT, BLUETOOTH_IO_TIMEOUT, true)
+            .map_err(|error| CliError::Protocol(error.to_string()))?;
     println!("wireless_bootstrap_state=bluetooth_connected");
 
     run_aaw_bootstrap(&mut bluetooth, &ssid, &password, &bssid)?;

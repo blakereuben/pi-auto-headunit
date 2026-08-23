@@ -48,8 +48,8 @@ impl CancellationFlag {
         self.0.store(true, Ordering::SeqCst);
     }
 
-    /// Resets the flag back to unset — used by `usb kiosk`/`usb
-    /// wireless-kiosk`'s reconnect loop (`gtk_dev_ui.rs`) when a window
+    /// Resets the flag back to unset — used by `usb kiosk`'s
+    /// reconnect loop (`gtk_dev_ui.rs`) when a window
     /// `close-request` should only end the *current* session attempt,
     /// not quit the whole reconnect-forever process: the same shared
     /// flag that bounds one attempt's underlying protocol session is

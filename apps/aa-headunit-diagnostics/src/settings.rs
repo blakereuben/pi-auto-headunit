@@ -775,14 +775,32 @@ impl HeadUnitSettings {
         self.launch_on_boot = enabled;
     }
 
-    /// Whether `usb wireless-kiosk`/`usb wireless-bootstrap-probe` should
-    /// actively reconnect an already-OS-paired phone
-    /// (`transport_bluetooth::accept_wireless_bootstrap_connection`)
-    /// before falling back to passively advertising and waiting — added
-    /// 2026-08-23 at the operator's explicit request, real-hardware-
-    /// confirmed working the same night. Defaults on, unlike
-    /// `launch_on_boot`: this isn't a can-silently-hang-on-boot risk, just
-    /// the now-proven-correct way wireless reconnection should behave.
+    /// Whether `usb kiosk` keeps automatically scheduling another
+    /// reconnect attempt after the operator closes AA
+    /// (`gtk_dev_ui::end_kiosk_attempt`'s `window_close_requested`
+    /// branch), versus going idle (`KioskWindow::awaiting_manual_reconnect`)
+    /// until they deliberately reopen it (a repeat `GApplication`
+    /// activation from opening the desktop icon again, wired up in
+    /// `gtk_dev_ui::run_kiosk`'s `connect_activate` closure). Added
+    /// 2026-08-23 at the operator's explicit request; went through two
+    /// wrong shapes the same night before landing here — first gating
+    /// only the Bluetooth active-push step (too narrow: a phone that had
+    /// recently been actively connected still reconnected passively on
+    /// its own, so turning the checkbox off looked like it did nothing),
+    /// then widened into a master switch over whether wireless is
+    /// attempted at all (too broad: it also blocked a deliberate manual
+    /// open, which the operator was explicit must always try both wired
+    /// and wireless immediately and actively regardless of this
+    /// checkbox). Neither of those survived; this is the third and
+    /// correct shape, confirmed against the operator's own restatement of
+    /// the desired behavior. Never affects opening AA in the first place
+    /// — only what happens automatically after a close. Errors and
+    /// disconnects that aren't a deliberate close are unaffected either
+    /// way: those always keep retrying, checkbox or not — this setting is
+    /// specifically about the operator's own close action. Defaults on,
+    /// unlike `launch_on_boot`: this isn't a can-silently-hang-on-boot
+    /// risk, just the now-proven-correct way reconnection should behave
+    /// by default.
     #[must_use]
     pub fn wireless_bluetooth_auto_connect(&self) -> bool {
         self.wireless_bluetooth_auto_connect

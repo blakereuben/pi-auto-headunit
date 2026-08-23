@@ -70,6 +70,23 @@ pub const HANDSFREE_AG_PROFILE_UUID: &str = "0000111f-0000-1000-8000-00805f9b34f
 /// arbitrary, project-chosen value (no source specifies one).
 const AA_WIRELESS_SDP_CHANNEL: u16 = 22;
 
+/// Bound on each individual `Device::connect_profile` call in the
+/// active-reconnect loop below. Real-hardware finding, 2026-08-23: with a
+/// phone genuinely paired (`Paired: yes`) but not currently connected and
+/// in range, this D-Bus call was observed to simply never return —
+/// blocking well past a minute with no error and no progress, silently
+/// wedging the entire wireless bootstrap (nothing past this point, not
+/// even the profile registrations or the passive advertise-and-wait
+/// fallback, could ever run). The loop's own doc comment already
+/// documents this as meant to be "best-effort... slow to respond just
+/// means this has no visible effect" — that promise only holds with an
+/// actual bound, since without one a genuine hang here is
+/// indistinguishable from every other kind of "AA screen stays black"
+/// hang this project has spent real hardware time chasing. Short
+/// relative to `accept_timeout` (the passive fallback's own, much longer
+/// wait): this is a quick nudge, not the real wait.
+const ACTIVE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug)]
 pub enum BluetoothError {
     Session(String),
@@ -237,13 +254,23 @@ pub fn accept_wireless_bootstrap_connection(
                     continue;
                 };
                 if device.is_paired().await.unwrap_or(false) {
-                    match device.connect_profile(&handsfree_uuid).await {
-                        Ok(()) => {
+                    match tokio::time::timeout(
+                        ACTIVE_RECONNECT_TIMEOUT,
+                        device.connect_profile(&handsfree_uuid),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
                             println!("wireless_bootstrap_state=paired_device_reconnected address={address}");
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             eprintln!(
                                 "wireless_bootstrap_state=paired_device_reconnect_failed address={address} error={error}"
+                            );
+                        }
+                        Err(_elapsed) => {
+                            eprintln!(
+                                "wireless_bootstrap_state=paired_device_reconnect_failed address={address} error=timed out after {ACTIVE_RECONNECT_TIMEOUT:?}"
                             );
                         }
                     }

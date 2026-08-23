@@ -132,7 +132,12 @@ const WIRELESS_HANG_SAFETY_NET_SECONDS: u32 = 300;
 fn hang_safety_net_seconds(source: KioskTransportSource) -> Result<u32, CliError> {
     let source_floor = match source {
         KioskTransportSource::Usb => HANG_SAFETY_NET_SECONDS,
-        KioskTransportSource::Wireless => WIRELESS_HANG_SAFETY_NET_SECONDS,
+        // `Auto` doesn't know until the attempt actually starts whether
+        // it'll end up wired or wireless this time — use the wireless
+        // floor unconditionally, since it's already well above the wired
+        // floor too and this is only a hang-detection ceiling, not a
+        // target duration.
+        KioskTransportSource::Auto => WIRELESS_HANG_SAFETY_NET_SECONDS,
     };
     match crate::auth_discovery_probe::read_observation_window_override()? {
         Some(duration) => {
@@ -730,7 +735,7 @@ fn wire_window_close_cancels_session(window: &ApplicationWindow, cancel: &Cancel
     });
 }
 
-/// The `usb kiosk`/`usb wireless-kiosk` counterpart to
+/// The `usb kiosk` counterpart to
 /// [`wire_window_close_cancels_session`] — real-hardware finding,
 /// 2026-08-23: a window `close-request` kept firing mid-session,
 /// unprompted and unexplained (root cause never identified despite
@@ -742,7 +747,7 @@ fn wire_window_close_cancels_session(window: &ApplicationWindow, cancel: &Cancel
 /// for the single-shot `run`/`run_with_cancel` case), every one of those
 /// close-requests was quitting the entire reconnect-forever kiosk
 /// process outright — directly blocking the very reconnect behavior
-/// `usb wireless-kiosk` exists for. Sets [`KioskWindow::window_close_requested`]
+/// `usb kiosk` exists for. Sets [`KioskWindow::window_close_requested`]
 /// instead of hiding the window (the window is persistent for the whole
 /// process, unlike the single-shot case — it must stay visible so the
 /// next reconnect attempt has something to render into); still triggers
@@ -942,6 +947,35 @@ const KIOSK_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// failure) before starting the next — unchanged from `main.rs`'s
 /// previous `RECONNECT_DELAY`.
 const KIOSK_RECONNECT_DELAY_SECONDS: u32 = 2;
+/// How often [`wire_kiosk_heartbeat`] prints — frequent enough to
+/// pinpoint a hang's onset within a couple of seconds, infrequent enough
+/// not to flood the log over a multi-hour session.
+const KIOSK_HEARTBEAT_INTERVAL_SECONDS: u32 = 2;
+
+/// Diagnostic heartbeat, added 2026-08-23 after several real-hardware
+/// "the screen hung" reports where it was genuinely unclear whether the
+/// GTK main loop/compositor had actually stopped responding, versus the
+/// process exiting cleanly (which prints its own clear shutdown log
+/// lines), versus continuing to run normally underneath a stale
+/// screen. A `glib::timeout_add_seconds_local` timer only fires at all
+/// while the GTK main loop is still alive and processing events, so this
+/// line's *last* appearance before a gap, followed by nothing else at
+/// all (not even a clean-shutdown log), is definitive, timestamped proof
+/// the main loop itself froze at that exact moment — as opposed to a
+/// process crash/exit (distinguishable from the absence of any further
+/// process activity in the OS-level record) or the process continuing
+/// fine (heartbeat keeps appearing). Wired once, for the window's whole
+/// process lifetime, printed to stdout alongside every other
+/// `probe_state` line so it lands in the same persistent log.
+fn wire_kiosk_heartbeat() {
+    glib::timeout_add_seconds_local(KIOSK_HEARTBEAT_INTERVAL_SECONDS, move || {
+        println!(
+            "probe_state=heartbeat elapsed_ms={}",
+            crate::auth_discovery_probe::elapsed_ms_since_process_start()
+        );
+        glib::ControlFlow::Continue
+    });
+}
 
 /// Everything built exactly once, for the whole lifetime of the
 /// `usb kiosk` process — see [`run_kiosk`]'s doc comment for why this now
@@ -986,6 +1020,16 @@ struct KioskWindow {
     /// `close-request` firing within [`WINDOW_CLOSE_DEBOUNCE`] of the
     /// *current* attempt's own start is suppressed rather than acted on.
     attempt_started_at: Rc<Cell<Option<Instant>>>,
+    /// Set by [`end_kiosk_attempt`] when the operator closed the window
+    /// (not a real `SIGINT`) and
+    /// [`crate::settings::HeadUnitSettings::wireless_bluetooth_auto_connect`]
+    /// is off — the process stops scheduling further reconnect attempts
+    /// on its own and just sits idle with this set, until a repeat
+    /// `GApplication` activation (the operator opening the desktop icon
+    /// again while this process is already running — see [`run_kiosk`]'s
+    /// `connect_activate` closure) finds it set, clears it, and starts a
+    /// fresh attempt. Read and cleared there, never elsewhere.
+    awaiting_manual_reconnect: Rc<Cell<bool>>,
 }
 
 /// Builds the fullscreen window, its overlays, and every widget
@@ -1082,6 +1126,7 @@ fn build_kiosk_window(application: &Application, cancel: &CancellationFlag) -> K
         &quick_controls,
         &is_fullscreen,
     );
+    wire_kiosk_heartbeat();
 
     KioskWindow {
         application: application.clone(),
@@ -1099,6 +1144,7 @@ fn build_kiosk_window(application: &Application, cancel: &CancellationFlag) -> K
         audio_settings,
         window_close_requested,
         attempt_started_at,
+        awaiting_manual_reconnect: Rc::new(Cell::new(false)),
     }
 }
 
@@ -1114,6 +1160,11 @@ fn find_kiosk_candidate_device()
 -> Result<Option<transport_api::UsbDeviceId>, transport_api::AoaError> {
     use transport_api::AoaBackend;
     const LINUX_FOUNDATION_ROOT_HUB_VENDOR_ID: u16 = 0x1d6b;
+    // Google's AOA specification has only ever published protocol
+    // versions 1 and 2 (v1 = original accessory protocol, v2 = adds
+    // audio) — see the loop below for why only these two count.
+    const AOA_PROTOCOL_VERSION_1: u16 = 1;
+    const AOA_PROTOCOL_VERSION_2: u16 = 2;
 
     let mut backend = transport_usb::LibUsbAoaBackend::new()?;
     let devices = backend.list_devices()?;
@@ -1127,7 +1178,24 @@ fn find_kiosk_candidate_device()
         if device.vendor_id == LINUX_FOUNDATION_ROOT_HUB_VENDOR_ID {
             continue;
         }
-        if backend.query_protocol(device).is_ok() {
+        // Real-hardware finding, 2026-08-23: a Microsoft wireless-keyboard
+        // USB receiver answered this vendor-specific control request
+        // without stalling it — most USB controllers reject an
+        // unrecognized vendor request outright, but evidently not this
+        // one — so `query_protocol(..).is_ok()` alone falsely treated it
+        // as an AOA-capable candidate, then immediately failed to open it
+        // as an accessory (`USB error: Pipe error`) and retried forever
+        // against the keyboard dongle, never falling back to wireless.
+        // Checking for a merely nonzero response isn't enough either —
+        // confirmed live against the same real keyboard dongle, which
+        // answers with `Ok(40)`: a well-formed, nonzero, but meaningless
+        // 2-byte reply, not a real protocol version. No higher version
+        // exists to be forward-compatible with, so only exactly one of
+        // the two documented versions counts as a genuine candidate.
+        if matches!(
+            backend.query_protocol(device),
+            Ok(AOA_PROTOCOL_VERSION_1 | AOA_PROTOCOL_VERSION_2)
+        ) {
             return Ok(Some(device.clone()));
         }
     }
@@ -1196,17 +1264,31 @@ fn reset_stale_kiosk_device(device: &transport_api::UsbDeviceId) {
     }
 }
 
-/// Where `usb kiosk`/`usb wireless-kiosk` source their `AAP` transport
-/// from, threaded through the whole persistent-window reconnect chain
+/// Where `usb kiosk` sources its `AAP` transport from for one attempt,
+/// threaded through the whole persistent-window reconnect chain
 /// (`run_kiosk` → `start_kiosk_session` → `install_kiosk_hang_safety_net`
-/// / `end_kiosk_attempt` → `discover_and_run_kiosk_session`) so every
-/// reconnect after the first keeps using the same source the process was
-/// started with. Only `discover_and_run_kiosk_session` actually branches
-/// on it; every other function in the chain just forwards it along.
+/// / `end_kiosk_attempt` → `discover_and_run_kiosk_session`). Only
+/// `discover_and_run_kiosk_session` actually branches on it; every other
+/// function in the chain just forwards it along.
+///
+/// There used to be a third variant, `Wireless`, selected by a separate
+/// `usb wireless-kiosk` command — removed 2026-08-23 at the operator's
+/// explicit direction: a real head unit is one program that handles
+/// either connection method, not two separate ones the operator has to
+/// choose between. `Usb` stays as an explicit wired-only mode (used by
+/// `usb gtk-dev-ui`'s single-shot, operator-selected-device flow, where
+/// "which transport" is answered by the `--device` argument, not
+/// discovery). `Auto` is what `usb kiosk` actually uses: every attempt
+/// independently checks for a wired device first and only falls back to
+/// the wireless bootstrap (access point + Bluetooth handoff) if nothing
+/// is plugged in at that moment — see `discover_and_run_kiosk_session`'s
+/// `Auto` arm. Because the check happens fresh on every reconnect, not
+/// once per process, plugging or unplugging a phone between sessions is
+/// enough to switch which path the next attempt takes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KioskTransportSource {
     Usb,
-    Wireless,
+    Auto,
 }
 
 /// Polls for a candidate device, exactly as `discover_and_run_kiosk_session`
@@ -1257,40 +1339,90 @@ fn discover_and_run_kiosk_session(
 ) -> Result<(), CliError> {
     match source {
         KioskTransportSource::Usb => {
-            let Some(mut device) = discover_kiosk_candidate(cancel) else {
+            let Some(device) = discover_kiosk_candidate(cancel) else {
                 return Ok(());
             };
-            if reset_before_attempt {
-                reset_stale_kiosk_device(&device);
-                let Some(post_reset_device) = discover_kiosk_candidate(cancel) else {
-                    return Ok(());
-                };
-                device = post_reset_device;
-            }
-            let selector = format!("{}:{}", device.bus, device.address);
-            println!(
-                "probe_state=kiosk_device_selected selector={selector} elapsed_ms={}",
-                crate::auth_discovery_probe::elapsed_ms_since_process_start()
-            );
-            run_session(
-                &selector,
+            run_usb_kiosk_attempt(
+                device,
                 tls12_compatibility,
                 handoff,
                 touch_settings,
                 cancel,
+                reset_before_attempt,
             )
         }
-        // No USB device to reset — `reset_before_attempt` is meaningful
-        // only for the `Usb` source, so it's deliberately not threaded
-        // in here at all.
-        KioskTransportSource::Wireless => {
-            run_wireless_kiosk_session(tls12_compatibility, handoff, touch_settings, cancel)
+        // Real head units are one program that accepts either connection
+        // method, not two the operator has to pick between (explicit
+        // product direction, 2026-08-23) — every attempt takes one
+        // instant, non-blocking look for a wired device
+        // (`find_kiosk_candidate_device`, not the infinite-poll
+        // `discover_kiosk_candidate` the `Usb` arm uses above, which
+        // would block this attempt on a cable that may never arrive) and
+        // only falls back to the wireless bootstrap if nothing is
+        // plugged in right now. `reset_before_attempt` is meaningful only
+        // when this attempt actually turns out wired.
+        KioskTransportSource::Auto => {
+            if cancel.is_set() {
+                return Ok(());
+            }
+            match find_kiosk_candidate_device() {
+                Ok(Some(device)) => run_usb_kiosk_attempt(
+                    device,
+                    tls12_compatibility,
+                    handoff,
+                    touch_settings,
+                    cancel,
+                    reset_before_attempt,
+                ),
+                Ok(None) => {
+                    run_wireless_kiosk_session(tls12_compatibility, handoff, touch_settings, cancel)
+                }
+                Err(error) => {
+                    println!("probe_state=kiosk_discovery_failed error={error}");
+                    run_wireless_kiosk_session(tls12_compatibility, handoff, touch_settings, cancel)
+                }
+            }
         }
     }
 }
 
-/// The `KioskTransportSource::Wireless` counterpart to [`run_session`]:
-/// sources its transport from
+/// One wired `AAP` session attempt against an already-discovered `device`
+/// — shared by `KioskTransportSource::Usb` (which discovers via the
+/// infinite `discover_kiosk_candidate` poll) and `KioskTransportSource::Auto`
+/// (which discovers via one instant `find_kiosk_candidate_device` check)
+/// so the actual reset-then-run logic isn't duplicated between them.
+fn run_usb_kiosk_attempt(
+    mut device: transport_api::UsbDeviceId,
+    tls12_compatibility: bool,
+    handoff: Gtk4WindowHandoff,
+    touch_settings: TouchSettingsHandoff,
+    cancel: &CancellationFlag,
+    reset_before_attempt: bool,
+) -> Result<(), CliError> {
+    if reset_before_attempt {
+        reset_stale_kiosk_device(&device);
+        let Some(post_reset_device) = discover_kiosk_candidate(cancel) else {
+            return Ok(());
+        };
+        device = post_reset_device;
+    }
+    let selector = format!("{}:{}", device.bus, device.address);
+    println!(
+        "probe_state=kiosk_device_selected selector={selector} elapsed_ms={}",
+        crate::auth_discovery_probe::elapsed_ms_since_process_start()
+    );
+    run_session(
+        &selector,
+        tls12_compatibility,
+        handoff,
+        touch_settings,
+        cancel,
+    )
+}
+
+/// The wireless counterpart to [`run_session`], used as
+/// `KioskTransportSource::Auto`'s fallback when no wired device is
+/// plugged in: sources its transport from
 /// [`crate::wireless_bootstrap::bootstrap_wireless_transport`] (AP
 /// bring-up + Bluetooth→Wi-Fi handoff) instead of USB/AOA, then hands off
 /// to the same `auth_discovery_probe::run`, under `Gtk4Window` so
@@ -1462,6 +1594,32 @@ fn end_kiosk_attempt(
             // `wire_kiosk_window_close_ends_current_attempt`'s doc
             // comment for why this whole distinction exists).
             cancel.reset();
+            // Real-hardware finding, 2026-08-23: an operator closing AA
+            // used to always reschedule another attempt automatically —
+            // indistinguishable, from outside, from AA staying "open" in
+            // the background regardless of whether the operator wanted
+            // that. The operator's explicit direction: closing AA should
+            // be able to mean staying closed. When
+            // `wireless_bluetooth_auto_connect` (the Display settings
+            // page's "Keep reconnecting after I close Android Auto"
+            // checkbox — see its own doc comment, widened the same night
+            // to cover this) is off, a close goes idle instead of
+            // scheduling below, and only a deliberate reopen
+            // (`run_kiosk`'s `connect_activate` closure, on a repeat
+            // activation) starts a fresh attempt.
+            // Errors and disconnects that aren't a deliberate close are
+            // untouched by this — they always keep retrying below,
+            // exactly as before; this checkbox is specifically about
+            // what happens after the operator closes the window, not
+            // about resilience to a dropped connection.
+            let auto_reconnect_after_close =
+                HeadUnitSettings::load(Path::new(DEFAULT_SETTINGS_PATH))
+                    .wireless_bluetooth_auto_connect();
+            if !auto_reconnect_after_close {
+                println!("probe_state=kiosk_awaiting_manual_reconnect");
+                window.awaiting_manual_reconnect.set(true);
+                return;
+            }
         } else {
             *final_result.borrow_mut() = Some(result);
             window.application.quit();
@@ -1692,18 +1850,19 @@ fn start_kiosk_session(
     });
 }
 
-/// Entry point for `usb kiosk --allow-live-aap [--tls12-compat]` (`source
-/// = Usb`) and `usb wireless-kiosk --allow-live-aap [--tls12-compat]`
-/// (`source = Wireless`, added 2026-08-23 so head-unit gestures work over
-/// a wireless session too — see [`KioskTransportSource`]'s own doc
-/// comment) — the unattended, boot-time, reconnect-forever equivalent of
+/// Entry point for `usb kiosk --allow-live-aap [--tls12-compat]` — the
+/// unattended, boot-time, reconnect-forever equivalent of
 /// [`run`]/[`run_with_cancel`]. Builds the fullscreen window exactly once
 /// ([`build_kiosk_window`]) and keeps it alive for the whole process
 /// lifetime, running one `AAP` session attempt after another against it
 /// ([`start_kiosk_session`]) without ever tearing down or recreating the
-/// window/`Application` in between. `source` stays fixed for the whole
-/// process — a process either always reconnects over USB or always over
-/// wireless, never switching mid-run.
+/// window/`Application` in between. Always called with `source =
+/// KioskTransportSource::Auto` in production, so every attempt
+/// independently decides wired or wireless — see that variant's own doc
+/// comment. `source` itself stays fixed for the whole process (`Auto`
+/// throughout); it's the *outcome* of `Auto`'s per-attempt check that can
+/// differ from one reconnect to the next, e.g. a phone unplugged between
+/// sessions.
 ///
 /// **Why this exists (2026-08-21)**: the previous design called
 /// `run_with_cancel` fresh for every single reconnect attempt from a loop
@@ -1757,25 +1916,53 @@ pub(crate) fn run_kiosk(
     // is unrelated to today's fix and out of scope here).
     let application_id = match source {
         KioskTransportSource::Usb => "dev.pi-auto-headunit.gtk-dev-ui",
-        KioskTransportSource::Wireless => "dev.pi-auto-headunit.gtk-dev-ui.wireless",
+        KioskTransportSource::Auto => "dev.pi-auto-headunit.gtk-dev-ui.auto",
     };
     let application = Application::builder()
         .application_id(application_id)
         .build();
 
-    // `connect_activate` requires `Fn`, callable more than once in
-    // principle — this guard (mirroring `run`/`run_with_cancel`'s own
-    // `RefCell<Option<..>>.take()` guard against the same theoretical
-    // double-activation) ensures the window is still only ever built
-    // once even if it were.
+    // `connect_activate` requires `Fn`, callable more than once — not
+    // just theoretically: a repeat activation is exactly what happens
+    // when the operator opens the desktop icon again while this process
+    // is already running (see the real-hardware finding above this
+    // function about the shared `application_id` mechanism). This guard
+    // still ensures the window itself is only ever built once; what a
+    // *repeat* activation does is handled below instead of being ignored
+    // outright, so a deliberate reopen can mean something.
     let already_started = Rc::new(Cell::new(false));
+    let window_slot: Rc<RefCell<Option<Rc<KioskWindow>>>> = Rc::new(RefCell::new(None));
     let final_result_for_activate = Rc::clone(&final_result);
     let cancel_for_activate = cancel.clone();
+    let window_slot_for_activate = Rc::clone(&window_slot);
     application.connect_activate(move |application| {
         if already_started.replace(true) {
+            // Real-hardware finding, 2026-08-23: a repeat activation
+            // while idle (`awaiting_manual_reconnect` set —
+            // `end_kiosk_attempt`'s doc comment on that field has the
+            // full story) is the operator's deliberate "open AA" action
+            // after a close that intentionally didn't auto-reconnect on
+            // its own. Start a fresh attempt right now; otherwise (still
+            // mid-attempt, or already connected) a repeat activation is a
+            // no-op, same as it always was.
+            if let Some(window) = window_slot_for_activate.borrow().as_ref() {
+                if window.awaiting_manual_reconnect.replace(false) {
+                    start_kiosk_session(
+                        window,
+                        tls12_compatibility,
+                        source,
+                        hang_safety_net_seconds,
+                        &cancel_for_activate,
+                        &final_result_for_activate,
+                        false,
+                        false,
+                    );
+                }
+            }
             return;
         }
         let window = Rc::new(build_kiosk_window(application, &cancel_for_activate));
+        *window_slot_for_activate.borrow_mut() = Some(Rc::clone(&window));
         // See `auth_discovery_probe::mark_kiosk_session_live`'s doc
         // comment: a marker left over from a previous process that never
         // confirmed a clean end means the phone is very likely still
@@ -3012,13 +3199,14 @@ fn build_display_page(
     page.append(&launch_on_boot_check);
 
     // On by default (`HeadUnitSettings::wireless_bluetooth_auto_connect`'s
-    // doc comment) — real-hardware-confirmed 2026-08-23: actively
-    // reconnecting an already-paired phone over Bluetooth before falling
-    // back to passively advertising is what actually makes `usb
-    // wireless-kiosk` reconnect hands-off. An operator can turn it off
-    // here if they'd rather it just wait passively.
+    // doc comment) — whether `usb kiosk` keeps reconnecting on its own
+    // after the operator closes AA, versus going idle until they
+    // deliberately reopen it (`end_kiosk_attempt`'s
+    // `window_close_requested` branch). Never affects opening AA in the
+    // first place: the icon/autostart always tries both wired and
+    // wireless immediately and actively, checkbox or not.
     let wireless_bluetooth_auto_connect_check =
-        CheckButton::with_label("Wireless: auto-connect paired phone");
+        CheckButton::with_label("Keep reconnecting after I close Android Auto");
     wireless_bluetooth_auto_connect_check.set_active(initial_wireless_bluetooth_auto_connect);
     page.append(&wireless_bluetooth_auto_connect_check);
 
@@ -3775,14 +3963,14 @@ fn wire_launch_on_boot_toggle(
         });
 }
 
-/// Mirrors [`wire_mtp_suppression_toggle`] for the "Wireless: auto-connect
-/// paired phone" check button — see
+/// Mirrors [`wire_mtp_suppression_toggle`] for the "Keep reconnecting
+/// after I close Android Auto" check button — see
 /// `HeadUnitSettings::wireless_bluetooth_auto_connect`'s doc comment for
 /// what this actually gates. Unlike `mtp_suppression`, nothing needs
-/// live-syncing on toggle: the setting is only ever read fresh, at the
-/// start of the next `usb wireless-kiosk`/`usb wireless-bootstrap-probe`
-/// Bluetooth bootstrap attempt (`wireless_bootstrap.rs`), not something a
-/// currently-running session could apply retroactively.
+/// live-syncing on toggle: the setting is only ever read fresh, in
+/// `end_kiosk_attempt`'s `window_close_requested` branch, the next time
+/// the operator actually closes AA — not something a currently-running
+/// session could apply retroactively.
 fn wire_wireless_bluetooth_auto_connect_toggle(
     settings_panel: &SettingsPanel,
     gesture_settings: &Rc<RefCell<HeadUnitSettings>>,

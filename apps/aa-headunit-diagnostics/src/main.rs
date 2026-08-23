@@ -300,19 +300,6 @@ fn run(args: &[String]) -> Result<(), CliError> {
             usb_kiosk(true)
         }
         [group, command, allow]
-            if group == "usb" && command == "wireless-kiosk" && allow == "--allow-live-aap" =>
-        {
-            usb_wireless_kiosk(false)
-        }
-        [group, command, allow, compatibility]
-            if group == "usb"
-                && command == "wireless-kiosk"
-                && allow == "--allow-live-aap"
-                && compatibility == "--tls12-compat" =>
-        {
-            usb_wireless_kiosk(true)
-        }
-        [group, command, allow]
             if group == "usb"
                 && command == "wireless-bootstrap-probe"
                 && allow == "--allow-live-aap" =>
@@ -365,8 +352,7 @@ fn print_help() {
            usb auth-discovery-probe --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
            usb session-supervisor --device BUS:ADDRESS --allow-live-aap [--tls12-compat] [--max-cycles COUNT [--force-disconnect-each-cycle]]\n\
            usb gtk-dev-ui --device BUS:ADDRESS --allow-live-aap [--tls12-compat]\n\
-           usb kiosk --allow-live-aap [--tls12-compat]\n\
-           usb wireless-kiosk --allow-live-aap [--tls12-compat]\n\
+           usb kiosk --allow-live-aap [--tls12-compat]  (auto: wired if plugged in, else wireless)\n\
            usb wireless-bootstrap-probe --allow-live-aap [--tls12-compat]\n\
          \n\
          The AOA command sends documented USB vendor requests only to the explicitly selected device.",
@@ -1423,6 +1409,17 @@ fn usb_gtk_dev_ui(_: &str, _: bool) -> Result<(), CliError> {
 /// (2026-08-21). The device-discovery-then-run-one-session loop this
 /// function used to own directly now lives there instead, for the same
 /// reason.
+///
+/// This is the one and only head-unit kiosk command (operator's explicit
+/// direction, 2026-08-23: a real head unit is one program, not two the
+/// operator has to choose between) — passes
+/// `KioskTransportSource::Auto`, so every reconnect attempt independently
+/// checks for a wired device first and only falls back to the wireless
+/// bootstrap (access point + Bluetooth handoff) if nothing is plugged in
+/// at that moment. See [`gtk_dev_ui::KioskTransportSource`]'s own doc
+/// comment for why the separate `Usb`/`Wireless`-selecting `usb
+/// wireless-kiosk` command this used to be split against no longer
+/// exists.
 #[cfg(target_os = "linux")]
 fn usb_kiosk(tls12_compatibility: bool) -> Result<(), CliError> {
     println!("probe_authorization=operator_confirmed");
@@ -1434,44 +1431,13 @@ fn usb_kiosk(tls12_compatibility: bool) -> Result<(), CliError> {
     let cancel = cancellation::install_ctrlc_handler()?;
     gtk_dev_ui::run_kiosk(
         tls12_compatibility,
-        gtk_dev_ui::KioskTransportSource::Usb,
+        gtk_dev_ui::KioskTransportSource::Auto,
         &cancel,
     )
 }
 
 #[cfg(not(target_os = "linux"))]
 fn usb_kiosk(_: bool) -> Result<(), CliError> {
-    Err(CliError::UnsupportedPlatform)
-}
-
-/// `usb wireless-kiosk --allow-live-aap [--tls12-compat]` — the wireless
-/// counterpart to [`usb_kiosk`]: same persistent-window, reconnect-forever
-/// kiosk experience, sourcing its `AAP` transport from the wireless
-/// bootstrap (access point + Bluetooth handoff,
-/// `wireless_bootstrap::bootstrap_wireless_transport`) instead of
-/// USB/AOA. Added 2026-08-23 because `usb wireless-bootstrap-probe`'s
-/// plain `Wayland` render target never wires a `TouchSettingsHandoff`, so
-/// head-unit gestures (arm-swipe → settings/quick-controls/screen-off)
-/// never worked over that command's wireless sessions — see
-/// `wireless_bootstrap`'s own module doc comment.
-#[cfg(target_os = "linux")]
-fn usb_wireless_kiosk(tls12_compatibility: bool) -> Result<(), CliError> {
-    println!("probe_authorization=operator_confirmed");
-    println!("probe_payload_logging=disabled");
-    println!(
-        "probe_state=kiosk_started elapsed_ms={}",
-        auth_discovery_probe::elapsed_ms_since_process_start()
-    );
-    let cancel = cancellation::install_ctrlc_handler()?;
-    gtk_dev_ui::run_kiosk(
-        tls12_compatibility,
-        gtk_dev_ui::KioskTransportSource::Wireless,
-        &cancel,
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn usb_wireless_kiosk(_: bool) -> Result<(), CliError> {
     Err(CliError::UnsupportedPlatform)
 }
 
