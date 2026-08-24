@@ -57,159 +57,33 @@ Also run a secret-marker scan before committing (grep the diff for PEM
 headers / private-key markers) and the project's ARM64 `.deb` packaging
 step.
 
-## Status as of this note
+## Status as of this note (corrected 2026-08-23 — see note below)
 
-Verified on native Pi 5 Rust tooling (fmt, check, strict clippy, full
-workspace test suite, secret-marker scan, ARM64 `.deb` packaging all pass):
-the fake in-memory transport (`crates/transport-api/src/fake.rs`), the
-fake-phone handshake integration test
-(`crates/protocol-aap/tests/fake_phone_transport.rs`), parser fuzz/property
-tests for untrusted phone input (`crates/protocol-aap/tests/property_fuzz.rs`),
-and the gated `auth-discovery-probe` CLI subcommand in
-`apps/aa-headunit-diagnostics` are implemented and committed.
+**The "blocked on real hardware" framing and the file pointer this section
+used to end with were stale and have been removed.** They described the
+Android Auto "Error 2" investigation while it was still open. That
+investigation is long since closed: `docs/protocol/error-2-investigation.md`
+itself is headed **"FULLY RESOLVED"** (2026-08-15) — the phone was confirmed,
+on its own screen, actively driving-mode navigating with Google Maps over a
+real, live session, and real H.265 video was confirmed on the head unit's
+own physical display. Full authentication, service discovery, video, audio,
+microphone, touch, and reconnect — everything this section previously
+listed as incomplete — have all since been built and real-hardware-confirmed
+(milestones M2 through M7).
 
-`crates/protocol-aap/src/service_discovery.rs`'s `ServiceDiscoveryRequestSummary`
-field naming is now confirmed directly against the pinned primary AASDK
-source (`docs/protocol/aasdk-adoption.md`, revision `9bf6adf`): field 4 is
-`label_text_bytes` and field 5 is `device_name_bytes`. An earlier revision of
-this file incorrectly named them `device_name_bytes`/`device_brand_bytes`
-(sourced from a secondary reference instead of the pinned primary source);
-there is no `device_brand` field in the schema. This was a naming-only
-defect — the summarizer only ever recorded byte length and validated UTF-8,
-never the field's semantic name.
+`MILESTONE_CHECKLIST.md` is the authoritative, actively-maintained record of
+what's done and what's open — this file will not attempt to duplicate it,
+since a second copy of that status is exactly how this section went stale
+last time. As of this correction, M0–M7 are substantially complete and
+**M8 (Pi 5 completion gate)** is the current milestone in progress: several
+substantial items remain (cold-boot and wired/wireless-switching
+determinism, no-VNC operation, failure-mode and soak testing, the
+compatibility matrix, and publish-readiness), plus a full whole-application
+security pass beyond the wireless-specific one already done. Read
+`MILESTONE_CHECKLIST.md`'s M8 section directly for the current, precise
+state of each item before starting work.
 
-The newer AASDK `Service`/`ServiceDiscoveryResponse` schema is now mapped
-field by field in `docs/protocol/aasdk-adoption.md` for the five service
-kinds the current catalogue models (sensor source, media sink, input
-source, media source, Bluetooth) and explicitly contrasted against
-OpenAuto's older `ChannelDescriptor` schema. The remaining eight nested
-service types and their leaf enum/config messages are recorded as not yet
-mapped. No `Service`/`ServiceDiscoveryResponse` Rust wire encoder exists;
-response encoding remains gated.
-
-`auth-discovery-probe` previously rejected any AAP frame with the
-`Encrypted` flag outright, which would have hard-failed against a real
-phone's post-handshake `AuthComplete`/`ServiceDiscoveryRequest` traffic
-(sent as TLS-encrypted application data, not more `EncapsulatedTls`
-handshake messages). `TlsClient` (`crates/protocol-aap/src/tls.rs`) now has
-`encrypt_application_data`/`decrypt_application_data`, implemented on
-`OpenSslTlsClient` using the same live post-handshake `SslStream` the
-handshake completed on (`crates/security-openssl/src/linux.rs`, no session
-reconstruction). `auth-discovery-probe`'s receive loop decrypts each
-`Encrypted` frame's payload before it reaches bounded reassembly, and
-rejects an encrypted frame only if it arrives before TLS has completed.
-Verified with real OpenSSL crypto, not fakes: client/server round-trip,
-split/coalesced TLS records, invalid ciphertext, premature use before
-handshake completion, session closure, and sanitized errors
-(`crates/security-openssl/src/linux.rs`'s test module), plus a real TLS 1.2
-handshake and a possibly-fragmented encrypted `ServiceDiscoveryRequest`
-reassembled end to end (`crates/protocol-aap/tests/encrypted_service_discovery.rs`).
-This work also surfaced and fixed a latent defect in the frame codec itself
-(`crates/protocol-aap/src/lib.rs`): `decode_frame`/`encode_frame` compared
-a first frame's declared total against that frame's on-wire length
-unconditionally, which is only valid when both are plaintext-domain (true
-for plain frames) — for encrypted frames the wire length is ciphertext,
-which can exceed a small plaintext total by TLS per-record overhead. The
-check is now skipped only for `Encryption::Encrypted`; the `Plain` path is
-unchanged and still strictly enforced. Confirmed against the pinned primary
-AASDK source (`docs/protocol/aasdk-adoption.md`, "Encrypted-message
-framing"): the declared total is plaintext-domain, matching what the fix
-assumes.
-
-`usb auth-discovery-probe --device <bus:address> --allow-live-aap` has now
-been run on Pi 5 against a real phone (USB accessory transition, the phone
-re-enumerated as the documented Google AOA accessory ID) using the
-operator-authorised external identity, requiring `sudo` since
-`/etc/aa-headunit/credentials` was root-only (`0700`) at the time — see the
-2026-08-18 correction near the end of this note: that path is no longer
-root-only and `sudo` is no longer required or advisable. It reached
-`probe_result=service_discovery_summary_received`: version negotiated, TLS
-handshake completed, `AuthComplete` sent, and — the specific behaviour this
-session's TLS application-data work targeted — the phone's real
-TLS-encrypted `ServiceDiscoveryRequest` was decrypted and reassembled
-(`probe_state=encrypted_frame_received`) into a bounded, byte-count-only
-summary. The probe stopped cleanly before any response or media setup, and
-the USB interface was released cleanly. The installed `/usr/bin/aa-headunit-diagnostics`
-package binary was stale at the time (missing `auth-discovery-probe`
-entirely), so the freshly built `target/release/aa-headunit-diagnostics`
-was used instead. The `.deb` has since been rebuilt from current source and
-reinstalled (`packaging/debian`, via a temporary `debian` symlink at the
-repo root removed after the build); `/usr/bin/aa-headunit-diagnostics` now
-includes `auth-discovery-probe` under both `usb` and `developer`, confirmed
-by re-running `usb auth-discovery-probe --device <bus:address>
---allow-live-aap` from the installed binary directly against the real
-phone — same clean result (`probe_result=service_discovery_summary_received`,
-stopped before response/media setup). The package binary is no longer
-stale.
-
-Clean timeout, malformed-message, unplug, and reconnect recovery are now
-proven, all on Pi 5 against the real phone (see `MILESTONE_CHECKLIST.md`
-M2 for full detail): a timeout was captured naturally (a stale-app-state
-phone left `auth-discovery-probe` waiting past its 10s `PROBE_TIMEOUT`,
-failing closed with no hang); malformed-message recovery is proven at the
-parser boundary the real probe actually calls, via
-`property_fuzz.rs`/`encrypted_service_discovery.rs` (a real phone sending
-genuinely malformed bytes isn't reproducible from the head-unit side, so
-fuzzing the exact same parser code path is the correct proof, not a
-compromise); `usb hold --device <bus:address> --seconds N` proved unplug
-detection with a real physical unplug (`hold_result=unplug_detected`, no
-hang) — this also surfaced and fixed a pre-existing bug in `usb hold`
-(`apps/aa-headunit-diagnostics/src/main.rs`) where two mutually-exclusive
-accessory-mode checks made the command fail unconditionally regardless of
-device state; reconnect recovery was proven by physically replugging after
-that unplug and immediately re-running `auth-discovery-probe`
-successfully. `usb auth-discovery-probe --device <bus:address>
---allow-live-aap` needed `sudo` at the time (credentials were root-only
-`0700`) — no longer true, see the 2026-08-18 correction below. The
-installed `/usr/bin/aa-headunit-diagnostics` package is current and
-includes `auth-discovery-probe`, so either it or a freshly built
-`target/release/aa-headunit-diagnostics` works.
-
-**Correction, 2026-08-18: `sudo` is no longer needed to run this app, and
-should not be used.** `/etc/aa-headunit/credentials` is now owned
-`blakereuben:aa-headunit`, mode `0700` (the operator is both the owner
-and a member of the `aa-headunit` group — the group-based fix from M4's
-audio-unprivileged work, `MILESTONE_CHECKLIST.md` M4). Running under
-`sudo` strips `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`
-from the process environment, which silently breaks every render
-pipeline — video and all three audio channels — real-hardware-confirmed
-during M4's 60-minute soak (`gst_wl_window_ensure_fullscreen: assertion
-'self' failed`, `render pipeline state change failed`). Always run `usb
-auth-discovery-probe`/`session-supervisor`/`gtk-dev-ui` as the plain
-logged-in user, not `sudo`.
-
-Since the note above, the remaining `Service`/`ServiceDiscoveryResponse`
-schema mapping (all 13 nested kinds, every leaf enum/config message, and
-`DriverPosition`/`ConnectionConfiguration`/`HeadUnitInfo`) was completed in
-`docs/protocol/aasdk-adoption.md`, and a full implementation was built on
-top of it, scoped to `Video`/`Input`/`MediaAudio`:
-`crates/protocol-aap/src/{protobuf,service_discovery_response,channel_open,
-media_message,video_setup}.rs`, wired into `auth-discovery-probe`
-(`apps/aa-headunit-diagnostics/src/auth_discovery_probe.rs`). This sends
-`ServiceDiscoveryResponse` the instant the phone's request summary is
-received, drives `ChannelOpenRequest`/`ChannelOpenResponse` for all three
-channels, and drives the video channel through `Setup`→`Config`→`Start`.
-It's proven correct end to end with real TLS crypto and real frame
-reassembly across three concurrently-fragmenting channels
-(`crates/protocol-aap/tests/full_channel_setup.rs`), and the frame codec,
-message assembler, and every new state machine have their own unit tests.
-
-**This is blocked on real hardware, not a natural stopping point.** Running
-`usb auth-discovery-probe --allow-live-aap` against a real phone reaches
-`probe_state=service_discovery_response_sent` cleanly (TLS-encrypted, no
-local error) and then the phone shows Android Auto's **"Error 2: phone and
-car are running incompatible software"** — no `ChannelOpenRequest` ever
-arrives. Three independent, minimal, reversible hypotheses were tested
-against the real phone and each refuted: a missing audio service, the
-offered protocol version (the phone negotiates `1.7`, undocumented in any
-known open-source AASDK fork — offering `1.7` instead of the pinned `1.6`
-made no difference and was reverted), and missing head-unit identity
-(`HeadUnitInfo`, now populated and kept). The `MediaAudio` channel and
-`HeadUnitInfo` both remain in the code as genuine completeness
-improvements, independent of the fact neither alone fixed Error 2.
-
-Full investigation writeup, confirmed facts, what's ruled out, what isn't,
-and research leads for whoever picks this up:
-**`docs/protocol/error-2-investigation.md`**. **First step in a new
-session: read that file, then run the verification commands above and
-report the actual results before writing any more code.**
+`docs/protocol/error-2-investigation.md` remains valuable as a detailed
+historical record of how that investigation was actually resolved (useful
+if a similar protocol-level symptom ever recurs), not as a pointer to an
+open blocker.
