@@ -6,12 +6,14 @@ version = 4
 name = "aa-headunit-diagnostics"
 version = "0.1.0"
 dependencies = [
+ "caps",
  "credential-store",
  "ctrlc",
  "futures-util",
  "gtk4",
  "media-api",
  "media-gstreamer",
+ "nix 0.29.0",
  "platform-api",
  "platform-linux",
  "protocol-aap",
@@ -148,6 +150,15 @@ dependencies = [
  "glib-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "caps"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd1ddba47aba30b6a889298ad0109c3b8dcb0e8fc993b459daa7067d46f865e0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

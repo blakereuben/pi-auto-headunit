@@ -66,6 +66,10 @@ case "$1" in
         if [ -n "$active_user" ] && ! getent passwd "$active_user" >/dev/null 2>&1; then
             active_user=""
         fi
+        active_home=""
+        if [ -n "$active_user" ]; then
+            active_home=$(getent passwd "$active_user" | cut -d: -f6)
+        fi
 
         # Supplementary groups are narrow — exactly what this app has
         # ever actually needed on real hardware: `video` (backlight
@@ -109,6 +113,36 @@ case "$1" in
         mkdir -p /var/lib/aa-headunit
         chown root:aa-headunit /var/lib/aa-headunit
         chmod 0770 /var/lib/aa-headunit
+
+        # Adopt a certificate/private-key pair staged by
+        # `packaging/setup.sh` (the "run the wizard, then install"
+        # entry point, operator's explicit direction 2026-08-24) or by
+        # a standalone `credentials setup` run
+        # (`credentials_setup_wizard.rs`) — both always write to this
+        # same fixed spot in the detected active user's home directory,
+        # never anywhere privileged, since neither can assume
+        # `/etc/aa-headunit` (created just above) exists yet. Installs
+        # via the exact same `credentials install` CLI path
+        # `docs/development/credential-provisioning.md` documents for
+        # manual use, as the detected user (not root, so the result is
+        # owned the same way a normal unprivileged `credentials
+        # install` run would leave it) — no-op, safely, if nothing was
+        # staged, if this is only an upgrade, or if real credentials
+        # already exist (that "install" call just fails harmlessly and
+        # the stale staged copy is still cleaned up below). The main
+        # app's own startup (`usb kiosk`) repeats this same adoption
+        # check as a safety net in case this step is ever skipped
+        # (e.g. no active desktop session detected at install time).
+        if [ -n "$active_user" ] && [ -n "$active_home" ]; then
+            staged_dir="$active_home/.local/share/aa-headunit/pending-credentials"
+            if [ -f "$staged_dir/headunit.crt" ] && [ -f "$staged_dir/headunit.key" ]; then
+                runuser -u "$active_user" -- \
+                    /usr/bin/aa-headunit-diagnostics credentials install \
+                    --certificate "$staged_dir/headunit.crt" \
+                    --private-key "$staged_dir/headunit.key" || true
+                rm -rf "$staged_dir"
+            fi
+        fi
 
         # Real deployment finding (2026-08-22): `usb wireless-bootstrap-probe`
         # (crate's own `wireless_bootstrap.rs`) brings up a temporary Wi-Fi
@@ -189,7 +223,6 @@ case "$1" in
             sed -i "/^\[Seat:\*\]/a autologin-user=$active_user" "$lightdm_conf"
         fi
         if [ -n "$active_user" ]; then
-            active_home=$(getent passwd "$active_user" | cut -d: -f6)
             if [ -n "$active_home" ] && [ -d "$active_home" ] \
                 && [ -f /usr/share/aa-headunit/labwc-autostart ]; then
                 mkdir -p "$active_home/.config/labwc"

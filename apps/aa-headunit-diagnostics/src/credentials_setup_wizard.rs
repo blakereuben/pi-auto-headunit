@@ -377,18 +377,26 @@ fn build_validate_result_page(stack: &Stack, source: &CredentialPaths) -> GtkBox
 fn build_install_result_page(source: &CredentialPaths) -> GtkBox {
     let page = page_container();
 
-    match install_credentials(source, &destination_paths()) {
+    // Always stages rather than installing straight to `destination_paths()`
+    // — this wizard can run before the package (and the `aa-headunit`
+    // group/directory that owns the real destination) is even installed
+    // (`packaging/setup.sh`). `postinst`, or the main app's own startup as
+    // a safety net, adopts the staged pair for real afterward
+    // (`credentials::adopt_staged_credentials_if_present`).
+    let result = match crate::credentials::staging_paths() {
+        Some(staging) => install_credentials(source, &staging),
+        None => Err(CredentialError::Config(
+            "could not determine a home directory to save to".into(),
+        )),
+    };
+
+    match result {
         Ok(_) => {
-            page.append(&title_label("Credentials installed"));
-            page.append(&body_label(&format!(
-                "Installed to {}. You can now open Android Auto Head Unit \
-                 from the desktop — it'll connect over USB or wirelessly \
-                 automatically.",
-                destination_paths().certificate.parent().map_or_else(
-                    || destination_paths().certificate.display().to_string(),
-                    |parent| parent.display().to_string()
-                )
-            )));
+            page.append(&title_label("Credentials saved"));
+            page.append(&body_label(
+                "These will be installed automatically the next time the \
+                 head unit app starts.",
+            ));
         }
         Err(error) => {
             page.append(&title_label("Installation failed"));

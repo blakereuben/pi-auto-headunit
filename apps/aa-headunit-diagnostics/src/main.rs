@@ -39,8 +39,13 @@ mod gtk_dev_ui;
 #[cfg(target_os = "linux")]
 mod wireless_bootstrap;
 
+#[cfg(target_os = "linux")]
+mod privilege;
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    #[cfg(target_os = "linux")]
+    privilege::drop_unneeded_capabilities(&args);
     let code = match run(&args) {
         Ok(()) => 0,
         Err(error) => {
@@ -1429,6 +1434,12 @@ fn usb_gtk_dev_ui(_: &str, _: bool) -> Result<(), CliError> {
 /// exists.
 #[cfg(target_os = "linux")]
 fn usb_kiosk(tls12_compatibility: bool) -> Result<(), CliError> {
+    // Safety net: adopt any certificate/private-key pair
+    // `credentials setup` staged but nothing has installed for real yet
+    // (normally `postinst` already did this at install time — see
+    // `credentials::adopt_staged_credentials_if_present`'s own doc
+    // comment for when this actually fires).
+    credentials::adopt_staged_credentials_if_present();
     println!("probe_authorization=operator_confirmed");
     println!("probe_payload_logging=disabled");
     println!(
