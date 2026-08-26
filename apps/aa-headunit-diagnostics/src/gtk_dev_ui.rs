@@ -1717,6 +1717,31 @@ fn start_kiosk_session(
 ) {
     window.attempt_started_at.set(Some(Instant::now()));
 
+    // Real finding, 2026-08-25: `end_kiosk_attempt` hides the window when
+    // an attempt ends (see its own doc comment for why — avoiding stale
+    // frozen video on a reconnect), and the only other place that calls
+    // `present()` again is the capability-poll closure below, gated on a
+    // `DecoderCapability` actually arriving — which only happens once a
+    // session gets deep enough to negotiate a video decoder, i.e. well
+    // into a *successful* connection. Any attempt that fails before that
+    // point (no device plugged in, no phone paired, bad credentials, no
+    // wireless hardware, the phone declining the connection, ...) left
+    // the window hidden for its *entire* duration with zero on-screen
+    // indication anything was happening — confirmed via a real repro
+    // (deliberately broken credentials): the process retried once a
+    // second, forever, while the operator's screen just showed their
+    // plain desktop. Re-presenting immediately here, at the start of
+    // every attempt rather than only once video is ready, means the
+    // operator always sees the kiosk window while it's trying/retrying.
+    // Safe against the original frozen-video bug this hiding was added
+    // to fix: `end_kiosk_attempt` already clears the paintable before
+    // hiding, so there is never stale video content to freeze on here —
+    // only the themed "no video yet" background.
+    window.window.present();
+    if window.is_fullscreen.get() {
+        window.window.fullscreen();
+    }
+
     let (capability_sender, capability_receiver) = mpsc::channel::<DecoderCapability>();
     let (pipeline_sender, pipeline_receiver) = mpsc::channel();
     let (session_result_sender, session_result_receiver) = mpsc::channel::<Result<(), CliError>>();

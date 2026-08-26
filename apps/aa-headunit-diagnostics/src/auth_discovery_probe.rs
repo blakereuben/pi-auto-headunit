@@ -3089,7 +3089,7 @@ fn send_service_discovery_response<T: SessionTransport>(
     limits: ProtocolLimits,
 ) -> Result<(), CliError> {
     let catalogue = build_service_catalogue()?;
-    let capabilities = build_service_capabilities();
+    let capabilities = build_service_capabilities()?;
     let response = encode_service_discovery_response(&catalogue, &capabilities)
         .map_err(|error| CliError::Protocol(error.to_string()))?;
     let payload = response
@@ -3161,8 +3161,18 @@ fn build_service_catalogue() -> Result<ServiceCatalogue, CliError> {
 /// Head-unit-chosen capability data for every advertised service — not
 /// phone-derived, so safe to construct and log without any privacy
 /// concern (unlike `ServiceDiscoveryRequestSummary`).
-fn build_service_capabilities() -> ServiceCapabilities {
-    ServiceCapabilities {
+fn build_service_capabilities() -> Result<ServiceCapabilities, CliError> {
+    // Real-hardware finding, 2026-08-26: `car_address` used to be a
+    // hardcoded placeholder (`02:00:00:00:00:01`) — a real phone then
+    // tried and failed to open an HFP connection to it during a live
+    // wireless session ("can't connect to 02:00:00:00:00:01"). This
+    // machine's real local adapter address is what a phone actually needs
+    // here, independent of which transport (USB or wireless) is carrying
+    // this very session — see `transport_bluetooth::local_adapter_address`'s
+    // own doc comment.
+    let car_address = transport_bluetooth::local_adapter_address()
+        .map_err(|error| CliError::Protocol(error.to_string()))?;
+    Ok(ServiceCapabilities {
         // Both entries share the same resolution/frame-rate tier and
         // differ only in codec — position in this list is load-bearing:
         // `video_setup.rs`'s `ADVERTISED_H264_CONFIGURATION_INDEX`/
@@ -3253,9 +3263,7 @@ fn build_service_capabilities() -> ServiceCapabilities {
             number_of_channels: VOICE_AUDIO_CHANNELS,
             stream_type: AudioStreamType::Guidance,
         }),
-        bluetooth: Some(BluetoothCapability {
-            car_address: "02:00:00:00:00:01".into(),
-        }),
+        bluetooth: Some(BluetoothCapability { car_address }),
         microphone: Some(MicrophoneCapability {
             sampling_rate: VOICE_AUDIO_SAMPLING_RATE,
             number_of_bits: VOICE_AUDIO_BITS,
@@ -3289,7 +3297,7 @@ fn build_service_capabilities() -> ServiceCapabilities {
             high_latency_threshold_ms: ADVERTISED_PING_HIGH_LATENCY_THRESHOLD_MS,
             tracked_ping_count: ADVERTISED_PING_TRACKED_COUNT,
         }),
-    }
+    })
 }
 
 /// Drives the video channel's `ChannelOpenStateMachine` then

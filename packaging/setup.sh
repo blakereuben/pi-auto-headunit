@@ -70,7 +70,33 @@ if [ ! -x "$wizard" ]; then
     exit 1
 fi
 
-"$wizard" credentials setup || true
+# `credentials setup` itself now leads with a Bluetooth-pairing page
+# before the credential file picker (`credentials_setup_wizard.rs`'s
+# `build_pair_bluetooth_page`) — operator's explicit direction,
+# 2026-08-26: that step belongs in the same GTK wizard as the credential
+# setup, not a separate terminal-based step here beforehand.
+#
+# `set +e`/`$?` instead of the old `|| true`: real-hardware finding,
+# 2026-08-26 — a plain `|| true` swallows *every* wizard exit code
+# indistinguishably, so this script used to barrel on into `apt install
+# --reinstall` below even when the operator had just hit the wizard's own
+# "Cancel Installation" button, silently reinstalling the very package
+# that button had just uninstalled (confirmed via `journalctl`: the
+# `pkexec`/`apt purge` it ran genuinely succeeded — this script simply
+# never checked). `CANCELLED_EXIT_CODE` (`credentials_setup_wizard.rs`)
+# is a specific, deliberately-chosen exit code so this can tell "the
+# operator cancelled and uninstalled" apart from every other nonzero
+# wizard exit (e.g. the window just being closed without finishing),
+# which should still fall through to install below in case credentials
+# were already staged from an earlier run.
+set +e
+"$wizard" credentials setup
+wizard_exit_code=$?
+set -e
+if [ "$wizard_exit_code" -eq 42 ]; then
+    echo "Setup was cancelled — the app has already been uninstalled. Nothing more to do."
+    exit 0
+fi
 
 echo "Installing $deb..."
 # --reinstall: plain `apt install` silently no-ops ("already the newest
@@ -81,5 +107,15 @@ echo "Installing $deb..."
 # project's own install history already established `--reinstall` as
 # the right fix for exactly this local-.deb-reinstall case.
 sudo apt install --reinstall -y "$deb"
+
+# Operator's explicit direction, 2026-08-26: exactly two icons should be
+# left on the Desktop after running this installer — the app itself and
+# the uninstaller (both just installed by the package's own `postinst`,
+# `aa-headunit.desktop`/`aa-headunit-uninstall.desktop`) — not a third,
+# lingering "Install" icon whose job is now done. Only ever removes the
+# fixed, well-known Desktop-shortcut path this project's own install
+# convention uses; a no-op if it's not there (run from a terminal, no
+# such shortcut, already removed, etc).
+rm -f "$HOME/Desktop/aa-headunit-install.desktop"
 
 echo "Done. Credentials staged during setup have been installed automatically."

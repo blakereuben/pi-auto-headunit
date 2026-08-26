@@ -1,6 +1,25 @@
 #!/bin/sh
 set -e
 
+# Same detection `postinst` uses to decide whose home directory to write
+# desktop icons/autostart into — duplicated here (maintainer scripts don't
+# share code) so `purge` can find and remove exactly those same per-user
+# files. See `postinst`'s own copy of this function for the full
+# reasoning; kept intentionally identical.
+detect_active_desktop_user() {
+    if ! command -v loginctl >/dev/null 2>&1; then
+        return 0
+    fi
+    for session_id in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+        seat=$(loginctl show-session "$session_id" -p Seat --value 2>/dev/null || true)
+        state=$(loginctl show-session "$session_id" -p State --value 2>/dev/null || true)
+        if [ "$seat" = "seat0" ] && [ "$state" = "active" ]; then
+            loginctl show-session "$session_id" -p Name --value 2>/dev/null || true
+            return 0
+        fi
+    done
+}
+
 # M5 install/upgrade/remove/purge testing surfaced that this package had
 # no postrm at all — `remove` already did the right thing by default
 # (dpkg only ever touches files it installed, so the dedicated
@@ -9,19 +28,67 @@ set -e
 # reversible" semantics), but `purge` left the same things behind too,
 # which isn't a real clean slate.
 #
-# Deliberately narrow, and deliberately never touches
-# `/etc/aa-headunit` at all: that directory holds `config.toml` (a
-# conffile dpkg already manages on its own) and — separately, entirely
-# outside dpkg's install manifest — a `credentials/` directory a human
-# operator provisions by hand (`credentials install`,
-# `docs/development/credential-provisioning.md`). dpkg's own standard
-# conffile/empty-directory handling already does the right thing here
-# (never removes a non-empty directory, never touches untracked files),
-# and that's relied on rather than reimplemented — this script has no
-# code path that could ever remove real credential material, on purpose.
+# `/etc/aa-headunit` (config.toml, a conffile dpkg would otherwise leave
+# on `remove` and normally purges separately itself, plus the
+# `credentials/` directory a human operator provisions by hand,
+# `docs/development/credential-provisioning.md`) IS removed outright by
+# `purge` below, including any installed certificate/private key —
+# real, explicit operator direction, 2026-08-26: "the uninstaller MUST
+# remove 100% of its files" (a plain `remove` — as opposed to `purge` —
+# still leaves it alone, matching every other conffile/data directory in
+# this script and standard dpkg convention: `remove` is reversible,
+# `purge` is not). An operator who purges this package is choosing to
+# lose their installed identity along with everything else and will need
+# to run the credential wizard again on next install.
 
 case "$1" in
     purge)
+        # `postinst` writes desktop icons, an app-menu entry, and (for
+        # wireless bootstrap installs run before this package existed —
+        # `packaging/setup.sh`) a staged-but-never-adopted credential pair
+        # into the active operator's own home directory — none of it
+        # tracked in dpkg's install manifest, since it lives per-user
+        # rather than under `/usr`, so a plain `apt purge` would otherwise
+        # leave every one of these behind forever. Real user finding,
+        # 2026-08-26: "I want an uninstaller to remove all of its files" —
+        # see this file's own header comment for why `/etc/aa-headunit`
+        # (including any installed credential pair) is included below,
+        # unlike the rest of this script's otherwise-conservative
+        # defaults.
+        rm -rf /etc/aa-headunit
+        active_user=$(detect_active_desktop_user)
+        case "$active_user" in
+            *[!a-zA-Z0-9_-]*) active_user="" ;;
+        esac
+        if [ -n "$active_user" ] && ! getent passwd "$active_user" >/dev/null 2>&1; then
+            active_user=""
+        fi
+        active_home=""
+        if [ -n "$active_user" ]; then
+            active_home=$(getent passwd "$active_user" | cut -d: -f6)
+        fi
+        if [ -n "$active_home" ] && [ -d "$active_home" ]; then
+            rm -f \
+                "$active_home/Desktop/aa-headunit.desktop" \
+                "$active_home/Desktop/aa-headunit-setup.desktop" \
+                "$active_home/Desktop/aa-headunit-uninstall.desktop" \
+                "$active_home/Desktop/aa-headunit-install.desktop" \
+                "$active_home/.local/share/applications/aa-headunit.desktop" \
+                "$active_home/.local/share/applications/aa-headunit-setup.desktop" \
+                "$active_home/.local/share/applications/aa-headunit-uninstall.desktop"
+            # `packaging/setup.sh`'s own extracted-wizard staging spot, and
+            # anything `credentials setup` staged but nothing ever adopted
+            # (e.g. the operator ran setup but the package install that
+            # would have adopted it failed or was cancelled).
+            rm -rf "$active_home/.local/share/aa-headunit/pending-credentials"
+            rm -rf "$active_home/.local/share/aa-headunit/installer"
+            # `postinst` always overwrites this on every install/upgrade
+            # ("package-managed content, not something meant to be
+            # hand-edited" — see `postinst`'s own comment) — safe to
+            # remove outright rather than leave a stale copy that still
+            # tries to launch a now-uninstalled binary on every login.
+            rm -f "$active_home/.config/labwc/autostart"
+        fi
         # `loginctl enable-linger aa-headunit` (`postinst`) keeps a real
         # `systemd --user` instance running for this user at all times —
         # real-hardware finding, M5 packaging tests: `deluser` below

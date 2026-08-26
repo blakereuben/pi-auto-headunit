@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Uninstall Android Auto Head Unit
+Comment=Remove the app, its desktop icons, and its settings from this computer
+Exec=pkexec apt purge -y aa-headunit-diagnostics
+Icon=edit-delete
+Terminal=false
+Categories=System;

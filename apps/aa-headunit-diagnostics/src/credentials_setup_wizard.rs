@@ -29,10 +29,16 @@ use credential_store::{
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, FileDialog, Label, Orientation, Stack,
+    glib,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use transport_bluetooth::PairingProgress;
 
 use crate::credentials::{DEFAULT_CERTIFICATE_PATH, DEFAULT_PRIVATE_KEY_PATH};
 
@@ -40,6 +46,28 @@ const WINDOW_WIDTH: i32 = 560;
 const WINDOW_HEIGHT: i32 = 420;
 const PAGE_MARGIN: i32 = 24;
 const ROW_SPACING: i32 = 12;
+
+/// The exit code this process reports when the operator hit Cancel
+/// (`build_cancel_row`) — arbitrary but distinct from `0`/`1`/`2`, the
+/// exit codes a plain window-close or an ordinary error might already
+/// produce. `packaging/setup.sh` checks for exactly this value to know
+/// its own subsequent `apt install` step must be skipped, not just any
+/// nonzero wizard exit — see `build_cancel_row`'s own comment for the
+/// real-hardware finding that made this necessary.
+const CANCELLED_EXIT_CODE: i32 = 42;
+
+/// How long the pairing page waits for a phone before giving up and
+/// letting the operator continue anyway (they can always pair later from
+/// Bluetooth settings) — matches `packaging/setup.sh`'s own shell
+/// implementation of the same wait.
+const BLUETOOTH_PAIRING_TIMEOUT: Duration = Duration::from_secs(180);
+/// How often the background pairing thread checks whether a phone has
+/// paired yet.
+const BLUETOOTH_PAIRING_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the GTK page itself polls for a progress update from that
+/// background thread — matches this app's other GTK/background-thread
+/// bridges (`gtk_dev_ui.rs`'s own `POLL_INTERVAL`).
+const BLUETOOTH_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Where the wizard installs to — identical to `credentials.rs`'s own
 /// `install` command destination, not independently chosen.
@@ -92,7 +120,20 @@ fn build_and_present_wizard(application: &Application) {
 
     let stack = Stack::new();
     stack.set_transition_type(gtk4::StackTransitionType::SlideLeftRight);
-    window.set_child(Some(&stack));
+    stack.set_vexpand(true);
+
+    // A persistent row *outside* the stack, not duplicated into every
+    // individual page's own button row — stays visible across every page
+    // (including ones added to `stack` dynamically later, like the
+    // validate/install result pages) without needing separate wiring in
+    // each `build_*_page` function. Operator's explicit direction,
+    // 2026-08-26: "a cancel installation button in the wizard on every
+    // page so i can cancel at anytime, which will also act as a
+    // uninstall."
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    root.append(&stack);
+    root.append(&build_cancel_row());
+    window.set_child(Some(&root));
 
     let state: Rc<RefCell<WizardState>> = Rc::new(RefCell::new(WizardState::default()));
 
@@ -108,6 +149,7 @@ fn build_and_present_wizard(application: &Application) {
         stack.set_visible_child_name("already-installed");
     } else {
         stack.add_named(&build_welcome_page(&stack), Some("welcome"));
+        stack.add_named(&build_pair_bluetooth_page(&stack), Some("pair-bluetooth"));
         stack.add_named(
             &build_choose_files_page(&window, &stack, &state),
             Some("choose-files"),
@@ -116,6 +158,99 @@ fn build_and_present_wizard(application: &Application) {
     }
 
     window.present();
+}
+
+/// The persistent "Cancel Installation" row shown under every page. A
+/// separate, fixed row (not part of any individual page's own
+/// `button_row`) — see [`build_and_present_wizard`]'s own comment for
+/// why.
+///
+/// Real-hardware finding, 2026-08-26: `cancel_and_uninstall` (the
+/// `pkexec`/`apt purge` call) genuinely worked the first time this was
+/// tried (confirmed via `journalctl`: polkit authenticated and `apt
+/// purge` ran successfully) — but running it synchronously right here in
+/// the click handler blocked the GTK main thread for as long as the
+/// operator took to answer the polkit password prompt, with the window
+/// giving no sign anything was happening. Indistinguishable from
+/// actually being broken. Same background-thread-plus-channel-plus-
+/// `glib::timeout_add_local` bridge as [`build_pair_bluetooth_page`],
+/// so the window stays responsive and visibly says what it's doing
+/// instead of silently freezing.
+fn build_cancel_row() -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
+    row.set_halign(gtk4::Align::Start);
+    row.set_margin_start(PAGE_MARGIN);
+    row.set_margin_end(PAGE_MARGIN);
+    row.set_margin_bottom(PAGE_MARGIN);
+
+    let cancel = Button::with_label("Cancel Installation");
+    cancel.add_css_class("destructive-action");
+    row.append(&cancel);
+
+    let status = body_label("");
+    row.append(&status);
+
+    cancel.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        status.set_label("Cancelling and uninstalling — check for a password prompt…");
+
+        let (sender, receiver) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            cancel_and_uninstall();
+            let _ = sender.send(());
+        });
+
+        glib::timeout_add_local(BLUETOOTH_STATUS_POLL_INTERVAL, move || {
+            match receiver.try_recv() {
+                // Real-hardware finding, 2026-08-26: `packaging/setup.sh`'s
+                // `"$wizard" credentials setup || true` swallows *any*
+                // wizard exit code, so it unconditionally continued on to
+                // `apt install --reinstall` right after — reinstalling
+                // the very package Cancel had just purged, even though
+                // the purge itself genuinely succeeded (confirmed via
+                // `journalctl`). `window.close()` alone can't signal
+                // "cancelled" to the shell script that launched this
+                // process at all — only the process's own exit code can.
+                // `std::process::exit` (not a normal `window.close()` and
+                // GTK app-loop return) so this exact code reaches
+                // `setup.sh` unconditionally, skipping GTK's own cleanup
+                // since the process is ending regardless. `setup.sh`
+                // checks for exactly this value to skip its own install
+                // step instead of treating it like any other nonzero
+                // wizard exit (e.g. the window just being closed without
+                // finishing, which should still fall through to install
+                // in case credentials were already staged).
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                    std::process::exit(CANCELLED_EXIT_CODE);
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            }
+        });
+    });
+
+    row
+}
+
+/// Operator's explicit direction, 2026-08-26: Cancel means "undo
+/// everything" — whatever this run of the wizard has staged, and (if
+/// this is a later re-run of `credentials setup` against an
+/// already-installed package, not the first-run `packaging/setup.sh`
+/// flow) the installed package itself. `pkexec` (not `sudo`, which has
+/// no terminal to prompt a password on from a GTK button): the exact
+/// same mechanism the packaged "Uninstall Android Auto Head Unit" icon
+/// uses (`packaging/labwc/aa-headunit-uninstall.desktop`), so Cancel
+/// here and that icon always agree on how the app actually gets
+/// removed. Best-effort throughout: if the package was never installed
+/// yet, `apt purge` on it is a harmless no-op, not an error worth
+/// surfacing — the operator is leaving either way.
+fn cancel_and_uninstall() {
+    if let Some(staging) = crate::credentials::staging_paths() {
+        let _ = std::fs::remove_file(&staging.certificate);
+        let _ = std::fs::remove_file(&staging.private_key);
+    }
+    let _ = std::process::Command::new("pkexec")
+        .args(["apt", "purge", "-y", "aa-headunit-diagnostics"])
+        .status();
 }
 
 fn page_container() -> GtkBox {
@@ -172,9 +307,78 @@ fn build_welcome_page(stack: &Stack) -> GtkBox {
     next.add_css_class("suggested-action");
     let stack_for_next = stack.clone();
     next.connect_clicked(move |_| {
+        stack_for_next.set_visible_child_name("pair-bluetooth");
+    });
+    page.append(&button_row(&[&next]));
+    page
+}
+
+/// Pairing your phone before picking credential files, not after —
+/// operator's explicit direction, 2026-08-26: turn Bluetooth on and make
+/// it discoverable itself if it isn't already, as part of this same
+/// guided flow, so Android Auto can find an already-paired phone and
+/// start right up on first launch instead of the operator hitting a
+/// black screen with nothing paired. Never blocks progress on actually
+/// pairing — "Continue" is enabled from the start, matching
+/// `packaging/setup.sh`'s own "setup continues either way" shell version
+/// of the same step.
+fn build_pair_bluetooth_page(stack: &Stack) -> GtkBox {
+    let page = page_container();
+    page.append(&title_label("Connect your phone over Bluetooth"));
+    page.append(&body_label(
+        "Pairing now means Android Auto can start right up once setup \
+         finishes, instead of the first launch having nothing paired to \
+         talk to. You can also pair later from Bluetooth settings.",
+    ));
+
+    let status = body_label("Turning on Bluetooth…");
+    page.append(&status);
+
+    let next = Button::with_label("Continue");
+    next.add_css_class("suggested-action");
+    let stack_for_next = stack.clone();
+    next.connect_clicked(move |_| {
         stack_for_next.set_visible_child_name("choose-files");
     });
     page.append(&button_row(&[&next]));
+
+    let (sender, receiver) = mpsc::channel::<PairingProgress>();
+    thread::spawn(move || {
+        transport_bluetooth::pair_phone_with_progress(
+            BLUETOOTH_PAIRING_TIMEOUT,
+            BLUETOOTH_PAIRING_CHECK_INTERVAL,
+            &sender,
+        );
+    });
+
+    let status_for_poll = status.clone();
+    glib::timeout_add_local(BLUETOOTH_STATUS_POLL_INTERVAL, move || {
+        match receiver.try_recv() {
+            Ok(PairingProgress::Discoverable { device_name }) => {
+                status_for_poll.set_label(&format!(
+                    "On your phone: open Bluetooth settings and pair with \
+                     \"{device_name}\". Waiting…"
+                ));
+                glib::ControlFlow::Continue
+            }
+            Ok(PairingProgress::Paired) => {
+                status_for_poll.set_label("Phone paired.");
+                glib::ControlFlow::Break
+            }
+            Ok(PairingProgress::TimedOut) => {
+                status_for_poll
+                    .set_label("No phone paired yet — you can pair later from Bluetooth settings.");
+                glib::ControlFlow::Break
+            }
+            Ok(PairingProgress::Error(error)) => {
+                status_for_poll.set_label(&format!("Couldn't start Bluetooth pairing: {error}."));
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+
     page
 }
 
@@ -329,7 +533,13 @@ fn build_choose_files_page(
 fn build_validate_result_page(stack: &Stack, source: &CredentialPaths) -> GtkBox {
     let page = page_container();
 
-    match validate_credentials(source, true) {
+    // `false`: this previews the freshly *picked* source pair, which
+    // `install_credentials` (`credential-store/src/linux.rs`) rewrites to
+    // the real destination with correct `0600` permissions regardless of
+    // the source's own mode — see that function's own comment. Matching
+    // its relaxed check here means this preview page doesn't reject a
+    // pair the actual install step would accept.
+    match validate_credentials(source, false) {
         Ok(status) => {
             page.append(&title_label("Step 2 of 2 — Files look valid"));
             page.append(&body_label(&format!(
@@ -359,7 +569,7 @@ fn build_validate_result_page(stack: &Stack, source: &CredentialPaths) -> GtkBox
             page.append(&button_row(&[&back, &install]));
         }
         Err(error) => {
-            page.append(&title_label("These files aren't a valid pair"));
+            page.append(&title_label(credential_error_title(&error)));
             page.append(&body_label(&describe_credential_error(&error)));
 
             let back = Button::with_label("Back");
@@ -399,7 +609,7 @@ fn build_install_result_page(source: &CredentialPaths) -> GtkBox {
             ));
         }
         Err(error) => {
-            page.append(&title_label("Installation failed"));
+            page.append(&title_label(credential_error_title(&error)));
             page.append(&body_label(&describe_credential_error(&error)));
         }
     }
@@ -419,6 +629,29 @@ fn build_install_result_page(source: &CredentialPaths) -> GtkBox {
     page
 }
 
+/// A title specific to *what actually went wrong*, shown above
+/// [`describe_credential_error`]'s detail text. Previously every branch of
+/// [`build_validate_page`] (and, separately, [`build_install_result_page`])
+/// hard-coded "These files aren't a valid pair"/"Installation failed" for
+/// any [`CredentialError`] at all — so a pure file-permissions problem (no
+/// mismatch between the certificate and key whatsoever) read as if the
+/// files didn't pair, misleading an operator who already knows their
+/// cert/key really do match. Real-hardware finding, 2026-08-26: a fresh
+/// install's picked-from-USB-stick private key hit exactly this — 0644
+/// permissions inherited from a FAT-formatted drive, reported as "aren't a
+/// valid pair".
+fn credential_error_title(error: &CredentialError) -> &'static str {
+    match error {
+        CredentialError::Missing(_) => "File not found",
+        CredentialError::InvalidFile(_) => "That file isn't usable",
+        CredentialError::InvalidCredentials(_) => "These files aren't a valid pair",
+        CredentialError::InsecurePrivateKeyPermissions(_) => "Private key permissions are too open",
+        CredentialError::AlreadyInstalled(_) => "Already installed",
+        CredentialError::Io(_) => "Couldn't read that file",
+        CredentialError::Config(_) => "Setup problem",
+    }
+}
+
 /// Plain-language versions of [`CredentialError`] for the wizard's own
 /// pages — the CLI's `Display` impl (`credential-store/src/linux.rs`) is
 /// already reasonably plain, this just avoids the `Debug`-shaped prefix
@@ -434,8 +667,13 @@ fn describe_credential_error(error: &CredentialError) -> String {
             format!("The certificate and private key don't form a valid pair: {reason}.")
         }
         CredentialError::InsecurePrivateKeyPermissions(mode) => format!(
-            "The private key file's permissions ({mode:04o}) allow other users to read it. \
-             Fix this before continuing, e.g. `chmod 600` on the file, then try again."
+            "The private key file's permissions ({mode:04o}) allow other users to read it — \
+             it must be exactly 0600 (readable only by you). Fix this before continuing: \
+             open a terminal and run `chmod 600` on the private key file, then try again. \
+             If that file is on a USB drive or SD card reader formatted FAT32/exFAT, `chmod` \
+             won't take effect there — those filesystems don't support Unix permissions at \
+             all — copy the file onto this device first (e.g. into your home folder), `chmod \
+             600` the copy, and pick that copy instead."
         ),
         CredentialError::AlreadyInstalled(path) => {
             format!("{} already exists.", path.display())

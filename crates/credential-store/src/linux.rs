@@ -166,7 +166,20 @@ pub fn install_credentials(
     source: &CredentialPaths,
     destination: &CredentialPaths,
 ) -> Result<CredentialStatus, CredentialError> {
-    validate_credentials(source, true)?;
+    // `false`: the *source* file's own permissions are irrelevant here —
+    // its bytes get read and rewritten to `destination` with a fresh,
+    // correctly-locked-down `0o600` a few lines below regardless of
+    // whatever mode the source had (e.g. `0644`, inherited unavoidably
+    // from a FAT32/exFAT USB stick or SD card, which cannot represent
+    // Unix permissions at all). Requiring the source to already be secure
+    // was pure friction for a new operator picking a fresh cert/key pair
+    // from removable media — it blocked on a property this function
+    // immediately discards and rewrites correctly anyway. Real-hardware
+    // finding, 2026-08-26. The *destination* check two lines below stays
+    // `true`: that file is what actually gets loaded at runtime, and
+    // `docs/development/credential-provisioning.md` documents 0600 there
+    // as the real security property being enforced.
+    validate_credentials(source, false)?;
     if destination.certificate.exists() {
         return Err(CredentialError::AlreadyInstalled(
             destination.certificate.clone(),

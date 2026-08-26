@@ -247,6 +247,27 @@ case "$1" in
                         "$active_home/Desktop/aa-headunit.desktop"
                     chown "$active_user:$active_user" \
                         "$active_home/Desktop/aa-headunit.desktop"
+                    # Real-hardware finding, 2026-08-26: GNOME/GTK's
+                    # `GDesktopAppInfo` (what a double-click in the desktop
+                    # file manager actually uses) refuses to even parse a
+                    # `.desktop` launcher sitting in `~/Desktop` unless it
+                    # carries this GVFS metadata attribute — a security
+                    # hardening against a downloaded/copied `.desktop` file
+                    # silently running arbitrary commands. Confirmed: the
+                    # exact same file launches fine from
+                    # `~/.local/share/applications` (a recognized XDG apps
+                    # dir, exempt from this check) but fails from `Desktop`
+                    # with "invalid desktop entry file" until this is set.
+                    # Must run as the operator, not root — the attribute is
+                    # stored per-user (`~/.local/share/gvfs-metadata`), and
+                    # root's own store is a different file the operator's
+                    # desktop session never reads. `|| true`: cosmetic only
+                    # (a missing `gio` just means the operator has to
+                    # right-click-trust it once themselves), never worth
+                    # failing the whole install over.
+                    runuser -u "$active_user" -- \
+                        gio set "$active_home/Desktop/aa-headunit.desktop" \
+                        metadata::trusted true >/dev/null 2>&1 || true
                 fi
                 mkdir -p "$active_home/.local/share/applications"
                 install -m0755 /usr/share/aa-headunit/aa-headunit.desktop \
@@ -254,22 +275,45 @@ case "$1" in
                 chown -R "$active_user:$active_user" \
                     "$active_home/.local/share/applications"
             fi
-            # Same pattern as the icon above, for the guided credential
-            # setup wizard (`aa-headunit-diagnostics credentials setup`) —
-            # a separate icon so an operator installing their certificate
-            # for the first time has something to double-tap without
-            # needing a terminal.
+            # App-menu entry only, deliberately NOT a Desktop icon —
+            # operator's explicit direction, 2026-08-26: the one-stop
+            # `packaging/setup.sh` installer already runs this exact
+            # wizard as its own first step, so a separate "run the wizard
+            # again" Desktop icon would make three icons appear after a
+            # single install (app, setup, uninstall) instead of the two
+            # the operator actually wants (app, uninstall). Still
+            # available from the application menu for the rare case of
+            # rotating credentials later without a full reinstall.
             if [ -n "$active_home" ] && [ -d "$active_home" ] \
                 && [ -f /usr/share/aa-headunit/aa-headunit-setup.desktop ]; then
-                if [ -d "$active_home/Desktop" ]; then
-                    install -m0755 /usr/share/aa-headunit/aa-headunit-setup.desktop \
-                        "$active_home/Desktop/aa-headunit-setup.desktop"
-                    chown "$active_user:$active_user" \
-                        "$active_home/Desktop/aa-headunit-setup.desktop"
-                fi
                 mkdir -p "$active_home/.local/share/applications"
                 install -m0755 /usr/share/aa-headunit/aa-headunit-setup.desktop \
                     "$active_home/.local/share/applications/aa-headunit-setup.desktop"
+                chown -R "$active_user:$active_user" \
+                    "$active_home/.local/share/applications"
+            fi
+            # Same pattern again, for a one-click way to remove the app —
+            # `pkexec` (not a `Terminal=true` + `sudo`, which needs a
+            # non-existent TTY to prompt for a password from a plain
+            # double-click) shows the operator's normal desktop polkit
+            # password dialog, matching the setup wizard's Browse button
+            # or credential wizard flow: a GUI action asking for a GUI
+            # confirmation, no terminal required.
+            if [ -n "$active_home" ] && [ -d "$active_home" ] \
+                && [ -f /usr/share/aa-headunit/aa-headunit-uninstall.desktop ]; then
+                if [ -d "$active_home/Desktop" ]; then
+                    install -m0755 /usr/share/aa-headunit/aa-headunit-uninstall.desktop \
+                        "$active_home/Desktop/aa-headunit-uninstall.desktop"
+                    chown "$active_user:$active_user" \
+                        "$active_home/Desktop/aa-headunit-uninstall.desktop"
+                    # See the kiosk icon's own comment above for why.
+                    runuser -u "$active_user" -- \
+                        gio set "$active_home/Desktop/aa-headunit-uninstall.desktop" \
+                        metadata::trusted true >/dev/null 2>&1 || true
+                fi
+                mkdir -p "$active_home/.local/share/applications"
+                install -m0755 /usr/share/aa-headunit/aa-headunit-uninstall.desktop \
+                    "$active_home/.local/share/applications/aa-headunit-uninstall.desktop"
                 chown -R "$active_user:$active_user" \
                     "$active_home/.local/share/applications"
             fi
