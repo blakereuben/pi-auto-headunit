@@ -1,8 +1,35 @@
 use gstreamer as gst;
 use media_api::{DecoderCapability, DecoderKind, VideoRequest};
 use std::fmt;
+use std::sync::Once;
 
 use crate::{PipelineElements, capability_for_request, decoder_element, pipeline_elements};
+
+static EQUALIZER_PLUGIN_WARMUP: Once = Once::new();
+
+/// Real CI/test finding, 2026-08-26: `cargo test`'s default parallel test
+/// threads can each independently try to load the `equalizer` `GStreamer`
+/// plugin (via `equalizer-10bands` in a parsed pipeline string,
+/// `audio.rs`) for the first time simultaneously. Observed directly as an
+/// intermittent SIGSEGV — `cannot register existing type
+/// 'GstIirEqualizerBand'` from `GLib`'s own type system — a genuine
+/// double-registration race in `GStreamer`/`GLib`'s plugin loading, not in
+/// this project's own code (nothing here calls `g_type_register_static`
+/// directly, and `gst::init()` itself is already documented safe to call
+/// concurrently). Forcing exactly one thread to construct (and
+/// immediately drop, never started) a throwaway pipeline containing the
+/// element, gated by a process-wide `Once`, serializes that first load;
+/// every other concurrent caller of [`GstreamerBackend::new`] just waits
+/// for it rather than racing it — after the plugin's types are
+/// registered once, further lookups are read-only and safe. Reproduced
+/// directly: `cargo test -p media-gstreamer --lib` failed 2 of 3 runs
+/// before this fix (and failed CI, `RUST_TEST_THREADS=1` sidestepping it
+/// locally without fixing it), passed reliably after.
+fn warm_up_equalizer_plugin() {
+    EQUALIZER_PLUGIN_WARMUP.call_once(|| {
+        let _ = gst::parse::launch("equalizer-10bands name=warmup ! fakesink");
+    });
+}
 
 #[derive(Debug)]
 pub enum GstreamerError {
@@ -52,6 +79,7 @@ pub struct GstreamerBackend;
 impl GstreamerBackend {
     pub fn new() -> Result<Self, GstreamerError> {
         gst::init().map_err(|error| GstreamerError::Initialization(error.to_string()))?;
+        warm_up_equalizer_plugin();
         Ok(Self)
     }
 
