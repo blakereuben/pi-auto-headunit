@@ -77,6 +77,10 @@ Wireless Android Auto is deliberately scheduled after a stable wired release. Ad
 
 Current direct Rust and native dependencies and their licences are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Future display, audio, Bluetooth, and networking dependencies will be documented when they are actually added.
 
+## Credentials
+
+Android Auto requires the head unit to present a certificate and private key that Google's client trusts. This project does not include, generate, or distribute one, and never will — see [`docs/protocol/tls-credential-policy.md`](docs/protocol/tls-credential-policy.md) for the full reasoning, and [the Error 2 investigation](docs/protocol/error-2-investigation.md) for what a self-generated test identity actually does when tried against a real phone (it's rejected). Running this software against a real phone requires your own legitimately-authorized credential, supplied through the guided setup wizard (`credentials setup` / `packaging/setup.sh`) — it is never bundled, embedded, or committed.
+
 ## Installation
 
 Download the latest `arm64` `.deb`, `SHA256SUMS`, and `SHA256SUMS.asc` from the [Releases page](https://github.com/blakereuben/pi-auto-headunit/releases), then verify and install:
