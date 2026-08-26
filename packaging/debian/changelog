@@ -1,3 +1,29 @@
+aa-headunit (0.1.0-3) unstable; urgency=medium
+
+  * First Pi 5 preview release. Complete wired and wireless Android Auto
+    sessions real-hardware-confirmed end to end: protocol handshake,
+    live video, all three audio channels, microphone, and touch
+    (including two-finger multi-touch) all streaming on the physical
+    display, not just in logs.
+  * Full-screen GTK4 kiosk app (`usb kiosk`) with automatic reconnect
+    (wired or wireless, no operator intervention after first setup),
+    a settings panel (rotation, themes, renamable EQ presets, gesture
+    mapping, Wi-Fi/Bluetooth provider selection, night-mode GPIO), and
+    a guided credential setup wizard.
+  * `packaging/setup.sh`: single-entry-point installer that collects
+    the operator's certificate/private key before installing the
+    package, instead of two separate manual steps.
+  * Known limitations (M8 completion gate, still open): cold-boot and
+    wired/wireless-switching determinism, sustained-use/soak testing,
+    power-interruption/low-storage/thermal failure-mode testing, a full
+    whole-application security pass, and the phone/display/audio/USB-
+    radio compatibility matrix have not yet been done. See
+    MILESTONE_CHECKLIST.md's M8 section and README.md for the current,
+    precise status of each. Recovery steps: docs/development/
+    appliance-recovery.md.
+
+ -- Pi Auto Head Unit Contributors <noreply@example.invalid>  Wed, 26 Aug 2026 05:00:00 +0100
+
 aa-headunit (0.1.0-2) unstable; urgency=medium
 
   * Wired Android Auto session (USB accessory transition, TLS handshake,

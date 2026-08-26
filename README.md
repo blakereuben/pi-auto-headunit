@@ -10,42 +10,34 @@ The aim is an appliance-style system that starts with the car, connects to an An
 > **AI authorship disclosure:** The code and documentation in this repository were created through an AI-assisted process using more than one AI coding tool: the project was originated with OpenAI Codex, and ongoing development (including the current Android Auto session/protocol work) continues using Claude (Anthropic), acting as Claude Code. Blake Reuben has acted as the project owner and orchestrator throughout: defining the goals and requirements, supplying the hardware and test environment, approving the work, and carrying out or supervising physical testing. See [AI_DISCLOSURE.md](AI_DISCLOSURE.md) for details.
 
 > [!IMPORTANT]
-> This project is experimental, uncertified software for bench development and must not control safety-critical vehicle functions. A live wired session now completes the full Android Auto protocol handshake on real hardware — version negotiation, TLS, authentication, service discovery, and channel setup through video `Start` — but the phone still reports **"Error 2: phone and car are running incompatible software"** before any real video/audio streams, so this project does **not** yet display Android Auto, play its audio, or return touch input during an active session. Wireless Android Auto is not implemented. See [the Error 2 investigation](docs/protocol/error-2-investigation.md) for the current blocker and everything ruled out so far.
+> This project is experimental, uncertified software for bench development and must not control safety-critical vehicle functions. Wired and wireless Android Auto sessions — full protocol handshake, live video, audio, touch, and microphone — are real-hardware-confirmed (see below). What is **not** yet done: cold-boot and wired/wireless-switching determinism, sustained/soak testing, and the other M8 completion-gate items listed in [`MILESTONE_CHECKLIST.md`](MILESTONE_CHECKLIST.md). Treat this as a working preview, not a stress-tested release.
 
 ## Features and current status
 
-Milestone 1 (safe USB/AOA foundation) and Milestone 2 (lawful Android Auto session foundation) are functionally complete against real hardware. Milestone 3 (display/media/audio/touch spike) is partially complete. Milestone 4 (a complete wired session) is blocked on the "Error 2" investigation described below — see [`MILESTONE_CHECKLIST.md`](MILESTONE_CHECKLIST.md) for the authoritative, item-by-item status.
+Milestones 0 through 5 are functionally complete against real hardware. Milestone 6 (wired hardening) and Milestone 7 (wireless Android Auto) are substantially complete. Milestone 8 (the Pi 5 completion gate — cold-boot determinism, failure-mode and soak testing, the compatibility matrix, and a full security pass) is the current, open milestone — see [`MILESTONE_CHECKLIST.md`](MILESTONE_CHECKLIST.md) for the authoritative, item-by-item status.
 
-Working today:
+Working today, real-hardware-confirmed:
 
-- native Rust build on 64-bit Raspberry Pi OS;
-- Raspberry Pi model, OS, and architecture preflight checks;
-- runtime detection of onboard and USB Wi-Fi/Bluetooth providers;
-- independent `Auto`, `Onboard`, or explicit USB provider selection for Wi-Fi and Bluetooth;
-- USB device discovery;
-- documented Android Open Accessory (AOA) negotiation;
-- phone re-enumeration detection and accessory bulk-endpoint discovery;
-- clean unplug/reconnect handling;
+- a full-screen GTK4 kiosk app (`usb kiosk`) that reconnects automatically, wired or wireless, with no operator intervention needed after first setup;
+- complete wired **and** wireless Android Auto sessions — protocol version negotiation, TLS, authentication, service discovery, and channel setup, followed by live video, audio (media/system/speech), microphone capture, and touch (including two-finger multi-touch) all confirmed working end-to-end against a real phone on the official 7-inch touchscreen;
+- wireless bootstrap (Wi-Fi access point + Bluetooth handoff) with no prior wired pairing required;
+- a guided GTK4 credential setup wizard, and a single-entry-point installer (`packaging/setup.sh`) that collects the operator's certificate/private key before installing the `.deb`;
+- a settings panel reachable by touch gesture: display rotation, themes, renamable EQ presets, gesture-to-action mapping, Wi-Fi/Bluetooth provider selection, night-mode GPIO input, and a "launch on boot" toggle (off by default — see the appliance-recovery doc for why);
+- automatic USB reconnect/replug recovery, and a session supervisor that survives phone-side rejects, timeouts, and service restarts;
 - board-independent video-decoder selection and a native GStreamer capability probe;
-- native touch press/move/release and two-finger multi-touch on the official 7-inch touchscreen;
-- bounded AAP framing, reassembly, and a replaceable OpenSSL TLS client, including post-handshake application-data encrypt/decrypt;
-- a gated, opt-in `auth-discovery-probe` diagnostic (`usb`/`developer` subcommands, behind `--allow-live-aap`) that, using an operator-authorized credential loaded only from a root-only local file, completes version negotiation, TLS, authentication, service discovery, and `ChannelOpenRequest`/`Response` for all 8 canonical Android Auto services, then drives video and all three audio channels through `Setup`→`Config`→`Start`;
-- an `arm64` development `.deb` with unprivileged USB access rules.
-
-**Current blocker:** on real hardware, that session negotiation reaches video `Start` — the deepest point Android Auto's wire protocol requires before real media begins — but the phone then shows **"Error 2: phone and car are running incompatible software"** instead of streaming. Every wire-protocol-level hypothesis tested so far (missing channels/capabilities, message-flow gaps, timing, ping cadence and arm-timing, an alternate USB accessory identity) has been refuted or shown no effect; the leading theory is that a real phone needs the head unit to behave like a genuine media sink — send or accept a real stream — before it will commit to one, which is out of scope until the M3 encode/render pipeline exists. Full detail, every hypothesis tried, and what's ruled in/out: [`docs/protocol/error-2-investigation.md`](docs/protocol/error-2-investigation.md).
+- an `arm64` Debian package with unprivileged USB/network access rules, a dedicated system user/group, persistent settings, and bounded journald logging.
 
 Verified on the Pi 5 reference system:
 
-- Raspberry Pi 5, 8 GB, booting from NVMe;
+- Raspberry Pi 5, 8 GB, booting from NVMe or SD card;
 - Debian 13/Raspberry Pi OS Trixie, 64-bit;
-- Samsung phone entering AOA 2 accessory mode;
-- reconnect without rebooting the Pi;
-- 100/100 repeated interface claim/release cycles;
-- no increase in open file handles or resident memory during that soak;
-- package install, remove, purge, and clean reinstall;
-- Pi 5 H.264 software decoding selected at 800x480/30 with Wayland output;
-- a real phone completing version negotiation, TLS, authentication, and service discovery, then opening all 8 advertised channels and driving video/audio through `Setup`→`Config`→`Start`, sensor request/response exchanges, and (most recently) a real `PingResponse` to a proactively-sent `PingRequest` — all confirmed on real hardware, none yet sufficient to clear Error 2;
-- clean timeout, malformed-message-fuzzing, physical unplug, and reconnect recovery, each proven against real hardware or the exact parser boundary a real phone's bytes reach.
+- a real phone completing the full protocol handshake — version negotiation, TLS, authentication, service discovery, and channel setup — over both a wired USB/AOA connection and a wireless (Wi-Fi AP + Bluetooth handoff) connection, with no prior wired pairing needed for the wireless path;
+- live H.264 video, all three audio channels (media/system/speech), and microphone capture, all confirmed streaming on the head unit's own physical display, not just in logs;
+- touch, including two-finger multi-touch, confirmed working during a live session on the official 7-inch touchscreen;
+- automatic reconnect after a phone disconnect, a USB replug, and a deliberate operator close/reopen;
+- package install, remove, purge, and clean reinstall.
+
+Not yet done, and explicitly tracked as open in [`MILESTONE_CHECKLIST.md`](MILESTONE_CHECKLIST.md)'s M8 section: cold-boot determinism, deterministic wired/wireless switching, sustained-use/soak testing, power-interruption and low-storage/thermal failure-mode testing, a full whole-application security pass, and the phone/display/audio/USB-radio compatibility matrix. Treat this release as functionally working but not yet stress-tested.
 
 Detailed results are recorded in [the Pi 5 evidence report](docs/hardware/evidence/pi5-2026-08-04.md) and [`MILESTONE_CHECKLIST.md`](MILESTONE_CHECKLIST.md).
 
@@ -87,7 +79,19 @@ Current direct Rust and native dependencies and their licences are recorded in [
 
 ## Installation
 
-There is not yet an end-user release. The current diagnostic can be built on a 64-bit Raspberry Pi OS development system:
+Download the latest `arm64` `.deb`, `SHA256SUMS`, and `SHA256SUMS.asc` from the [Releases page](https://github.com/blakereuben/pi-auto-headunit/releases), then verify and install:
+
+```bash
+gpg --import packaging/release-signing-key.asc   # one-time: import the release-signing key
+sha256sum --check SHA256SUMS
+gpg --verify SHA256SUMS.asc SHA256SUMS
+
+./packaging/setup.sh aa-headunit-diagnostics_*.deb
+```
+
+`setup.sh` collects your Android Auto certificate/private key first (a guided GTK4 wizard), then installs the package — a single entry point, no separate manual steps. See [the current release's known limitations](MILESTONE_CHECKLIST.md) (M8 is still open: stress/soak testing and a few other completion-gate items remain) before relying on this for anything but bench testing.
+
+To build from source instead, on a 64-bit Raspberry Pi OS development system:
 
 ```bash
 sudo apt update
@@ -97,7 +101,7 @@ cd pi-auto-headunit
 cargo build --workspace --locked
 ```
 
-The finished release installation will use an `arm64` Debian package installed through `apt`, followed by preflight/setup and explicit systemd service activation. It will not require Docker or a Rust toolchain. See [PACKAGING.md](PACKAGING.md) for the release packaging plan.
+See [PACKAGING.md](PACKAGING.md) for the release packaging plan.
 
 ## Usage
 
