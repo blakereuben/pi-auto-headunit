@@ -565,25 +565,83 @@ fn open_file_browser(
     stack.set_visible_child_name(page_name);
 }
 
-/// Where the browser starts — an operator's certificate/private key
-/// pair usually lives on a USB drive (real-hardware finding: this is
-/// how every setup so far has actually been done), so this prefers the
-/// first mounted removable volume it finds under `/media/<user>/`
-/// (where `gvfs-udisks2-volume-monitor`/udisks2 auto-mount removable
-/// media, both installed specifically for this) and only falls back to
-/// the operator's own home directory if none is mounted yet.
-fn initial_browse_dir() -> PathBuf {
-    if let Ok(username) = std::env::var("USER") {
-        let media_dir = PathBuf::from("/media").join(username);
-        if let Ok(entries) = fs::read_dir(&media_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    return entry.path();
-                }
+/// Real-hardware finding, 2026-08-29: a bare Lite appliance (no desktop
+/// environment, no file manager watching for newly-plugged-in volumes)
+/// never auto-mounts a USB drive on its own — udisks2/gvfs being
+/// installed only means something *can* mount removable media, not
+/// that anything actually does automatically; that behavior normally
+/// comes from a desktop's own automount policy, which doesn't exist on
+/// this install method. Without this, the file browser could open to
+/// an empty `/media/<user>/` forever even with a drive physically
+/// plugged in. Walks `/sys/block` for removable, not-yet-mounted
+/// partitions and mounts each via `udisksctl` (the same mechanism a
+/// desktop's own automount would use, so it relies on udisks2's
+/// already-standard polkit policy of allowing the active local session
+/// to mount removable media unprompted — not yet confirmed on real
+/// hardware whether that policy is actually in effect on a bare Lite
+/// install without anything else granting it).
+fn mount_removable_media() {
+    let Ok(block_devices) = fs::read_dir("/sys/block") else {
+        return;
+    };
+    for device in block_devices.flatten() {
+        let device_name = device.file_name().to_string_lossy().into_owned();
+        let is_removable = fs::read_to_string(device.path().join("removable"))
+            .is_ok_and(|contents| contents.trim() == "1");
+        if !is_removable {
+            continue;
+        }
+        let Ok(partitions) = fs::read_dir(device.path()) else {
+            continue;
+        };
+        for partition in partitions.flatten() {
+            let partition_name = partition.file_name().to_string_lossy().into_owned();
+            if !partition_name.starts_with(&device_name) || partition_name == device_name {
+                continue;
             }
+            if partition_is_mounted(&partition_name) {
+                continue;
+            }
+            let _ = std::process::Command::new("udisksctl")
+                .args(["mount", "-b", &format!("/dev/{partition_name}")])
+                .status();
         }
     }
-    std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from)
+}
+
+fn partition_is_mounted(partition_name: &str) -> bool {
+    let Ok(mounts) = fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    let device_prefix = format!("/dev/{partition_name} ");
+    mounts.lines().any(|line| line.starts_with(&device_prefix))
+}
+
+/// Mounts any not-yet-mounted removable media ([`mount_removable_media`])
+/// and returns the first mounted volume found under `/media/<user>/`, if
+/// any — used both for the browser's own starting directory and for its
+/// "Drive" shortcut (for a drive plugged in *after* the browser was
+/// already open).
+fn find_removable_media_dir() -> Option<PathBuf> {
+    mount_removable_media();
+    let username = std::env::var("USER").ok()?;
+    let media_dir = PathBuf::from("/media").join(username);
+    fs::read_dir(&media_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+}
+
+/// Where the browser starts — an operator's certificate/private key
+/// pair usually lives on a USB drive (real-hardware finding: this is
+/// how every setup so far has actually been done), so this prefers a
+/// mounted removable volume ([`find_removable_media_dir`]) and only
+/// falls back to the operator's own home directory if none is found at
+/// all.
+fn initial_browse_dir() -> PathBuf {
+    find_removable_media_dir()
+        .unwrap_or_else(|| std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from))
 }
 
 fn build_file_browser_page(
@@ -610,8 +668,10 @@ fn build_file_browser_page(
     let header_row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
     let up_button = Button::with_label("⬆ Up");
     let home_button = Button::with_label("🏠 Home");
+    let drive_button = Button::with_label("💾 Drive");
     header_row.append(&up_button);
     header_row.append(&home_button);
+    header_row.append(&drive_button);
     page.append(&header_row);
 
     let list_box = ListBox::new();
@@ -635,59 +695,107 @@ fn build_file_browser_page(
     // `ListBoxRow`'s `index()` looks its entry up directly — simpler
     // than attaching data to each row widget individually.
     let row_entries: Rc<RefCell<Vec<(bool, PathBuf)>>> = Rc::new(RefCell::new(Vec::new()));
+    refresh_file_browser_list(&list_box, &path_label, &current_dir, &row_entries);
 
+    wire_row_activation(
+        &list_box,
+        &path_label,
+        &current_dir,
+        &row_entries,
+        stack,
+        state,
+        target,
+        certificate_label,
+        private_key_label,
+        next,
+    );
+    wire_navigation_buttons(
+        &up_button,
+        &home_button,
+        &drive_button,
+        &list_box,
+        &path_label,
+        &current_dir,
+        &row_entries,
+    );
+
+    page
+}
+
+/// Wires the file list's own tap/click handling — descending into a
+/// directory, or (for a file) recording the pick and returning to
+/// `choose-files`. Split out of [`build_file_browser_page`] to keep that
+/// function under this project's own line-count lint.
+#[allow(clippy::too_many_arguments)]
+fn wire_row_activation(
+    list_box: &ListBox,
+    path_label: &Label,
+    current_dir: &Rc<RefCell<PathBuf>>,
+    row_entries: &Rc<RefCell<Vec<(bool, PathBuf)>>>,
+    stack: &Stack,
+    state: &Rc<RefCell<WizardState>>,
+    target: BrowseTarget,
+    certificate_label: Label,
+    private_key_label: Label,
+    next: Button,
+) {
+    let list_box_for_activate = list_box.clone();
+    let path_label_for_activate = path_label.clone();
+    let current_dir_for_activate = Rc::clone(current_dir);
+    let row_entries_for_activate = Rc::clone(row_entries);
+    let stack = stack.clone();
+    let state = Rc::clone(state);
+    list_box.connect_row_activated(move |_, row| {
+        let index = usize::try_from(row.index()).unwrap_or(usize::MAX);
+        let Some((is_dir, path)) = row_entries_for_activate.borrow().get(index).cloned() else {
+            return;
+        };
+        if is_dir {
+            *current_dir_for_activate.borrow_mut() = path;
+            refresh_file_browser_list(
+                &list_box_for_activate,
+                &path_label_for_activate,
+                &current_dir_for_activate,
+                &row_entries_for_activate,
+            );
+            return;
+        }
+        match target {
+            BrowseTarget::Certificate => {
+                certificate_label.set_text(&format!("Certificate: {}", path.display()));
+                state.borrow_mut().certificate = Some(path);
+            }
+            BrowseTarget::PrivateKey => {
+                private_key_label.set_text(&format!("Private key: {}", path.display()));
+                state.borrow_mut().private_key = Some(path);
+            }
+        }
+        let both_chosen = {
+            let state = state.borrow();
+            state.certificate.is_some() && state.private_key.is_some()
+        };
+        next.set_sensitive(both_chosen);
+        stack.set_visible_child_name("choose-files");
+    });
+}
+
+/// Wires the Up/Home/Drive shortcut buttons. Split out of
+/// [`build_file_browser_page`] for the same reason as
+/// [`wire_row_activation`].
+fn wire_navigation_buttons(
+    up_button: &Button,
+    home_button: &Button,
+    drive_button: &Button,
+    list_box: &ListBox,
+    path_label: &Label,
+    current_dir: &Rc<RefCell<PathBuf>>,
+    row_entries: &Rc<RefCell<Vec<(bool, PathBuf)>>>,
+) {
     {
         let list_box = list_box.clone();
         let path_label = path_label.clone();
-        let current_dir = Rc::clone(&current_dir);
-        let row_entries = Rc::clone(&row_entries);
-        refresh_file_browser_list(&list_box, &path_label, &current_dir, &row_entries);
-
-        let list_box_for_activate = list_box.clone();
-        let path_label_for_activate = path_label.clone();
-        let current_dir_for_activate = Rc::clone(&current_dir);
-        let row_entries_for_activate = Rc::clone(&row_entries);
-        let stack = stack.clone();
-        let state = Rc::clone(state);
-        list_box.connect_row_activated(move |_, row| {
-            let index = usize::try_from(row.index()).unwrap_or(usize::MAX);
-            let Some((is_dir, path)) = row_entries_for_activate.borrow().get(index).cloned() else {
-                return;
-            };
-            if is_dir {
-                *current_dir_for_activate.borrow_mut() = path;
-                refresh_file_browser_list(
-                    &list_box_for_activate,
-                    &path_label_for_activate,
-                    &current_dir_for_activate,
-                    &row_entries_for_activate,
-                );
-                return;
-            }
-            match target {
-                BrowseTarget::Certificate => {
-                    certificate_label.set_text(&format!("Certificate: {}", path.display()));
-                    state.borrow_mut().certificate = Some(path);
-                }
-                BrowseTarget::PrivateKey => {
-                    private_key_label.set_text(&format!("Private key: {}", path.display()));
-                    state.borrow_mut().private_key = Some(path);
-                }
-            }
-            let both_chosen = {
-                let state = state.borrow();
-                state.certificate.is_some() && state.private_key.is_some()
-            };
-            next.set_sensitive(both_chosen);
-            stack.set_visible_child_name("choose-files");
-        });
-    }
-
-    {
-        let list_box = list_box.clone();
-        let path_label = path_label.clone();
-        let current_dir = Rc::clone(&current_dir);
-        let row_entries = Rc::clone(&row_entries);
+        let current_dir = Rc::clone(current_dir);
+        let row_entries = Rc::clone(row_entries);
         up_button.connect_clicked(move |_| {
             let parent = current_dir
                 .borrow()
@@ -701,6 +809,10 @@ fn build_file_browser_page(
     }
 
     {
+        let list_box = list_box.clone();
+        let path_label = path_label.clone();
+        let current_dir = Rc::clone(current_dir);
+        let row_entries = Rc::clone(row_entries);
         home_button.connect_clicked(move |_| {
             *current_dir.borrow_mut() =
                 std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from);
@@ -708,7 +820,18 @@ fn build_file_browser_page(
         });
     }
 
-    page
+    {
+        let list_box = list_box.clone();
+        let path_label = path_label.clone();
+        let current_dir = Rc::clone(current_dir);
+        let row_entries = Rc::clone(row_entries);
+        drive_button.connect_clicked(move |_| {
+            if let Some(media_dir) = find_removable_media_dir() {
+                *current_dir.borrow_mut() = media_dir;
+                refresh_file_browser_list(&list_box, &path_label, &current_dir, &row_entries);
+            }
+        });
+    }
 }
 
 /// Rebuilds `list_box`'s rows from `current_dir`'s contents — directories
