@@ -10,11 +10,24 @@
 #
 # Runs the wizard from an *extracted* copy of the .deb, not the
 # installed one — this has to work before the package exists on the
-# system at all. It runs as the plain, already-logged-in operator (no
-# root, no runuser/session juggling needed: this script itself already
-# runs in their real desktop session), so GTK/Wayland/the file-picker
-# portal all just work. The wizard always stages the picked files under
-# the operator's own home directory (`credentials::staging_paths()`,
+# system at all. On the default install method (an existing PiOS
+# Desktop) this script itself already runs inside that real desktop
+# session, so GTK/Wayland/the file-picker portal all just work with no
+# extra effort. On the PiOS Lite appliance install method
+# (docs/development/pios-lite-appliance.md) there is no desktop for
+# this script to inherit a session from — it's normally invoked from a
+# plain SSH login instead, after `appliance-lite-setup.sh` has already
+# bootstrapped a bare labwc session on the physical console (tty1).
+# `find_lite_session` below detects that already-running session (its
+# Wayland socket and D-Bus session bus, both under
+# /run/user/<uid>/) and exports the same environment variables a real
+# desktop login would already have set, so the wizard still renders —
+# on the physical screen, not over SSH — with no manual env-var setup
+# needed either way. A real desktop session already has these set, so
+# this is a no-op there.
+#
+# The wizard always stages the picked files under the operator's own
+# home directory (`credentials::staging_paths()`,
 # `~/.local/share/aa-headunit/pending-credentials/`) rather than writing
 # anywhere privileged — `postinst` (`packaging/debian/aa-headunit-diagnostics.postinst`)
 # picks that staged pair up and installs it for real as its very next
@@ -54,6 +67,33 @@ if ! command -v dpkg-deb >/dev/null 2>&1; then
     echo "dpkg-deb is required (part of dpkg, standard on Raspberry Pi OS)." >&2
     exit 1
 fi
+
+# PiOS Lite appliance support (docs/development/pios-lite-appliance.md):
+# if this shell doesn't already have a graphical session (the normal
+# case for an SSH login, as opposed to a real desktop terminal), look
+# for the one appliance-lite-setup.sh already bootstrapped on the
+# physical console for this same user and target it instead. Only
+# touches the environment when $WAYLAND_DISPLAY is unset, so a real
+# desktop session (which already has it) is never affected.
+find_lite_session() {
+    if [ -n "$WAYLAND_DISPLAY" ]; then
+        return 0
+    fi
+    runtime_dir="/run/user/$(id -u)"
+    # shellcheck disable=SC2012 # portable enough for this one-shot glob
+    wayland_socket=$(ls "$runtime_dir"/wayland-[0-9]* 2>/dev/null | head -n1)
+    if [ -z "$wayland_socket" ]; then
+        return 0
+    fi
+    WAYLAND_DISPLAY=$(basename "$wayland_socket")
+    export WAYLAND_DISPLAY
+    if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ -S "$runtime_dir/bus" ]; then
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+        export DBUS_SESSION_BUS_ADDRESS
+    fi
+    echo "No graphical session in this shell — found the appliance session on the physical screen ($WAYLAND_DISPLAY) and will show the wizard there instead."
+}
+find_lite_session
 
 extract_dir=$(mktemp -d)
 cleanup() {
@@ -115,7 +155,8 @@ sudo apt install --reinstall -y "$deb"
 # lingering "Install" icon whose job is now done. Only ever removes the
 # fixed, well-known Desktop-shortcut path this project's own install
 # convention uses; a no-op if it's not there (run from a terminal, no
-# such shortcut, already removed, etc).
+# such shortcut, already removed, etc — including every PiOS Lite
+# appliance install, which has no Desktop folder at all).
 rm -f "$HOME/Desktop/aa-headunit-install.desktop"
 
 echo "Done. Credentials staged during setup have been installed automatically."

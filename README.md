@@ -107,6 +107,8 @@ cargo build --workspace --locked
 
 See [PACKAGING.md](PACKAGING.md) for the release packaging plan.
 
+The above installs onto an existing PiOS Desktop and autologins as whoever already uses the machine, which is the recommended default. For a dedicated appliance with no desktop underneath at all (faster boot, no VNC/desktop fallback — SSH-only recovery), see [`docs/development/pios-lite-appliance.md`](docs/development/pios-lite-appliance.md); not yet real-hardware-confirmed.
+
 ## Usage
 
 This is for development on a 64-bit Raspberry Pi OS system. Rust and the native build dependencies are currently required; end users should wait for a published `.deb` release.
