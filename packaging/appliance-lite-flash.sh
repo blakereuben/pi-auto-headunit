@@ -301,7 +301,23 @@ if "\$HOME/$installer_name" \\
     printf 'launch_on_boot = true\n' | sudo tee /var/lib/aa-headunit/settings.toml >/dev/null
     sudo chown root:aa-headunit /var/lib/aa-headunit/settings.toml
     sudo chmod 0660 /var/lib/aa-headunit/settings.toml
-    sudo reboot
+    # No reboot needed, real-hardware finding 2026-08-28: a reboot here
+    # was only ever a blunt way to get a fresh login — postinst just
+    # added this account to several groups (aa-headunit, plugdev, video,
+    # gpio...) that only take effect for a *new* login, not this
+    # already-running one, so the app can't just be exec'd directly from
+    # here (it would inherit this session's stale, pre-install group
+    # membership and fail permission checks). \`sudo -u\` recomputes the
+    # target user's group membership fresh at invocation regardless of
+    # the calling shell's own — confirmed real-hardware: this reaches a
+    # live session immediately, no reboot wait.
+    if sudo -u $target_user env NO_AT_BRIDGE=1 /usr/bin/aa-headunit-diagnostics preflight; then
+        exec sudo -u $target_user env NO_AT_BRIDGE=1 \\
+            WAYLAND_DISPLAY="\$WAYLAND_DISPLAY" \\
+            DBUS_SESSION_BUS_ADDRESS="\$DBUS_SESSION_BUS_ADDRESS" \\
+            XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR" \\
+            /usr/bin/aa-headunit-diagnostics usb kiosk --allow-live-aap
+    fi
 fi
 AUTOSTART
     chown -R "$target_user:$target_user" "$target_home/.config/labwc"

@@ -54,5 +54,12 @@
 # "launch on boot" setting.
 if /usr/bin/aa-headunit-diagnostics launch-on-boot-enabled \
     && /usr/bin/aa-headunit-diagnostics preflight; then
+    # NO_AT_BRIDGE=1: real-hardware finding, 2026-08-28 — GTK auto-starts
+    # the accessibility bus (at-spi-bus-launcher/at-spi2-registryd, ~15MB
+    # combined) on every launch regardless of whether anything uses it.
+    # This is a fixed touch-only kiosk with no accessibility client ever
+    # attached, so there's nothing for that bus to serve; skipping it is
+    # a real, zero-functional-cost memory saving, not a guess.
+    export NO_AT_BRIDGE=1
     exec /usr/bin/aa-headunit-diagnostics usb kiosk --allow-live-aap
 fi
