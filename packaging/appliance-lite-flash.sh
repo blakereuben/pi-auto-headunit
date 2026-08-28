@@ -311,8 +311,8 @@ if "\$HOME/$installer_name" \\
     # target user's group membership fresh at invocation regardless of
     # the calling shell's own — confirmed real-hardware: this reaches a
     # live session immediately, no reboot wait.
-    if sudo -u $target_user env NO_AT_BRIDGE=1 /usr/bin/aa-headunit-diagnostics preflight; then
-        exec sudo -u $target_user env NO_AT_BRIDGE=1 \\
+    if sudo -u $target_user env GTK_A11Y=none /usr/bin/aa-headunit-diagnostics preflight; then
+        exec sudo -u $target_user env GTK_A11Y=none \\
             WAYLAND_DISPLAY="\$WAYLAND_DISPLAY" \\
             DBUS_SESSION_BUS_ADDRESS="\$DBUS_SESSION_BUS_ADDRESS" \\
             XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR" \\

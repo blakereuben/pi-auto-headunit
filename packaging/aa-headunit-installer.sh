@@ -98,16 +98,21 @@ fi
 # still fall through to install in case credentials were already staged
 # from an earlier run.
 set +e
-# NO_AT_BRIDGE=1: real-hardware finding, 2026-08-28 — GTK auto-starts
-# the accessibility bus (at-spi-bus-launcher/at-spi2-registryd, ~15MB)
-# for any GTK app, including this wizard, regardless of whether
-# anything uses it. Once started it stays running for the rest of the
-# session even after the wizard exits — setting this only on the later
-# kiosk app launch (which this project's shared production autostart
-# already does) is not enough on its own; the wizard itself needs it
-# too, or the accessibility bus is already up by the time the kiosk
-# starts and this saving never actually happens.
-NO_AT_BRIDGE=1 "$wizard" credentials setup
+# GTK_A11Y=none: real-hardware finding, 2026-08-28 — GTK auto-starts the
+# accessibility bus (at-spi-bus-launcher/at-spi2-registryd) for any GTK4
+# app, including this wizard, regardless of whether anything uses it.
+# The older NO_AT_BRIDGE=1 was tried first and confirmed to have no
+# effect at all on GTK4 (it only ever controlled the GTK2/3-era
+# ATK-bridge, which GTK4 dropped for its own native AT-SPI2
+# integration); GTK_A11Y=none is the GTK4-specific equivalent and is
+# what actually stops it, confirmed real-hardware. Once started it
+# stays running for the rest of the session even after the wizard
+# exits — setting this only on the later kiosk app launch (which this
+# project's shared production autostart already does) is not enough on
+# its own; the wizard itself needs it too, or the accessibility bus is
+# already up by the time the kiosk starts and this saving never
+# actually happens.
+GTK_A11Y=none "$wizard" credentials setup
 wizard_exit_code=$?
 set -e
 if [ "$wizard_exit_code" -eq 42 ]; then

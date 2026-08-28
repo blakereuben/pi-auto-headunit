@@ -54,12 +54,19 @@
 # "launch on boot" setting.
 if /usr/bin/aa-headunit-diagnostics launch-on-boot-enabled \
     && /usr/bin/aa-headunit-diagnostics preflight; then
-    # NO_AT_BRIDGE=1: real-hardware finding, 2026-08-28 — GTK auto-starts
-    # the accessibility bus (at-spi-bus-launcher/at-spi2-registryd, ~15MB
-    # combined) on every launch regardless of whether anything uses it.
-    # This is a fixed touch-only kiosk with no accessibility client ever
-    # attached, so there's nothing for that bus to serve; skipping it is
-    # a real, zero-functional-cost memory saving, not a guess.
-    export NO_AT_BRIDGE=1
+    # GTK_A11Y=none: real-hardware finding, 2026-08-28 — GTK auto-starts
+    # the accessibility bus (at-spi-bus-launcher/at-spi2-registryd) on
+    # every launch regardless of whether anything uses it. The older
+    # NO_AT_BRIDGE=1 (the GTK2/3-era ATK-bridge toggle) was tried first
+    # and confirmed to have no effect at all here — GTK4 dropped ATK for
+    # its own native AT-SPI2 integration, controlled by this different,
+    # GTK4-specific variable instead; confirmed on real hardware:
+    # GTK_A11Y=none is what actually stops both at-spi processes from
+    # starting (measured ~70-115MB freed, more than just those two
+    # processes — some of GTK4's own internal accessibility-tree
+    # bookkeeping goes with it too). This is a fixed touch-only kiosk
+    # with no accessibility client ever attached, so there's nothing for
+    # that bus to serve — a real, zero-functional-cost saving.
+    export GTK_A11Y=none
     exec /usr/bin/aa-headunit-diagnostics usb kiosk --allow-live-aap
 fi
