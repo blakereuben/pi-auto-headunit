@@ -311,6 +311,18 @@ if "\$HOME/$installer_name" \\
     # target user's group membership fresh at invocation regardless of
     # the calling shell's own — confirmed real-hardware: this reaches a
     # live session immediately, no reboot wait.
+    #
+    # Real-hardware finding, 2026-08-28: the wizard's own credential
+    # file picker activates a whole family of gvfs D-Bus services
+    # (gvfsd, gvfsd-trash, gvfsd-dnssd, gvfsd-network, gvfsd-recent,
+    # gvfs-afc-volume-monitor, gvfs-udisks2-volume-monitor —
+    # ~70-90MB combined, measured) to browse the plugged-in USB drive.
+    # Once started they stay running for the rest of the session even
+    # though nothing in normal kiosk operation ever needs them again.
+    # Killing them here is safe — they're D-Bus-activated on demand, so
+    # if the wizard is ever run again later (credential rotation) they
+    # simply start back up.
+    pkill -u $target_user -f '/usr/libexec/gvfs' 2>/dev/null || true
     if sudo -u $target_user env GTK_A11Y=none /usr/bin/aa-headunit-diagnostics preflight; then
         exec sudo -u $target_user env GTK_A11Y=none \\
             WAYLAND_DISPLAY="\$WAYLAND_DISPLAY" \\

@@ -218,6 +218,37 @@ if [ -n "$deb" ]; then
     rm -f "$mount_dir/tmp/$deb_basename"
 fi
 
+# Boot-speed trims, real-hardware finding 2026-08-28: measured via
+# systemd-analyze blame/critical-chain on real hardware, not guessed.
+#
+# NetworkManager-wait-online.service alone blocked boot for 4.26s of a
+# 12.28s total — dnsmasq.service (a system-level DNS/DHCP cache from
+# this image's own default cloud-init network config, unrelated to the
+# app's own private per-session dnsmasq instance for its wireless
+# bootstrap AP) was ordered to wait for it needlessly. The appliance's
+# own Android Auto function never depends on this: it configures wlan0
+# directly over netlink, bypassing NetworkManager entirely for that.
+# Confirmed real-hardware: masking this cut total boot time from
+# 12.28s to 6.72s (kernel+userspace to multi-user.target) with no
+# observed regression — SSH/ethernet still comes up fine (that's
+# NetworkManager.service itself configuring the interface, not this
+# separate readiness-confirmation step), and the appliance's own
+# wireless bootstrap is unaffected by design.
+#
+# systemd-binfmt.service / proc-sys-fs-binfmt_misc.mount: sets up
+# support for running foreign-architecture binaries (e.g. via
+# qemu-user-static) — this is a native aarch64-only appliance, nothing
+# on it ever needs that.
+#
+# avahi-daemon: mDNS/".local" hostname discovery — never actually used
+# for reaching this appliance (always by raw IP during development),
+# and not needed for its own Android Auto function either.
+chroot "$mount_dir" systemctl mask \
+    NetworkManager-wait-online.service \
+    systemd-binfmt.service \
+    avahi-daemon.service \
+    avahi-daemon.socket
+
 if [ -f "$resolv_backup" ]; then
     cp -a "$resolv_backup" "$mount_dir/etc/resolv.conf"
 else
