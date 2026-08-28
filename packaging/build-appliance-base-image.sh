@@ -43,6 +43,7 @@ set -e
 usage() {
     cat >&2 <<EOF
 Usage: $0 --base-image FILE --output FILE [--expected-sha256 HASH]
+          [--deb FILE] [--extra-size-mb MB]
 
   --base-image       local, stock PiOS Lite .img or .img.xz, already
                       downloaded (required; this script does not fetch
@@ -58,18 +59,35 @@ Usage: $0 --base-image FILE --output FILE [--expected-sha256 HASH]
                       download itself, so verification happens after
                       decompression either way, even when --base-image
                       was already a plain .img.
+  --deb              built aa-headunit-diagnostics .deb to pre-install
+                      into the image (optional but recommended) — real
+                      hardware finding, 2026-08-28: without this, the
+                      credential wizard's own final "apt install
+                      --reinstall" has to pull in the package's entire
+                      ~150-package dependency tree (full GStreamer,
+                      ImageMagick, Ghostscript, ONNX runtime...) fresh,
+                      taking 44s measured on real hardware; installing
+                      the same .deb here instead means that dependency
+                      tree is already satisfied, so the wizard-time
+                      reinstall only has to redo the small, fast part —
+                      postinst's own credential-adoption/autostart-wiring
+                      logic — not re-download and unpack everything.
+                      postinst runs here too, harmlessly (it already
+                      handles finding no active desktop session to
+                      configure, gracefully skipping that part).
   --extra-size-mb    how much room to add to the rootfs partition before
-                      installing anything (default: 4096). A stock Lite
-                      image's rootfs partition is sized to just barely
-                      fit itself — it's meant to auto-expand to fill the
+                      installing anything (default: 8192 — the full
+                      aa-headunit-diagnostics dependency tree needs more
+                      than labwc/gvfs alone). A stock Lite image's
+                      rootfs partition is sized to just barely fit
+                      itself — it's meant to auto-expand to fill the
                       whole SD card on the appliance's own first real
                       boot, not to have anything installed into it
                       beforehand — so without this there usually isn't
-                      room to add labwc/gvfs's dependency tree (real
-                      finding, 2026-08-28: a first attempt with no grow
-                      step ran out of space partway through installing
-                      GStreamer/Mesa libraries gvfs-backends pulls in,
-                      corrupting the partial dpkg state).
+                      room (real finding, 2026-08-28: a first attempt
+                      with no grow step ran out of space partway through
+                      installing GStreamer/Mesa libraries, corrupting
+                      the partial dpkg state).
 EOF
     exit 2
 }
@@ -77,17 +95,22 @@ EOF
 base_image=""
 output=""
 expected_sha256=""
-extra_size_mb=4096
+deb=""
+extra_size_mb=8192
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --base-image) base_image="$2"; shift 2 ;;
         --output) output="$2"; shift 2 ;;
         --expected-sha256) expected_sha256="$2"; shift 2 ;;
+        --deb) deb="$2"; shift 2 ;;
         --extra-size-mb) extra_size_mb="$2"; shift 2 ;;
         *) usage ;;
     esac
 done
+if [ -n "$deb" ]; then
+    [ -f "$deb" ] || { echo "$deb: not found" >&2; exit 1; }
+fi
 
 [ -n "$base_image" ] && [ -n "$output" ] || usage
 [ -f "$base_image" ] || { echo "$base_image: not found" >&2; exit 1; }
@@ -186,6 +209,15 @@ chroot "$mount_dir" apt-get install -y \
     pipewire pipewire-pulse wireplumber libspa-0.2-bluetooth
 chroot "$mount_dir" apt-get clean
 
+if [ -n "$deb" ]; then
+    echo "Pre-installing $deb (and its full dependency tree) into the image..."
+    deb_basename=$(basename "$deb")
+    cp "$deb" "$mount_dir/tmp/$deb_basename"
+    chroot "$mount_dir" apt-get install -y "/tmp/$deb_basename"
+    chroot "$mount_dir" apt-get clean
+    rm -f "$mount_dir/tmp/$deb_basename"
+fi
+
 if [ -f "$resolv_backup" ]; then
     cp -a "$resolv_backup" "$mount_dir/etc/resolv.conf"
 else
@@ -195,7 +227,7 @@ fi
 cat <<EOF
 
 Done. $output is a ready-to-flash appliance base image (labwc, gvfs,
-udisks2, and the PipeWire/Bluetooth audio stack already installed,
+udisks2, the PipeWire/Bluetooth audio stack, $( [ -n "$deb" ] && echo "aa-headunit-diagnostics and its full dependency tree, " )already installed,
 nothing else changed). Feed it to
 packaging/appliance-lite-flash.sh's --base-image as many times as you
 want — each flash from here on is fast and needs no network at all,
