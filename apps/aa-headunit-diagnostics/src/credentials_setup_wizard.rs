@@ -28,10 +28,11 @@ use credential_store::{
 };
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, FileDialog, Label, Orientation, Stack,
-    glib,
+    Application, ApplicationWindow, Box as GtkBox, Button, Label, ListBox, ListBoxRow, Orientation,
+    ScrolledWindow, SelectionMode, Stack, glib,
 };
 use std::cell::RefCell;
+use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -151,7 +152,7 @@ fn build_and_present_wizard(application: &Application) {
         stack.add_named(&build_welcome_page(&stack), Some("welcome"));
         stack.add_named(&build_pair_bluetooth_page(&stack), Some("pair-bluetooth"));
         stack.add_named(
-            &build_choose_files_page(&window, &stack, &state),
+            &build_choose_files_page(&stack, &state),
             Some("choose-files"),
         );
         stack.set_visible_child_name("welcome");
@@ -418,11 +419,7 @@ fn build_already_installed_page(window: &ApplicationWindow) -> GtkBox {
     page
 }
 
-fn build_choose_files_page(
-    window: &ApplicationWindow,
-    stack: &Stack,
-    state: &Rc<RefCell<WizardState>>,
-) -> GtkBox {
+fn build_choose_files_page(stack: &Stack, state: &Rc<RefCell<WizardState>>) -> GtkBox {
     let page = page_container();
     page.append(&title_label("Step 1 of 2 — Choose your files"));
     page.append(&body_label(
@@ -455,51 +452,38 @@ fn build_choose_files_page(
     next.set_sensitive(false);
 
     {
-        let window = window.clone();
+        let stack = stack.clone();
         let state = Rc::clone(state);
         let certificate_label = certificate_label.clone();
+        let private_key_label = private_key_label.clone();
         let next = next.clone();
-        let private_key_label_for_sensitivity = private_key_label.clone();
         certificate_browse.connect_clicked(move |_| {
-            let dialog = FileDialog::builder()
-                .title("Choose certificate file")
-                .build();
-            let state = Rc::clone(&state);
-            let certificate_label = certificate_label.clone();
-            let next = next.clone();
-            let private_key_label = private_key_label_for_sensitivity.clone();
-            dialog.open(Some(&window), gtk4::gio::Cancellable::NONE, move |result| {
-                let Ok(file) = result else { return };
-                let Some(path) = file.path() else { return };
-                certificate_label.set_text(&format!("Certificate: {}", path.display()));
-                let has_key = { state.borrow().private_key.is_some() };
-                state.borrow_mut().certificate = Some(path);
-                next.set_sensitive(has_key);
-                let _ = &private_key_label;
-            });
+            open_file_browser(
+                &stack,
+                &state,
+                BrowseTarget::Certificate,
+                certificate_label.clone(),
+                private_key_label.clone(),
+                next.clone(),
+            );
         });
     }
 
     {
-        let window = window.clone();
+        let stack = stack.clone();
         let state = Rc::clone(state);
+        let certificate_label = certificate_label.clone();
         let private_key_label = private_key_label.clone();
         let next = next.clone();
         private_key_browse.connect_clicked(move |_| {
-            let dialog = FileDialog::builder()
-                .title("Choose private key file")
-                .build();
-            let state = Rc::clone(&state);
-            let private_key_label = private_key_label.clone();
-            let next = next.clone();
-            dialog.open(Some(&window), gtk4::gio::Cancellable::NONE, move |result| {
-                let Ok(file) = result else { return };
-                let Some(path) = file.path() else { return };
-                private_key_label.set_text(&format!("Private key: {}", path.display()));
-                let has_certificate = { state.borrow().certificate.is_some() };
-                state.borrow_mut().private_key = Some(path);
-                next.set_sensitive(has_certificate);
-            });
+            open_file_browser(
+                &stack,
+                &state,
+                BrowseTarget::PrivateKey,
+                certificate_label.clone(),
+                private_key_label.clone(),
+                next.clone(),
+            );
         });
     }
 
@@ -528,6 +512,271 @@ fn build_choose_files_page(
 
     page.append(&button_row(&[&next]));
     page
+}
+
+/// Which of the two `choose-files` fields a `browse-files` page run is
+/// picking for — needed because both Browse buttons share the same
+/// picker implementation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowseTarget {
+    Certificate,
+    PrivateKey,
+}
+
+/// Real-hardware finding, 2026-08-28: the wizard's Browse buttons
+/// originally opened GTK4's native `FileDialog` — its own internal file
+/// list is a `GtkListView`/`GtkColumnView`-based widget with known touch-
+/// gesture problems (taps not reliably registering as row activation,
+/// unlike plain `Button`s, which `install_minimum_touch_target_css`
+/// already covers). Confirmed on the actual touchscreen this app targets.
+/// This replaces it with an in-wizard page built from `ListBox`/
+/// `ListBoxRow` instead — a much simpler widget whose "row-activated"
+/// signal fires directly off the same click/touch handling a `Button`
+/// uses, with no separate gesture recognizer arbitrating between tap and
+/// scroll the way the list-view-based file chooser's did. Built as a
+/// `Stack` page in the *same* window rather than a second top-level
+/// dialog window for the same reason `FileDialog` was replaced entirely,
+/// not just restyled: this sidesteps any possibility of touch input
+/// being routed to the wrong top-level surface under labwc, whatever the
+/// `FileDialog`'s exact root cause turned out to be.
+fn open_file_browser(
+    stack: &Stack,
+    state: &Rc<RefCell<WizardState>>,
+    target: BrowseTarget,
+    certificate_label: Label,
+    private_key_label: Label,
+    next: Button,
+) {
+    let page_name = "browse-files";
+    if let Some(existing) = stack.child_by_name(page_name) {
+        stack.remove(&existing);
+    }
+    stack.add_named(
+        &build_file_browser_page(
+            stack,
+            state,
+            target,
+            certificate_label,
+            private_key_label,
+            next,
+        ),
+        Some(page_name),
+    );
+    stack.set_visible_child_name(page_name);
+}
+
+/// Where the browser starts — an operator's certificate/private key
+/// pair usually lives on a USB drive (real-hardware finding: this is
+/// how every setup so far has actually been done), so this prefers the
+/// first mounted removable volume it finds under `/media/<user>/`
+/// (where `gvfs-udisks2-volume-monitor`/udisks2 auto-mount removable
+/// media, both installed specifically for this) and only falls back to
+/// the operator's own home directory if none is mounted yet.
+fn initial_browse_dir() -> PathBuf {
+    if let Ok(username) = std::env::var("USER") {
+        let media_dir = PathBuf::from("/media").join(username);
+        if let Ok(entries) = fs::read_dir(&media_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    return entry.path();
+                }
+            }
+        }
+    }
+    std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from)
+}
+
+fn build_file_browser_page(
+    stack: &Stack,
+    state: &Rc<RefCell<WizardState>>,
+    target: BrowseTarget,
+    certificate_label: Label,
+    private_key_label: Label,
+    next: Button,
+) -> GtkBox {
+    let page = page_container();
+    page.set_valign(gtk4::Align::Fill);
+    page.set_vexpand(true);
+
+    page.append(&title_label(match target {
+        BrowseTarget::Certificate => "Choose certificate file",
+        BrowseTarget::PrivateKey => "Choose private key file",
+    }));
+
+    let path_label = body_label("");
+    path_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+    page.append(&path_label);
+
+    let header_row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
+    let up_button = Button::with_label("⬆ Up");
+    let home_button = Button::with_label("🏠 Home");
+    header_row.append(&up_button);
+    header_row.append(&home_button);
+    page.append(&header_row);
+
+    let list_box = ListBox::new();
+    list_box.set_selection_mode(SelectionMode::None);
+
+    let scroller = ScrolledWindow::new();
+    scroller.set_child(Some(&list_box));
+    scroller.set_vexpand(true);
+    scroller.set_min_content_height(240);
+    page.append(&scroller);
+
+    let cancel = Button::with_label("Cancel");
+    let stack_for_cancel = stack.clone();
+    cancel.connect_clicked(move |_| {
+        stack_for_cancel.set_visible_child_name("choose-files");
+    });
+    page.append(&button_row(&[&cancel]));
+
+    let current_dir: Rc<RefCell<PathBuf>> = Rc::new(RefCell::new(initial_browse_dir()));
+    // Kept in the same order rows are appended to `list_box`, so a
+    // `ListBoxRow`'s `index()` looks its entry up directly — simpler
+    // than attaching data to each row widget individually.
+    let row_entries: Rc<RefCell<Vec<(bool, PathBuf)>>> = Rc::new(RefCell::new(Vec::new()));
+
+    {
+        let list_box = list_box.clone();
+        let path_label = path_label.clone();
+        let current_dir = Rc::clone(&current_dir);
+        let row_entries = Rc::clone(&row_entries);
+        refresh_file_browser_list(&list_box, &path_label, &current_dir, &row_entries);
+
+        let list_box_for_activate = list_box.clone();
+        let path_label_for_activate = path_label.clone();
+        let current_dir_for_activate = Rc::clone(&current_dir);
+        let row_entries_for_activate = Rc::clone(&row_entries);
+        let stack = stack.clone();
+        let state = Rc::clone(state);
+        list_box.connect_row_activated(move |_, row| {
+            let index = usize::try_from(row.index()).unwrap_or(usize::MAX);
+            let Some((is_dir, path)) = row_entries_for_activate.borrow().get(index).cloned() else {
+                return;
+            };
+            if is_dir {
+                *current_dir_for_activate.borrow_mut() = path;
+                refresh_file_browser_list(
+                    &list_box_for_activate,
+                    &path_label_for_activate,
+                    &current_dir_for_activate,
+                    &row_entries_for_activate,
+                );
+                return;
+            }
+            match target {
+                BrowseTarget::Certificate => {
+                    certificate_label.set_text(&format!("Certificate: {}", path.display()));
+                    state.borrow_mut().certificate = Some(path);
+                }
+                BrowseTarget::PrivateKey => {
+                    private_key_label.set_text(&format!("Private key: {}", path.display()));
+                    state.borrow_mut().private_key = Some(path);
+                }
+            }
+            let both_chosen = {
+                let state = state.borrow();
+                state.certificate.is_some() && state.private_key.is_some()
+            };
+            next.set_sensitive(both_chosen);
+            stack.set_visible_child_name("choose-files");
+        });
+    }
+
+    {
+        let list_box = list_box.clone();
+        let path_label = path_label.clone();
+        let current_dir = Rc::clone(&current_dir);
+        let row_entries = Rc::clone(&row_entries);
+        up_button.connect_clicked(move |_| {
+            let parent = current_dir
+                .borrow()
+                .parent()
+                .map(std::path::Path::to_path_buf);
+            if let Some(parent) = parent {
+                *current_dir.borrow_mut() = parent;
+                refresh_file_browser_list(&list_box, &path_label, &current_dir, &row_entries);
+            }
+        });
+    }
+
+    {
+        home_button.connect_clicked(move |_| {
+            *current_dir.borrow_mut() =
+                std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from);
+            refresh_file_browser_list(&list_box, &path_label, &current_dir, &row_entries);
+        });
+    }
+
+    page
+}
+
+/// Rebuilds `list_box`'s rows from `current_dir`'s contents — directories
+/// first, then files, both alphabetical, dotfiles hidden (matching how
+/// GTK's own native file chooser behaves by default). Large touch
+/// targets throughout: each row's own margins give it well over the
+/// 48px minimum `install_minimum_touch_target_css` sets for buttons,
+/// without needing a separate CSS rule for a widget type that isn't a
+/// `Button`.
+fn refresh_file_browser_list(
+    list_box: &ListBox,
+    path_label: &Label,
+    current_dir: &Rc<RefCell<PathBuf>>,
+    row_entries: &Rc<RefCell<Vec<(bool, PathBuf)>>>,
+) {
+    while let Some(child) = list_box.first_child() {
+        list_box.remove(&child);
+    }
+    row_entries.borrow_mut().clear();
+
+    let dir = current_dir.borrow().clone();
+    path_label.set_text(&dir.display().to_string());
+
+    let mut entries: Vec<_> = match fs::read_dir(&dir) {
+        Ok(read_dir) => read_dir.flatten().collect(),
+        Err(_) => Vec::new(),
+    };
+    entries.sort_by_key(|entry| {
+        let is_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        (!is_dir, entry.file_name())
+    });
+
+    if entries.is_empty() {
+        let row = ListBoxRow::new();
+        row.set_activatable(false);
+        row.set_child(Some(&build_browser_row_label("(empty or unreadable)")));
+        list_box.append(&row);
+        return;
+    }
+
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let is_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        let icon = if is_dir { "📁" } else { "📄" };
+
+        let row = ListBoxRow::new();
+        row.set_activatable(true);
+        row.set_child(Some(&build_browser_row_label(&format!("{icon} {name}"))));
+        list_box.append(&row);
+        row_entries.borrow_mut().push((is_dir, entry.path()));
+    }
+}
+
+fn build_browser_row_label(text: &str) -> GtkBox {
+    let row_box = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
+    row_box.set_margin_top(14);
+    row_box.set_margin_bottom(14);
+    row_box.set_margin_start(PAGE_MARGIN);
+    row_box.set_margin_end(PAGE_MARGIN);
+    let label = Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    row_box.append(&label);
+    row_box
 }
 
 fn build_validate_result_page(stack: &Stack, source: &CredentialPaths) -> GtkBox {
