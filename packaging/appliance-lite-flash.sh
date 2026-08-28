@@ -181,12 +181,65 @@ chmod 440 "/etc/sudoers.d/010-$target_user"
 # depend on raspi-config's own live-systemd-state assumptions this
 # early, write the exact same drop-in it would have written, directly —
 # deterministic regardless of what's fully up yet at this point in boot.
-mkdir -p "/etc/systemd/system/getty@tty1.service.d"
-cat > "/etc/systemd/system/getty@tty1.service.d/autologin.conf" <<AUTOLOGIN_CONF
+# Real-hardware finding, 2026-08-28: on some boots the operator still
+# saw a plain login prompt on tty1 instead of autologin, even with this
+# drop-in written above — reproduced live: a manual write of the exact
+# same file, followed immediately by `systemctl daemon-reload`, survived
+# a real reboot cleanly every time; this script's own write, with no
+# reload, did not always take effect for that same boot (most likely:
+# getty@tty1.service can already be starting by the time firstrun.sh
+# — itself a fairly late early-boot hook — gets to writing this file, so
+# systemd needs telling to notice the new drop-in rather than running
+# with whatever it already loaded). Rather than depend on winning that
+# race, make it self-healing regardless of the exact cause: reload and
+# restart the unit right after writing the drop-in for this boot, and
+# also install a tiny oneshot service that re-verifies/recreates it on
+# every future boot, before getty.target, so a one-off failure here can
+# never turn into a permanent "no autologin" state.
+write_autologin_conf() {
+    mkdir -p "/etc/systemd/system/getty@tty1.service.d"
+    cat > "/etc/systemd/system/getty@tty1.service.d/autologin.conf" <<AUTOLOGIN_CONF
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin $target_user --noclear %I \$TERM
 AUTOLOGIN_CONF
+}
+write_autologin_conf
+systemctl daemon-reload
+systemctl restart getty@tty1.service || true
+
+ensure_script="/usr/local/sbin/aa-headunit-ensure-autologin"
+cat > "$ensure_script" <<ENSURE_SCRIPT
+#!/bin/sh
+conf="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+if [ ! -f "\$conf" ]; then
+    mkdir -p "\$(dirname "\$conf")"
+    cat > "\$conf" <<AUTOLOGIN_CONF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $target_user --noclear %I \$TERM
+AUTOLOGIN_CONF
+    systemctl daemon-reload
+fi
+ENSURE_SCRIPT
+chmod +x "$ensure_script"
+
+cat > "/etc/systemd/system/aa-headunit-ensure-autologin.service" <<'ENSURE_UNIT'
+[Unit]
+Description=Ensure PiOS Lite appliance console autologin is configured
+DefaultDependencies=no
+Before=getty.target getty@tty1.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aa-headunit-ensure-autologin
+
+[Install]
+WantedBy=getty.target
+ENSURE_UNIT
+systemctl enable aa-headunit-ensure-autologin.service
+
 if command -v raspi-config >/dev/null 2>&1; then
     raspi-config nonint do_hostname aa-headunit-lite || true
 fi

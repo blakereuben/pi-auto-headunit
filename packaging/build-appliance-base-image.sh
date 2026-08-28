@@ -3,12 +3,21 @@
 # produces a reusable PiOS Lite base image with everything the appliance
 # install method (docs/development/pios-lite-appliance.md) needs already
 # installed: labwc, dbus-user-session (the compositor + session bus a
-# bare Lite install doesn't ship), and udisks2/gvfs/gvfs-backends (so
+# bare Lite install doesn't ship), udisks2/gvfs/gvfs-backends (so
 # the credential wizard's GTK file picker can actually see a plugged-in
 # USB drive — a bare Lite install has no automount stack at all, real
 # hardware finding 2026-08-28: without this the operator has to SSH in
 # and mount USB media by hand before they can even pick their
-# certificate/key files, defeating the point of an on-screen installer).
+# certificate/key files, defeating the point of an on-screen installer),
+# and pipewire/pipewire-pulse/wireplumber/libspa-0.2-bluetooth (a bare
+# Lite install only pulls in PipeWire's client libraries as a dependency
+# of aa-headunit-diagnostics itself, not an actual running session, and
+# not the Bluetooth SPA plugin at all — real hardware finding
+# 2026-08-28: without something local registered to handle it, BlueZ has
+# nowhere to hand a Handsfree profile connection, so the wireless
+# bootstrap's own paired-phone auto-reconnect always fails with
+# "br-connection-profile-unavailable"; also needed regardless for real
+# Android Auto audio playback, same as the Desktop install method).
 #
 # Build this once — it needs real network access, to install those
 # packages. packaging/appliance-lite-flash.sh then flashes the result to
@@ -157,9 +166,24 @@ if [ -e "$mount_dir/etc/resolv.conf" ]; then
 fi
 cp /etc/resolv.conf "$mount_dir/etc/resolv.conf"
 
-echo "Installing labwc, dbus-user-session, udisks2, gvfs, gvfs-backends into the image..."
+# pipewire/pipewire-pulse/wireplumber/libspa-0.2-bluetooth: real-hardware
+# finding, 2026-08-28 — this bare Lite image only pulls in PipeWire's
+# client *libraries* as a dependency of aa-headunit-diagnostics itself
+# (which links against them for its own audio pipeline), not an actual
+# running PipeWire/WirePlumber session, and not libspa-0.2-bluetooth at
+# all. Without something local registered to handle it, BlueZ has
+# nowhere to hand a Handsfree profile connection — confirmed exactly
+# this failure real-hardware (`connect_profile` returning
+# "br-connection-profile-unavailable"), and confirmed fixed by
+# installing and running these three. This is also not optional for a
+# reason beyond Bluetooth: real Android Auto audio playback needs an
+# actual running PipeWire session regardless, on this install method
+# same as the Desktop one.
+echo "Installing labwc, dbus-user-session, udisks2, gvfs, gvfs-backends, pipewire, pipewire-pulse, wireplumber, libspa-0.2-bluetooth into the image..."
 chroot "$mount_dir" apt-get update
-chroot "$mount_dir" apt-get install -y labwc dbus-user-session udisks2 gvfs gvfs-backends
+chroot "$mount_dir" apt-get install -y \
+    labwc dbus-user-session udisks2 gvfs gvfs-backends \
+    pipewire pipewire-pulse wireplumber libspa-0.2-bluetooth
 chroot "$mount_dir" apt-get clean
 
 if [ -f "$resolv_backup" ]; then
@@ -171,7 +195,8 @@ fi
 cat <<EOF
 
 Done. $output is a ready-to-flash appliance base image (labwc, gvfs,
-and udisks2 already installed, nothing else changed). Feed it to
+udisks2, and the PipeWire/Bluetooth audio stack already installed,
+nothing else changed). Feed it to
 packaging/appliance-lite-flash.sh's --base-image as many times as you
 want — each flash from here on is fast and needs no network at all,
 on this machine or on the appliance.
