@@ -21,7 +21,7 @@ Working today, real-hardware-confirmed:
 - a full-screen GTK4 kiosk app (`usb kiosk`) that reconnects automatically, wired or wireless, with no operator intervention needed after first setup;
 - complete wired **and** wireless Android Auto sessions — protocol version negotiation, TLS, authentication, service discovery, and channel setup, followed by live video, audio (media/system/speech), microphone capture, and touch (including two-finger multi-touch) all confirmed working end-to-end against a real phone on the official 7-inch touchscreen;
 - wireless bootstrap (Wi-Fi access point + Bluetooth handoff) with no prior wired pairing required;
-- a guided GTK4 credential setup wizard, and a single-entry-point installer (`packaging/setup.sh`) that collects the operator's certificate/private key before installing the `.deb`;
+- a guided GTK4 credential setup wizard, and a single-entry-point installer that collects the operator's certificate/private key before installing the `.deb` — either `packaging/setup.sh` on an existing PiOS Desktop, or the single-file `packaging/aa-headunit-installer.sh` on the dedicated no-desktop appliance install method (see [Installation](#installation)), both sharing the same wizard;
 - a settings panel reachable by touch gesture: display rotation, themes, renamable EQ presets, gesture-to-action mapping, Wi-Fi/Bluetooth provider selection, night-mode GPIO input, and a "launch on boot" toggle (off by default — see the appliance-recovery doc for why);
 - automatic USB reconnect/replug recovery, and a session supervisor that survives phone-side rejects, timeouts, and service restarts;
 - board-independent video-decoder selection and a native GStreamer capability probe;
@@ -107,7 +107,9 @@ cargo build --workspace --locked
 
 See [PACKAGING.md](PACKAGING.md) for the release packaging plan.
 
-The above installs onto an existing PiOS Desktop and autologins as whoever already uses the machine, which is the recommended default. For a dedicated appliance with no desktop underneath at all (faster boot, no VNC/desktop fallback — SSH-only recovery), see [`docs/development/pios-lite-appliance.md`](docs/development/pios-lite-appliance.md); not yet real-hardware-confirmed.
+The above installs onto an existing PiOS Desktop and autologins as whoever already uses the machine, which is the recommended default.
+
+For a dedicated appliance with no desktop underneath at all (faster boot — ~7s to a usable console, no VNC/desktop fallback — SSH-only recovery), see [`docs/development/pios-lite-appliance.md`](docs/development/pios-lite-appliance.md) — **real-hardware-confirmed, 2026-08-29**: console autologin straight into the same guided single-file installer (Bluetooth pairing, a touch-friendly credential file picker with USB auto-mount, install), then directly into the kiosk app with no reboot needed, confirmed against a real phone completing wireless bootstrap and streaming a live Android Auto session. `packaging/build-appliance-base-image.sh` builds a reusable, offline-ready base image (network needed once, to build it — never on the appliance itself); `packaging/appliance-lite-flash.sh` flashes it to as many SD cards as needed afterward.
 
 ## Usage
 
